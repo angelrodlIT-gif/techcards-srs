@@ -92,7 +92,11 @@ API tests against disposable PostgreSQL, and a Docker runtime build.
 Defaults work without an `.env`. `.env.example` contains local development placeholders
 only. Optional copy: PowerShell `Copy-Item .env.example .env`; Unix `cp .env.example .env`.
 Never commit `.env`. Compose sets the container database host to `db`; the host-side
-Python default uses `localhost`. For special-character passwords provide a properly
+Python default uses `localhost:5435`. PostgreSQL inside the Compose network always
+uses `db:5432`. Set `POSTGRES_HOST_PORT` in `.env` (default `5435`) to change the
+published host port. If running Python on the host with a different port, also update
+`DATABASE_URL` to use that same port; it is independently configurable. For example,
+set `POSTGRES_HOST_PORT=5540` and use `localhost:5540` in `DATABASE_URL`. For special-character passwords provide a properly
 URL-encoded database URL when configuring a custom environment.
 
 `GENERATOR_PROVIDER=mock` is the only implemented setting; unknown providers fail validation.
@@ -106,12 +110,14 @@ output/error handling; no network fallback or hidden data upload exists now.
 - `app/sm2.py`: pure scheduling; `app/models.py`: persisted data.
 - `app/main.py`: routes and transaction boundary; `app/generator.py`: provider seam.
 - `migrations/`: versioned schema; `tests/`: scheduling and API checks.
+- [Personal English learning plan](docs/PROJECT_PLAN.md): vision, Saturday milestones and workflow.
 - [MVP design](docs/MVP.md): scope, endpoints, architecture and role/skills mapping.
 - [Saturday exercises](docs/NEXT_STEPS.md): six optional learning tasks.
 
 If startup fails, inspect `docker compose ps -a` and `docker compose logs db migrate api`.
-A busy host port 5432 or 8000 requires freeing the port or changing its host-side mapping
-in `compose.yaml`. After changing DB credentials, an existing volume keeps the original
+A busy host port 5435 requires setting `POSTGRES_HOST_PORT` to a free port and updating
+`DATABASE_URL` for host-side Python clients. For port 8000, free it or change the API
+host-side mapping in `compose.yaml`. After changing DB credentials, an existing volume keeps the original
 PostgreSQL credentials; restore the original settings or intentionally reset disposable data.
 `/health` checks the API process only, not database connectivity.
 
