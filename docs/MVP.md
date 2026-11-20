@@ -78,6 +78,11 @@ flowchart LR
 ```
 
 ## Roadmap
+
+The [personal English learning plan](PROJECT_PLAN.md) extends this implemented MVP
+with Angel's interview-focused learning loop and Saturday milestones through May 2027.
+The scope above describes what is implemented today.
+
 1. Local MVP: the API, mock strategy, PostgreSQL, migrations, tests and CI in this repo.
 2. AI generation: add an adapter, structured output validation, timeout/error policy,
    explicit opt-in configuration and an evaluation set; never silently transmit pasted text.
