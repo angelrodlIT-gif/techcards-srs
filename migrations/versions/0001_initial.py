@@ -27,7 +27,7 @@ def upgrade():
         sa.Column("kind", sa.String(30), nullable=False),
         sa.Column("repetitions", sa.Integer(), nullable=False),
         sa.Column("interval_days", sa.Integer(), nullable=False),
-        sa.Column("ease_factor", sa.Float(), nullable=False),
+        sa.Column("ease_factor", sa.Double(), nullable=False),
         sa.Column("due_date", sa.Date(), nullable=False),
         sa.CheckConstraint("repetitions >= 0 AND interval_days >= 0 AND ease_factor >= 1.3"),
     )
@@ -41,7 +41,7 @@ def upgrade():
         sa.Column("quality", sa.Integer(), nullable=False),
         sa.Column("reviewed_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("interval_days", sa.Integer(), nullable=False),
-        sa.Column("ease_factor", sa.Float(), nullable=False),
+        sa.Column("ease_factor", sa.Double(), nullable=False),
         sa.Column("repetitions", sa.Integer(), nullable=False),
         sa.Column("due_date", sa.Date(), nullable=False),
         sa.CheckConstraint("quality >= 0 AND quality <= 5"),
