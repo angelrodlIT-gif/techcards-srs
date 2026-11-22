@@ -7,7 +7,7 @@ This directory is the maintained verification source for TechCards SRS. Every us
 Before driving any feature file in this directory:
 
 - Launch a fresh isolated instance with `.cursor/skills/verify-techcards-srs/scripts/control-techcards.sh launch` and record its `RUN_ID` and `EVIDENCE_DIR`.
-- Confirm all 11 checks pass with `.cursor/skills/verify-techcards-srs/scripts/control-techcards.sh doctor "$RUN_ID" --save`.
+- Confirm all 12 checks pass with `.cursor/skills/verify-techcards-srs/scripts/control-techcards.sh doctor "$RUN_ID" --save`.
 - Start from an empty database (0 rows in `decks`, `cards`, `reviews`), or isolate each journey inside its own newly created deck.
 - Never target the developer's default `http://127.0.0.1:8000` or `127.0.0.1:5435` stack.
 

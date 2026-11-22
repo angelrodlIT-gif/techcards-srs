@@ -19,8 +19,11 @@ Run from the repository root (requires Docker with Compose v2, `curl`, and `pyth
 
 Optional flags: `--run-id <id>`, `--api-port <port>`, `--db-port <port>`, `--evidence-dir <dir>`.
 
+- `--run-id` must match `^[a-z0-9][a-z0-9_-]*$` so `run_id` maps 1-to-1 to Compose project `verify-techcards-<run-id>` (no two IDs can collide).
+- `--evidence-dir` must not already exist and must be strictly outside the scratch state tree (`.../instances/`), so separate runs never mix evidence and cleanup can never delete proof files.
+
 What `launch` does:
-1. Picks two unused `127.0.0.1` ports (so ports `8000` and `5435` stay free/untouched) and writes a scratch Compose override (`!override` on `db.ports` and `api.ports`) plus a dedicated verification env file (`GENERATOR_PROVIDER=mock`, isolated `verify-techcards-<run-id>` project) under `${XDG_STATE_HOME:-$HOME/.local/state}/verify-techcards-srs/instances/<run-id>/`.
+1. Atomically reserves the scratch directory (`${XDG_STATE_HOME:-$HOME/.local/state}/verify-techcards-srs/instances/<run-id>/`) and a fresh evidence directory, picks two unused `127.0.0.1` ports (leaving `8000` and `5435` untouched), writes JSON instance metadata (`instance.json`) and a scratch Compose override (`!override` on `db.ports` and `api.ports`), and passes fixed verification settings explicitly to `docker compose` (`POSTGRES_USER=techcards`, `POSTGRES_DB=techcards`, `GENERATOR_PROVIDER=mock`, unsetting `DATABASE_URL`) so exported shell variables cannot hijack the isolated run.
 2. Runs `docker compose -p verify-techcards-<run-id> ... up --build -d` from the current checkout (`Dockerfile` target `runtime`) with an **empty** PostgreSQL volume (`verify-techcards-<run-id>_postgres_data`).
 3. Waits for the full readiness chain, not just process startup:
    - `db` (`postgres:16-alpine`) container health is `healthy` (`pg_isready`).
@@ -28,7 +31,8 @@ What `launch` does:
    - `api` (`uvicorn app.main:app`) container health is `healthy`.
    - `GET /health` returns HTTP `200`.
    - `GET /decks` returns HTTP `200` (proving live PostgreSQL connectivity and migrated tables — `/health` alone does **not** touch the database).
-4. Prints `READY` along with `RUN_ID`, `COMPOSE_PROJECT`, `BASE_URL`, `DB_PORT`, and `EVIDENCE_DIR`.
+4. Provisions a dedicated non-superuser `SELECT`-only PostgreSQL role (`techcards_ro`) inside the isolated verification database for `db-query`.
+5. Prints `READY` along with `RUN_ID`, `COMPOSE_PROJECT`, `BASE_URL`, `DB_PORT`, and `EVIDENCE_DIR`.
 
 There is no pre-loaded seed data; a fresh launch starts with empty `decks`, `cards`, and `reviews` tables. Verification journeys create their own data through the real HTTP endpoints.
 
@@ -48,7 +52,7 @@ Run this read-only check right after `launch`, and first whenever anything looks
 
 Add `--save` to also write the diagnostic report to `<evidence-dir>/doctor.txt`.
 
-`doctor` mutates nothing and checks 11 conditions (exits `0` only if all 11 pass):
+`doctor` mutates nothing and checks 12 conditions (exits `0` only if all 12 pass):
 1. `instance_state`: `<run-id>` resolves to an active `verify-techcards-*` Compose project.
 2. `db_container`: PostgreSQL container is running and `healthy`.
 3. `migrate_container`: `migrate` exited with code `0`.
@@ -60,6 +64,7 @@ Add `--save` to also write the diagnostic report to `<evidence-dir>/doctor.txt`.
 9. `openapi_identity`: `GET /openapi.json` returns HTTP `200` with `info.title == "TechCards SRS"` and all expected route paths.
 10. `db_connectivity`: `GET /decks` returns HTTP `200` with a JSON array.
 11. `migrations_head`: `alembic current` inside the `api` container matches `alembic heads` (currently `0001`).
+12. `db_readonly_role`: `techcards_ro` connects read-only to the isolated database.
 
 ## Drive
 
@@ -75,7 +80,7 @@ DECK_ID="$(.cursor/skills/verify-techcards-srs/scripts/control-techcards.sh req 
   POST /decks '{"name":"Cloud interviews","description":"Technical English practice"}' --body-only \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
 
-# Query PostgreSQL read-only (enforced via default_transaction_read_only=on)
+# Query PostgreSQL read-only (non-superuser SELECT-only role techcards_ro + default_transaction_read_only=on)
 .cursor/skills/verify-techcards-srs/scripts/control-techcards.sh db-query <run-id> 01-decks \
   "SELECT id, name, description FROM decks ORDER BY id;"
 
@@ -93,19 +98,23 @@ Stable handles to use across all journeys:
 
 ## Evidence
 
-Proof artifacts are written to:
+Proof artifacts are written to a fresh directory per run:
 
 ```text
 ${XDG_STATE_HOME:-$HOME/.local/state}/verify-techcards-srs/evidence/<run-id>/
 ```
 
-(Override with `--evidence-dir <dir>` or `VERIFY_EVIDENCE_DIR`.)
+(Override with `--evidence-dir <dir>` or `VERIFY_EVIDENCE_DIR`; the target directory must not already exist and must lie outside the scratch `instances/` tree.)
+
+Saved end-to-end proof runs on the author's host (outside the repository, surviving cleanup):
+- Latest verified proof (`features/study-reviews.md`): `~/.local/state/verify-techcards-srs/evidence/proof-study-reviews-v2/`
+- Initial proof run (`features/study-reviews.md`): `~/.local/state/verify-techcards-srs/evidence/proof-study-reviews/`
 
 What every proof run captures in `<evidence-dir>/`:
-- `run-meta.json`: run ID, Compose project, git SHA, source hash, base URL, loopback ports, UTC timestamp (no credentials).
+- `run-meta.json`: run ID, Compose project, git SHA, source hash, base URL, loopback ports, database/role/provider settings, UTC timestamp (no credentials).
 - `doctor.txt`: output of `doctor <run-id> --save`.
-- `steps/<step-name>.http.txt` and `steps/<step-name>.body.json`: exact HTTP method, URL, request JSON body, response status code, response headers, and formatted response body for every step.
-- `db/<label>.txt`: read-only SQL query and PostgreSQL result table confirming persisted rows and cascade deletions.
+- `steps/<step-name>.http.txt` and `steps/<step-name>.body.json`: exact HTTP method, URL, request JSON body, and either response status code, headers, and formatted body OR full `curl` transport-error details if the connection failed mid-request.
+- `db/<label>.txt`: read-only SQL query (executed as the non-superuser `techcards_ro` `SELECT`-only role) and PostgreSQL result table confirming persisted rows and cascade deletions.
 - `logs/compose.log`: `db`, `migrate`, and `api` logs proving `alembic upgrade head` ran from an empty database and requests hit the live Uvicorn process.
 
 Proof standards (mandatory for every verification run):
@@ -128,7 +137,7 @@ Cleanup rules enforced by the script:
 - Refuses to act unless the recorded Compose project starts with `verify-techcards-`.
 - Runs `docker compose -p verify-techcards-<run-id> ... down --volumes --remove-orphans --rmi local` to remove ONLY that run's containers, network, fresh database volume, and project-scoped image tags.
 - Deletes ONLY the scratch instance state directory (`.../instances/<run-id>/`).
-- **Never deletes `<evidence-dir>`** (`.../evidence/<run-id>/`).
+- **Never deletes `<evidence-dir>`** (`.../evidence/<run-id>/`) and verifies path disjointness before removing scratch state.
 
 After cleanup, confirm that the instance is gone and the evidence survived:
 

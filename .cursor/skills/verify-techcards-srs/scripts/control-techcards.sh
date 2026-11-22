@@ -4,8 +4,9 @@ set -euo pipefail
 # Isolated verification harness for TechCards SRS.
 # Manages dedicated Docker Compose projects (db + migrate + api) on free loopback
 # ports so verification never interferes with a running local dev stack, drives
-# real HTTP endpoints with curl, inspects PostgreSQL side effects read-only,
-# captures proof artifacts, and tears down only what it started.
+# real HTTP endpoints with curl, inspects PostgreSQL side effects via a dedicated
+# read-only role, captures proof artifacts (including failed transport attempts),
+# and tears down only what it started.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
@@ -13,14 +14,24 @@ VERIFY_STATE_ROOT="${VERIFY_STATE_ROOT:-${XDG_STATE_HOME:-$HOME/.local/state}/ve
 INSTANCES_ROOT="$VERIFY_STATE_ROOT/instances"
 DEFAULT_EVIDENCE_ROOT="$VERIFY_STATE_ROOT/evidence"
 
+# Fixed verification-only Compose settings (never inherited from caller's exported env).
+VERIFY_POSTGRES_USER="techcards"
+VERIFY_POSTGRES_PASSWORD="local-development-only"
+VERIFY_POSTGRES_DB="techcards"
+VERIFY_DB_RO_USER="techcards_ro"
+VERIFY_GENERATOR_PROVIDER="mock"
+
 usage() {
   cat <<'EOF'
 Usage: control-techcards.sh <command> [args...]
 
 Commands:
   launch [--run-id ID] [--api-port PORT] [--db-port PORT] [--evidence-dir DIR]
-      Start an isolated Docker Compose stack (fresh Postgres volume -> migrate -> api)
-      and wait until DB, migrations, and API are fully usable.
+      Start an isolated Docker Compose stack (fresh Postgres volume -> migrate -> api),
+      provision a read-only DB inspection role, and wait until DB, migrations, and API
+      are fully usable.
+      Run IDs must match ^[a-z0-9][a-z0-9_-]*$ (1-to-1 with Compose project names).
+      Evidence directories must be fresh (not already existing) and outside scratch state.
 
   doctor <run-id> [--save]
       Read-only health, build-freshness, port-ownership, DB, and migration check.
@@ -28,12 +39,14 @@ Commands:
 
   req <run-id> <step-name> <METHOD> <PATH> [JSON_BODY] [--body-only]
       Send a real HTTP request via curl and save request + status + headers + body
-      under <evidence-dir>/steps/<step-name>.http.txt and .body.json.
-      Pass --body-only (before or after args) to print only the response body to stdout.
+      (or transport error details if curl fails) under
+      <evidence-dir>/steps/<step-name>.http.txt and .body.json.
+      Pass --body-only to print only the response body to stdout.
 
   db-query <run-id> <label> <SQL>
-      Run a read-only SQL query against the isolated Postgres container, save the
-      query and output to <evidence-dir>/db/<label>.txt, and print to stdout.
+      Run a read-only SQL query against the isolated Postgres container using the
+      dedicated non-superuser SELECT-only role (techcards_ro), save the query and
+      output to <evidence-dir>/db/<label>.txt, and print to stdout.
 
   logs <run-id> [service...]
       Capture Docker Compose logs (default: db migrate api) to
@@ -63,6 +76,34 @@ resolve_repo_root() {
   else
     echo "$DEFAULT_REPO_ROOT"
   fi
+}
+
+validate_run_id() {
+  local run_id="$1"
+  if [[ ! "$run_id" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+    die "Invalid run-id '$run_id' (must match ^[a-z0-9][a-z0-9_-]*$; lowercase letters, digits, _, - only so project names are strictly 1-to-1)"
+  fi
+}
+
+assert_disjoint_paths() {
+  local scratch_path="$1"
+  local evidence_path="$2"
+  python3 - "$scratch_path" "$evidence_path" <<'PY'
+import os
+import pathlib
+import sys
+
+scratch = pathlib.Path(os.path.realpath(sys.argv[1]))
+evidence = pathlib.Path(os.path.realpath(sys.argv[2]))
+
+if evidence == scratch or scratch in evidence.parents or evidence in scratch.parents:
+    print(
+        f"ERROR: evidence directory '{evidence}' overlaps scratch directory '{scratch}'. "
+        "Choose an evidence directory outside the scratch state tree.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+PY
 }
 
 compute_source_hash() {
@@ -135,21 +176,105 @@ PY
 
 load_instance() {
   local run_id="$1"
-  local env_file="$INSTANCES_ROOT/$run_id/instance.env"
-  [[ -f "$env_file" ]] || die "No active verification instance found for run-id '$run_id' (missing $env_file)"
-  # shellcheck disable=SC1090
-  source "$env_file"
-  [[ "$COMPOSE_PROJECT" == verify-techcards-* ]] || die "Refusing to operate on non-verification Compose project: $COMPOSE_PROJECT"
+  validate_run_id "$run_id"
+  local meta_file="$INSTANCES_ROOT/$run_id/instance.json"
+  [[ -f "$meta_file" ]] || die "No active verification instance found for run-id '$run_id' (missing $meta_file)"
+
+  local fields=()
+  while IFS= read -r -d '' field; do
+    fields+=("$field")
+  done < <(python3 - "$meta_file" <<'PY'
+import json
+import pathlib
+import sys
+
+data = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+keys = [
+    "run_id",
+    "compose_project",
+    "repo_root",
+    "instance_dir",
+    "evidence_dir",
+    "api_port",
+    "db_port",
+    "base_url",
+    "git_sha",
+    "source_hash",
+    "postgres_user",
+    "postgres_db",
+    "db_ro_user",
+    "generator_provider",
+    "created_at_utc",
+]
+for key in keys:
+    if key not in data:
+        print(f"Missing key '{key}' in {sys.argv[1]}", file=sys.stderr)
+        sys.exit(1)
+    sys.stdout.write(str(data[key]))
+    sys.stdout.write("\0")
+PY
+  )
+
+  [[ ${#fields[@]} -eq 15 ]] || die "Corrupt instance metadata in $meta_file"
+
+  RUN_ID="${fields[0]}"
+  COMPOSE_PROJECT="${fields[1]}"
+  REPO_ROOT="${fields[2]}"
+  INSTANCE_DIR="${fields[3]}"
+  EVIDENCE_DIR="${fields[4]}"
+  API_PORT="${fields[5]}"
+  DB_PORT="${fields[6]}"
+  BASE_URL="${fields[7]}"
+  GIT_SHA="${fields[8]}"
+  SOURCE_HASH="${fields[9]}"
+  POSTGRES_USER="${fields[10]}"
+  POSTGRES_DB="${fields[11]}"
+  DB_RO_USER="${fields[12]}"
+  GENERATOR_PROVIDER="${fields[13]}"
+  CREATED_AT="${fields[14]}"
+
+  [[ "$COMPOSE_PROJECT" == "verify-techcards-${RUN_ID}" ]] || die "Refusing to operate on unexpected Compose project: $COMPOSE_PROJECT"
 }
 
 compose_cmd() {
-  COMPOSE_ANSI=never BUILDKIT_PROGRESS=plain docker compose \
+  # Explicitly override exported Compose variables so caller's shell env cannot
+  # hijack POSTGRES_*, GENERATOR_PROVIDER, or DATABASE_URL for this isolated run.
+  env \
+    -u DATABASE_URL \
+    COMPOSE_ANSI=never \
+    BUILDKIT_PROGRESS=plain \
+    POSTGRES_USER="$POSTGRES_USER" \
+    POSTGRES_PASSWORD="$VERIFY_POSTGRES_PASSWORD" \
+    POSTGRES_DB="$POSTGRES_DB" \
+    POSTGRES_HOST_PORT="$DB_PORT" \
+    GENERATOR_PROVIDER="$GENERATOR_PROVIDER" \
+    docker compose \
     --progress=plain \
     -p "$COMPOSE_PROJECT" \
     --env-file "$INSTANCE_DIR/verify.env" \
     -f "$REPO_ROOT/compose.yaml" \
     -f "$INSTANCE_DIR/compose.override.yaml" \
     "$@"
+}
+
+provision_readonly_role() {
+  compose_cmd exec -T db \
+    psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<SQL >/dev/null
+DO \$\$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${DB_RO_USER}') THEN
+    CREATE ROLE ${DB_RO_USER} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;
+  END IF;
+END \$\$;
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+REVOKE ALL ON DATABASE ${POSTGRES_DB} FROM ${DB_RO_USER};
+GRANT CONNECT ON DATABASE ${POSTGRES_DB} TO ${DB_RO_USER};
+REVOKE ALL ON SCHEMA public FROM ${DB_RO_USER};
+GRANT USAGE ON SCHEMA public TO ${DB_RO_USER};
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM ${DB_RO_USER};
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO ${DB_RO_USER};
+ALTER DEFAULT PRIVILEGES FOR ROLE ${POSTGRES_USER} IN SCHEMA public GRANT SELECT ON TABLES TO ${DB_RO_USER};
+SQL
 }
 
 cmd_launch() {
@@ -195,16 +320,18 @@ cmd_launch() {
     suffix="$(python3 -c 'import secrets; print(secrets.token_hex(2))')"
     run_id="v-$(date -u +%Y%m%d-%H%M%S)-$suffix"
   fi
-  if [[ ! "$run_id" =~ ^[a-zA-Z0-9._-]+$ ]]; then
-    die "Invalid run-id '$run_id' (allowed: letters, digits, ., _, -)"
-  fi
-
-  local instance_dir="$INSTANCES_ROOT/$run_id"
-  [[ ! -e "$instance_dir" ]] || die "Instance '$run_id' already exists at $instance_dir"
+  validate_run_id "$run_id"
 
   if [[ -z "$evidence_dir" ]]; then
     evidence_dir="$DEFAULT_EVIDENCE_ROOT/$run_id"
   fi
+
+  mkdir -p "$INSTANCES_ROOT"
+  local instance_dir="$INSTANCES_ROOT/$run_id"
+
+  # Reject any evidence path overlapping the scratch state tree before reserving directories.
+  assert_disjoint_paths "$INSTANCES_ROOT" "$evidence_dir"
+  assert_disjoint_paths "$instance_dir" "$evidence_dir"
 
   if [[ -z "$api_port" ]]; then
     api_port="$(pick_free_port 0)"
@@ -219,23 +346,40 @@ cmd_launch() {
     port_is_free "$db_port" || die "Requested DB port 127.0.0.1:$db_port is already in use"
   fi
 
-  local repo_root git_sha source_hash sanitized_id compose_project base_url created_at
+  # Atomically reserve both the scratch instance directory and a fresh evidence directory
+  # so concurrent launches with the same run-id or reused evidence paths cannot collide.
+  if ! mkdir "$instance_dir" 2>/dev/null; then
+    die "Instance '$run_id' already exists or is currently launching ($instance_dir)"
+  fi
+
+  mkdir -p "$(dirname "$evidence_dir")"
+  if ! mkdir "$evidence_dir" 2>/dev/null; then
+    rmdir "$instance_dir" 2>/dev/null || true
+    die "Evidence directory already exists ($evidence_dir). Use a fresh --run-id or --evidence-dir so runs are never mixed."
+  fi
+
+  # Re-verify canonicalized disjointness now that both directories exist on disk.
+  if ! assert_disjoint_paths "$INSTANCES_ROOT" "$evidence_dir"; then
+    rmdir "$evidence_dir" "$instance_dir" 2>/dev/null || true
+    exit 1
+  fi
+
+  local repo_root git_sha source_hash compose_project base_url created_at
   repo_root="$(resolve_repo_root)"
   git_sha="$(git -C "$repo_root" rev-parse --short HEAD 2>/dev/null || echo unknown)"
   source_hash="$(compute_source_hash "$repo_root")"
-  sanitized_id="$(echo "$run_id" | tr '[:upper:].' '[:lower:]-')"
-  compose_project="verify-techcards-${sanitized_id}"
+  compose_project="verify-techcards-${run_id}"
   base_url="http://127.0.0.1:${api_port}"
   created_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-  mkdir -p "$instance_dir" "$evidence_dir/steps" "$evidence_dir/db" "$evidence_dir/logs"
+  mkdir -p "$evidence_dir/steps" "$evidence_dir/db" "$evidence_dir/logs"
 
   cat >"$instance_dir/verify.env" <<EOF
-POSTGRES_USER=techcards
-POSTGRES_PASSWORD=local-development-only
-POSTGRES_DB=techcards
+POSTGRES_USER=${VERIFY_POSTGRES_USER}
+POSTGRES_PASSWORD=${VERIFY_POSTGRES_PASSWORD}
+POSTGRES_DB=${VERIFY_POSTGRES_DB}
 POSTGRES_HOST_PORT=${db_port}
-GENERATOR_PROVIDER=mock
+GENERATOR_PROVIDER=${VERIFY_GENERATOR_PROVIDER}
 EOF
 
   cat >"$instance_dir/compose.override.yaml" <<EOF
@@ -261,41 +405,83 @@ services:
       techcards.verify.source_hash: "${source_hash}"
 EOF
 
-  cat >"$instance_dir/instance.env" <<EOF
-RUN_ID=${run_id}
-COMPOSE_PROJECT=${compose_project}
-REPO_ROOT=${repo_root}
-INSTANCE_DIR=${instance_dir}
-EVIDENCE_DIR=${evidence_dir}
-API_PORT=${api_port}
-DB_PORT=${db_port}
-BASE_URL=${base_url}
-GIT_SHA=${git_sha}
-SOURCE_HASH=${source_hash}
-POSTGRES_USER=techcards
-POSTGRES_DB=techcards
-CREATED_AT=${created_at}
-EOF
-
-  python3 - "$evidence_dir/run-meta.json" "$run_id" "$compose_project" "$repo_root" "$base_url" "$api_port" "$db_port" "$git_sha" "$source_hash" "$created_at" <<'PY'
+  python3 - \
+    "$instance_dir/instance.json" \
+    "$evidence_dir/run-meta.json" \
+    "$run_id" \
+    "$compose_project" \
+    "$repo_root" \
+    "$instance_dir" \
+    "$evidence_dir" \
+    "$api_port" \
+    "$db_port" \
+    "$base_url" \
+    "$git_sha" \
+    "$source_hash" \
+    "$VERIFY_POSTGRES_USER" \
+    "$VERIFY_POSTGRES_DB" \
+    "$VERIFY_DB_RO_USER" \
+    "$VERIFY_GENERATOR_PROVIDER" \
+    "$created_at" <<'PY'
 import json
 import pathlib
 import sys
 
-out = pathlib.Path(sys.argv[1])
-meta = {
-    "run_id": sys.argv[2],
-    "compose_project": sys.argv[3],
-    "repo_root": sys.argv[4],
-    "base_url": sys.argv[5],
-    "api_port": int(sys.argv[6]),
-    "db_port": int(sys.argv[7]),
-    "git_sha": sys.argv[8],
-    "source_hash": sys.argv[9],
-    "created_at_utc": sys.argv[10],
-    "generator_provider": "mock",
+(
+    instance_json,
+    evidence_json,
+    run_id,
+    compose_project,
+    repo_root,
+    instance_dir,
+    evidence_dir,
+    api_port,
+    db_port,
+    base_url,
+    git_sha,
+    source_hash,
+    pg_user,
+    pg_db,
+    db_ro_user,
+    gen_provider,
+    created_at,
+) = sys.argv[1:]
+
+instance_meta = {
+    "run_id": run_id,
+    "compose_project": compose_project,
+    "repo_root": repo_root,
+    "instance_dir": instance_dir,
+    "evidence_dir": evidence_dir,
+    "api_port": int(api_port),
+    "db_port": int(db_port),
+    "base_url": base_url,
+    "git_sha": git_sha,
+    "source_hash": source_hash,
+    "postgres_user": pg_user,
+    "postgres_db": pg_db,
+    "db_ro_user": db_ro_user,
+    "generator_provider": gen_provider,
+    "created_at_utc": created_at,
 }
-out.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+pathlib.Path(instance_json).write_text(json.dumps(instance_meta, indent=2) + "\n", encoding="utf-8")
+
+evidence_meta = {
+    "run_id": run_id,
+    "compose_project": compose_project,
+    "repo_root": repo_root,
+    "base_url": base_url,
+    "api_port": int(api_port),
+    "db_port": int(db_port),
+    "git_sha": git_sha,
+    "source_hash": source_hash,
+    "postgres_user": pg_user,
+    "postgres_db": pg_db,
+    "db_ro_user": db_ro_user,
+    "generator_provider": gen_provider,
+    "created_at_utc": created_at,
+}
+pathlib.Path(evidence_json).write_text(json.dumps(evidence_meta, indent=2) + "\n", encoding="utf-8")
 PY
 
   load_instance "$run_id"
@@ -337,6 +523,11 @@ PY
     compose_cmd ps -a >"$EVIDENCE_DIR/logs/launch-timeout.log" 2>&1 || true
     compose_cmd logs --no-color >>"$EVIDENCE_DIR/logs/launch-timeout.log" 2>&1 || true
     die "Timed out waiting for stack readiness (see $EVIDENCE_DIR/logs/launch-timeout.log). Run: $0 cleanup $run_id"
+  fi
+
+  if ! provision_readonly_role; then
+    compose_cmd logs --no-color >"$EVIDENCE_DIR/logs/launch-role-failure.log" 2>&1 || true
+    die "Failed to provision read-only DB role '$DB_RO_USER'. Run: $0 cleanup $run_id"
   fi
 
   echo "READY"
@@ -517,9 +708,18 @@ PY
     record "FAIL" "migrations_head" "alembic_current=${alembic_current:-none} head=${alembic_head:-none}"
   fi
 
+  local ro_check
+  ro_check="$(compose_cmd exec -T -e PGOPTIONS="-c default_transaction_read_only=on" db \
+    psql -At -v ON_ERROR_STOP=1 -U "$DB_RO_USER" -d "$POSTGRES_DB" -c "SELECT current_user;" 2>/dev/null || true)"
+  if [[ "$ro_check" == "$DB_RO_USER" ]]; then
+    record "PASS" "db_readonly_role" "role=$DB_RO_USER connected to db=$POSTGRES_DB"
+  else
+    record "FAIL" "db_readonly_role" "failed to connect as read-only role '$DB_RO_USER'"
+  fi
+
   printf '%s' "$report"
   if (( failures == 0 )); then
-    echo "DOCTOR: HEALTHY (11/11 checks passed)"
+    echo "DOCTOR: HEALTHY (12/12 checks passed)"
   else
     echo "DOCTOR: UNHEALTHY ($failures check(s) failed)"
   fi
@@ -530,7 +730,7 @@ PY
       echo "# Doctor report ($RUN_ID) at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
       printf '%s' "$report"
       if (( failures == 0 )); then
-        echo "DOCTOR: HEALTHY (11/11 checks passed)"
+        echo "DOCTOR: HEALTHY (12/12 checks passed)"
       else
         echo "DOCTOR: UNHEALTHY ($failures check(s) failed)"
       fi
@@ -575,17 +775,19 @@ cmd_req() {
   mkdir -p "$EVIDENCE_DIR/steps"
 
   local url="${BASE_URL}${path}"
-  local hdr_tmp body_tmp
+  local hdr_tmp body_tmp err_tmp
   hdr_tmp="$(mktemp)"
   body_tmp="$(mktemp)"
+  err_tmp="$(mktemp)"
 
   local curl_args=(-sS -D "$hdr_tmp" -o "$body_tmp" -X "$method")
   if [[ -n "$json_body" ]]; then
     curl_args+=(-H "Content-Type: application/json" --data-raw "$json_body")
   fi
 
-  local http_code
-  http_code="$(curl "${curl_args[@]}" -w '%{http_code}' "$url")"
+  local http_code="000"
+  local curl_rc=0
+  http_code="$(curl "${curl_args[@]}" -w '%{http_code}' "$url" 2>"$err_tmp")" || curl_rc=$?
 
   local transcript="$EVIDENCE_DIR/steps/${step_name}.http.txt"
   local body_file="$EVIDENCE_DIR/steps/${step_name}.body.json"
@@ -601,8 +803,22 @@ cmd_req() {
       echo "$json_body"
     fi
     echo ""
-    echo "=== RESPONSE (HTTP ${http_code}) ==="
-    tr -d '\r' <"$hdr_tmp"
+    if (( curl_rc != 0 )); then
+      echo "=== TRANSPORT ERROR (curl exit ${curl_rc}, HTTP ${http_code}) ==="
+      if [[ -s "$err_tmp" ]]; then
+        cat "$err_tmp"
+      else
+        echo "<no stderr output>"
+      fi
+      if [[ -s "$hdr_tmp" ]]; then
+        echo ""
+        echo "=== PARTIAL HEADERS ==="
+        tr -d '\r' <"$hdr_tmp"
+      fi
+    else
+      echo "=== RESPONSE (HTTP ${http_code}) ==="
+      tr -d '\r' <"$hdr_tmp"
+    fi
     if [[ -s "$body_tmp" ]]; then
       python3 - "$body_tmp" <<'PY'
 import json, pathlib, sys
@@ -631,7 +847,19 @@ PY
     : >"$body_file"
   fi
 
-  rm -f "$hdr_tmp" "$body_tmp"
+  local err_msg=""
+  if [[ -s "$err_tmp" ]]; then
+    err_msg="$(cat "$err_tmp")"
+  fi
+  rm -f "$hdr_tmp" "$body_tmp" "$err_tmp"
+
+  if (( curl_rc != 0 )); then
+    echo "ERROR: curl transport failed (exit $curl_rc, HTTP $http_code) for $method $path -> recorded $transcript" >&2
+    if [[ -n "$err_msg" ]]; then
+      echo "$err_msg" >&2
+    fi
+    return "$curl_rc"
+  fi
 
   if (( body_only == 1 )); then
     cat "$body_file"
@@ -666,10 +894,10 @@ cmd_db_query() {
 
   local result
   result="$(compose_cmd exec -T -e PGOPTIONS="-c default_transaction_read_only=on" db \
-    psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "$sql")"
+    psql -v ON_ERROR_STOP=1 -U "$DB_RO_USER" -d "$POSTGRES_DB" -c "$sql")"
 
   {
-    echo "=== DB QUERY (${timestamp}) ==="
+    echo "=== DB QUERY (${timestamp}, role=${DB_RO_USER}) ==="
     echo "$sql"
     echo ""
     echo "=== RESULT ==="
@@ -713,15 +941,23 @@ EVIDENCE_DIR=$EVIDENCE_DIR
 REPO_ROOT=$REPO_ROOT
 GIT_SHA=$GIT_SHA
 SOURCE_HASH=$SOURCE_HASH
+POSTGRES_USER=$POSTGRES_USER
+POSTGRES_DB=$POSTGRES_DB
+DB_RO_USER=$DB_RO_USER
+GENERATOR_PROVIDER=$GENERATOR_PROVIDER
 EOF
 }
 
 cmd_cleanup() {
   require_cmd docker
+  require_cmd python3
   [[ $# -eq 1 ]] || die "Usage: control-techcards.sh cleanup <run-id>"
   local run_id="$1"
 
   load_instance "$run_id"
+
+  # Defensive guard: never delete scratch if evidence overlaps it.
+  assert_disjoint_paths "$INSTANCE_DIR" "$EVIDENCE_DIR"
 
   echo "Tearing down isolated Compose project '$COMPOSE_PROJECT'..."
   compose_cmd down --volumes --remove-orphans --rmi local
