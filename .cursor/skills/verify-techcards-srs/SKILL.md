@@ -19,7 +19,7 @@ Run from the repository root (requires Docker with Compose v2, `curl`, and `pyth
 
 Optional flags: `--run-id <id>`, `--api-port <port>`, `--db-port <port>`, `--evidence-dir <dir>`.
 
-- `--run-id` must match `^[a-z0-9][a-z0-9_-]*$`. Each launch also generates a random 12-hex `run_nonce` so the Compose project is `verify-techcards-<run-id>-<nonce>` and every container, volume, and network carries ownership labels (`techcards.verify.run_id`, `techcards.verify.run_nonce`, `techcards.verify.instance_dir`).
+- `--run-id` must match `^[a-z0-9][a-z0-9_-]*$`. Each launch also generates a random 12-hex `run_nonce` so the Compose project is `verify-techcards-<run-id>-<nonce>` and every container, volume, and network carries pure-ASCII ownership labels (`techcards.verify.run_id`, `techcards.verify.run_nonce`, `techcards.verify.instance_dir_sha256`, which encodes the canonical instance directory path as SHA-256 hex so Compose variable interpolation and Unicode paths cannot corrupt it).
 - `--evidence-dir` must not already exist and must be strictly outside the scratch state tree (`.../instances/`), so separate runs never mix evidence and cleanup can never delete proof files. If creating the evidence parent or directory fails before `instance.json` is written, `launch` rolls back the scratch reservation automatically so the same `--run-id` can be retried.
 
 What `launch` does:
@@ -53,7 +53,7 @@ Run this read-only check right after `launch`, and first whenever anything looks
 Add `--save` to also write the diagnostic report to `<evidence-dir>/doctor.txt`.
 
 `doctor` mutates nothing and checks 12 conditions (exits `0` only if all 12 pass):
-1. `instance_state`: `<run-id>` resolves to an active `verify-techcards-<run-id>-<nonce>` Compose project whose containers, volume, and network all match this run's ownership labels (`run_id`, `run_nonce`, `instance_dir`).
+1. `instance_state`: `<run-id>` resolves to an active `verify-techcards-<run-id>-<nonce>` Compose project whose containers, volume, and network all match this run's ownership labels (`run_id`, `run_nonce`, `instance_dir_sha256`).
 2. `db_container`: PostgreSQL container is running and `healthy`.
 3. `migrate_container`: `migrate` exited with code `0`.
 4. `api_container`: API container is running and `healthy`.
@@ -107,8 +107,8 @@ ${XDG_STATE_HOME:-$HOME/.local/state}/verify-techcards-srs/evidence/<run-id>/
 (Override with `--evidence-dir <dir>` or `VERIFY_EVIDENCE_DIR`; the target directory must not already exist and must lie outside the scratch `instances/` tree.)
 
 Saved end-to-end proof runs on the author's host (outside the repository, surviving cleanup):
-- Latest verified proof (`features/study-reviews.md`): `~/.local/state/verify-techcards-srs/evidence/proof-study-reviews-v3/`
-- Previous proof runs (`features/study-reviews.md`): `~/.local/state/verify-techcards-srs/evidence/proof-study-reviews-v2/`, `~/.local/state/verify-techcards-srs/evidence/proof-study-reviews/`
+- Latest verified proof (`features/study-reviews.md`): `~/.local/state/verify-techcards-srs/evidence/proof-study-reviews-v4/`
+- Previous proof runs (`features/study-reviews.md`): `~/.local/state/verify-techcards-srs/evidence/proof-study-reviews-v3/`, `~/.local/state/verify-techcards-srs/evidence/proof-study-reviews-v2/`, `~/.local/state/verify-techcards-srs/evidence/proof-study-reviews/`
 
 What every proof run captures in `<evidence-dir>/`:
 - `run-meta.json`: run ID, run nonce, Compose project, git SHA, source hash, base URL, loopback ports, database/role/provider settings, UTC timestamp (no credentials).
@@ -134,9 +134,9 @@ Always tear down every verification instance you launched — including after fa
 
 Cleanup rules enforced by the script:
 - **Never kill by process name** (`pkill uvicorn`, `docker rm -f` by image, or `docker compose down` in the repo root are forbidden — they can destroy the user's running local stack).
-- Refuses to act unless the recorded Compose project matches `verify-techcards-<run-id>-<nonce>`, `instance.json` matches the loaded state directory, and every existing container, volume, and network for that project carries matching `techcards.verify.run_id`, `techcards.verify.run_nonce`, and `techcards.verify.instance_dir` ownership labels.
-- Runs `docker compose -p verify-techcards-<run-id>-<nonce> ... down --volumes --remove-orphans --rmi local` to remove ONLY that run's containers, network, fresh database volume, and project-scoped image tags.
-- Deletes ONLY the scratch instance state directory (`.../instances/<run-id>/`).
+- Refuses to act unless the recorded Compose project matches `verify-techcards-<run-id>-<nonce>`, `instance.json` matches the loaded state directory, and every existing container, volume (including mounted volumes), and network for that project carries matching `techcards.verify.run_id`, `techcards.verify.run_nonce`, and `techcards.verify.instance_dir_sha256` ownership labels.
+- Runs `docker compose -p verify-techcards-<run-id>-<nonce> ... down --remove-orphans --rmi local` (without `--volumes`, using the launch-time snapshot `compose.base.yaml`) to remove ONLY that run's containers, network, and project-scoped image tags, then re-verifies ownership labels and runs `docker volume rm` exclusively on the exact volumes verified for this run so mid-run edits to `compose.yaml` cannot delete another project's volume.
+- Verifies no containers, volumes, or networks remain for the project before deleting ONLY the scratch instance state directory (`.../instances/<run-id>/`).
 - **Never deletes `<evidence-dir>`** (`.../evidence/<run-id>/`) and verifies path disjointness before removing scratch state.
 
 After cleanup, confirm that the instance is gone and the evidence survived:
@@ -144,6 +144,7 @@ After cleanup, confirm that the instance is gone and the evidence survived:
 ```bash
 docker ps -a --filter "label=com.docker.compose.project=<compose-project>"
 docker volume ls --filter "label=com.docker.compose.project=<compose-project>"
+docker network ls --filter "label=com.docker.compose.project=<compose-project>"
 ls -la "${XDG_STATE_HOME:-$HOME/.local/state}/verify-techcards-srs/evidence/<run-id>/"
 ```
 

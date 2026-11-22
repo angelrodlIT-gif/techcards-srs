@@ -288,6 +288,11 @@ compose_cmd() {
   # Explicitly unset/override exported Compose variables so caller's shell env
   # cannot hijack POSTGRES_*, GENERATOR_PROVIDER, DATABASE_URL, or COMPOSE_PROFILES
   # (e.g. COMPOSE_PROFILES=test activating the SQLite test service).
+  # Use the launch-time snapshot of compose.yaml (when present) so mid-run edits
+  # to the working tree's compose.yaml cannot redirect teardown resources.
+  local compose_base="$INSTANCE_DIR/compose.base.yaml"
+  [[ -f "$compose_base" ]] || compose_base="$REPO_ROOT/compose.yaml"
+
   env \
     -u DATABASE_URL \
     -u COMPOSE_PROFILES \
@@ -303,16 +308,17 @@ compose_cmd() {
     GENERATOR_PROVIDER="$GENERATOR_PROVIDER" \
     docker compose \
     --progress=plain \
+    --project-directory "$REPO_ROOT" \
     -p "$COMPOSE_PROJECT" \
     --env-file "$INSTANCE_DIR/verify.env" \
-    -f "$REPO_ROOT/compose.yaml" \
+    -f "$compose_base" \
     -f "$INSTANCE_DIR/compose.override.yaml" \
     "$@"
 }
 
 assert_project_unused() {
   local project="$1"
-  local existing_containers existing_volumes existing_networks existing_named_vol
+  local existing_containers existing_volumes existing_networks existing_named_vol existing_named_net
   existing_containers="$(docker ps -a --filter "label=com.docker.compose.project=${project}" -q)"
   existing_volumes="$(docker volume ls --filter "label=com.docker.compose.project=${project}" -q)"
   existing_networks="$(docker network ls --filter "label=com.docker.compose.project=${project}" -q)"
@@ -320,27 +326,35 @@ assert_project_unused() {
   if docker volume inspect "${project}_postgres_data" >/dev/null 2>&1; then
     existing_named_vol="${project}_postgres_data"
   fi
+  existing_named_net=""
+  if docker network inspect "${project}_default" >/dev/null 2>&1; then
+    existing_named_net="${project}_default"
+  fi
 
-  if [[ -n "$existing_containers" || -n "$existing_volumes" || -n "$existing_networks" || -n "$existing_named_vol" ]]; then
+  if [[ -n "$existing_containers" || -n "$existing_volumes" || -n "$existing_networks" || -n "$existing_named_vol" || -n "$existing_named_net" ]]; then
     die "Compose project '$project' already has resources on this Docker daemon; refusing to reuse an existing project"
   fi
 }
 
 verify_project_ownership() {
   local require_present="${1:-0}"
-  python3 - "$COMPOSE_PROJECT" "$RUN_ID" "$RUN_NONCE" "$INSTANCE_DIR" "$require_present" <<'PY'
+  local output_mode="${2:-summary}"
+  python3 - "$COMPOSE_PROJECT" "$RUN_ID" "$RUN_NONCE" "$INSTANCE_DIR" "$require_present" "$output_mode" <<'PY'
+import hashlib
 import json
+import os
 import subprocess
 import sys
 
-project, run_id, run_nonce, instance_dir, require_present_raw = sys.argv[1:]
+project, run_id, run_nonce, instance_dir, require_present_raw, output_mode = sys.argv[1:]
 require_present = require_present_raw == "1"
+instance_dir_sha256 = hashlib.sha256(os.fsencode(instance_dir)).hexdigest()
 
 expected = {
     "com.docker.compose.project": project,
     "techcards.verify.run_id": run_id,
     "techcards.verify.run_nonce": run_nonce,
-    "techcards.verify.instance_dir": instance_dir,
+    "techcards.verify.instance_dir_sha256": instance_dir_sha256,
 }
 
 
@@ -360,25 +374,24 @@ def inspect_json(cmd):
     return json.loads(proc.stdout)
 
 
-containers = run_lines(["docker", "ps", "-a", "--filter", f"label=com.docker.compose.project={project}", "-q"])
+containers = run_lines(["docker", "ps", "-a", "--no-trunc", "--filter", f"label=com.docker.compose.project={project}", "-q"])
 volumes = run_lines(["docker", "volume", "ls", "--filter", f"label=com.docker.compose.project={project}", "-q"])
-networks = run_lines(["docker", "network", "ls", "--filter", f"label=com.docker.compose.project={project}", "-q"])
+networks = run_lines(["docker", "network", "ls", "--no-trunc", "--filter", f"label=com.docker.compose.project={project}", "-q"])
 
-# Also check the default Compose volume name even if it lacks Compose labels.
+# Also check the default Compose volume and network names even if they lack Compose labels.
 expected_vol_name = f"{project}_postgres_data"
 if expected_vol_name not in volumes:
     probe = subprocess.run(["docker", "volume", "inspect", expected_vol_name], capture_output=True, text=True, check=False)
     if probe.returncode == 0:
         volumes.append(expected_vol_name)
 
-total_resources = len(containers) + len(volumes) + len(networks)
-if require_present and (not containers or not volumes):
-    print(
-        f"Expected owned containers and volume for project '{project}', "
-        f"found containers={len(containers)} volumes={len(volumes)} networks={len(networks)}",
-        file=sys.stderr,
-    )
-    sys.exit(1)
+expected_net_name = f"{project}_default"
+if expected_net_name not in networks:
+    probe = subprocess.run(["docker", "network", "inspect", expected_net_name], capture_output=True, text=True, check=False)
+    if probe.returncode == 0:
+        net_items = json.loads(probe.stdout)
+        if net_items and net_items[0].get("Id") not in networks:
+            networks.append(net_items[0]["Id"])
 
 errors = []
 
@@ -400,12 +413,29 @@ if containers:
         name = item.get("Name", "").lstrip("/")
         labels = (item.get("Config") or {}).get("Labels") or {}
         check_labels("container", f"{name}({cid})", labels)
+        for mount in item.get("Mounts") or []:
+            if mount.get("Type") == "volume" and mount.get("Name"):
+                vol_name = mount["Name"]
+                if vol_name not in volumes:
+                    volumes.append(vol_name)
 
+if require_present and (not containers or not volumes):
+    print(
+        f"Expected owned containers and volume for project '{project}', "
+        f"found containers={len(containers)} volumes={len(volumes)} networks={len(networks)}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+verified_volumes = []
 if volumes:
     for item in inspect_json(["docker", "volume", "inspect", *volumes]):
         name = item.get("Name", "")
         labels = item.get("Labels") or {}
+        before_err_count = len(errors)
         check_labels("volume", name, labels)
+        if len(errors) == before_err_count and name:
+            verified_volumes.append(name)
 
 if networks:
     for item in inspect_json(["docker", "network", "inspect", *networks]):
@@ -423,7 +453,58 @@ if errors:
         print(f"  - {err}", file=sys.stderr)
     sys.exit(1)
 
-print(f"verified containers={len(containers)} volumes={len(volumes)} networks={len(networks)}")
+if output_mode == "volumes":
+    for vol_name in verified_volumes:
+        print(vol_name)
+else:
+    print(f"verified containers={len(containers)} volumes={len(volumes)} networks={len(networks)}")
+PY
+}
+
+remove_verified_volumes() {
+  python3 - "$COMPOSE_PROJECT" "$RUN_ID" "$RUN_NONCE" "$INSTANCE_DIR" "$@" <<'PY'
+import hashlib
+import json
+import os
+import subprocess
+import sys
+
+project, run_id, run_nonce, instance_dir, *volume_names = sys.argv[1:]
+if not volume_names:
+    sys.exit(0)
+
+instance_dir_sha256 = hashlib.sha256(os.fsencode(instance_dir)).hexdigest()
+expected = {
+    "com.docker.compose.project": project,
+    "techcards.verify.run_id": run_id,
+    "techcards.verify.run_nonce": run_nonce,
+    "techcards.verify.instance_dir_sha256": instance_dir_sha256,
+}
+
+for vol_name in volume_names:
+    probe = subprocess.run(["docker", "volume", "inspect", vol_name], capture_output=True, text=True, check=False)
+    if probe.returncode != 0:
+        continue
+    items = json.loads(probe.stdout)
+    if not items:
+        continue
+    labels = items[0].get("Labels") or {}
+    mismatches = [
+        f"{key}: expected {want!r}, got {labels.get(key)!r}"
+        for key, want in expected.items()
+        if labels.get(key) != want
+    ]
+    if mismatches:
+        print(
+            f"ERROR: Refusing to delete volume '{vol_name}' because ownership labels changed or did not match: "
+            + "; ".join(mismatches),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    rm = subprocess.run(["docker", "volume", "rm", "--", vol_name], capture_output=True, text=True, check=False)
+    if rm.returncode != 0:
+        print(f"ERROR: Failed to remove verified volume '{vol_name}': {rm.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
 PY
 }
 
@@ -731,8 +812,11 @@ EOF
     printf '%s\n' "$ro_password" >"$instance_dir/db-ro.secret"
   )
 
+  cp "$repo_root/compose.yaml" "$instance_dir/compose.base.yaml"
+
   python3 - \
     "$instance_dir/compose.override.yaml" \
+    "$compose_project" \
     "$db_port" \
     "$api_port" \
     "$run_id" \
@@ -740,55 +824,63 @@ EOF
     "$instance_dir" \
     "$git_sha" \
     "$source_hash" <<'PY'
+import hashlib
 import json
+import os
 import pathlib
 import sys
 
-out_path, db_port, api_port, run_id, run_nonce, instance_dir, git_sha, source_hash = sys.argv[1:]
+out_path, compose_project, db_port, api_port, run_id, run_nonce, instance_dir, git_sha, source_hash = sys.argv[1:]
+instance_dir_sha256 = hashlib.sha256(os.fsencode(instance_dir)).hexdigest()
 
 
-def q(val):
-    return json.dumps(str(val))
+def q_safe_ascii(val):
+    text = str(val)
+    if "$" in text or not text.isascii():
+        raise ValueError(f"Unsafe Compose YAML label/scalar value: {text!r}")
+    return json.dumps(text, ensure_ascii=True)
 
 
 content = f"""services:
   db:
     ports: !override
-      - {q(f"127.0.0.1:{db_port}:5432")}
+      - {q_safe_ascii(f"127.0.0.1:{db_port}:5432")}
     labels:
-      techcards.verify.run_id: {q(run_id)}
-      techcards.verify.run_nonce: {q(run_nonce)}
-      techcards.verify.instance_dir: {q(instance_dir)}
-      techcards.verify.git_sha: {q(git_sha)}
-      techcards.verify.source_hash: {q(source_hash)}
+      techcards.verify.run_id: {q_safe_ascii(run_id)}
+      techcards.verify.run_nonce: {q_safe_ascii(run_nonce)}
+      techcards.verify.instance_dir_sha256: {q_safe_ascii(instance_dir_sha256)}
+      techcards.verify.git_sha: {q_safe_ascii(git_sha)}
+      techcards.verify.source_hash: {q_safe_ascii(source_hash)}
   migrate:
     labels:
-      techcards.verify.run_id: {q(run_id)}
-      techcards.verify.run_nonce: {q(run_nonce)}
-      techcards.verify.instance_dir: {q(instance_dir)}
-      techcards.verify.git_sha: {q(git_sha)}
-      techcards.verify.source_hash: {q(source_hash)}
+      techcards.verify.run_id: {q_safe_ascii(run_id)}
+      techcards.verify.run_nonce: {q_safe_ascii(run_nonce)}
+      techcards.verify.instance_dir_sha256: {q_safe_ascii(instance_dir_sha256)}
+      techcards.verify.git_sha: {q_safe_ascii(git_sha)}
+      techcards.verify.source_hash: {q_safe_ascii(source_hash)}
   api:
     ports: !override
-      - {q(f"127.0.0.1:{api_port}:8000")}
+      - {q_safe_ascii(f"127.0.0.1:{api_port}:8000")}
     labels:
-      techcards.verify.run_id: {q(run_id)}
-      techcards.verify.run_nonce: {q(run_nonce)}
-      techcards.verify.instance_dir: {q(instance_dir)}
-      techcards.verify.git_sha: {q(git_sha)}
-      techcards.verify.source_hash: {q(source_hash)}
+      techcards.verify.run_id: {q_safe_ascii(run_id)}
+      techcards.verify.run_nonce: {q_safe_ascii(run_nonce)}
+      techcards.verify.instance_dir_sha256: {q_safe_ascii(instance_dir_sha256)}
+      techcards.verify.git_sha: {q_safe_ascii(git_sha)}
+      techcards.verify.source_hash: {q_safe_ascii(source_hash)}
 volumes:
   postgres_data:
+    name: {q_safe_ascii(f"{compose_project}_postgres_data")}
     labels:
-      techcards.verify.run_id: {q(run_id)}
-      techcards.verify.run_nonce: {q(run_nonce)}
-      techcards.verify.instance_dir: {q(instance_dir)}
+      techcards.verify.run_id: {q_safe_ascii(run_id)}
+      techcards.verify.run_nonce: {q_safe_ascii(run_nonce)}
+      techcards.verify.instance_dir_sha256: {q_safe_ascii(instance_dir_sha256)}
 networks:
   default:
+    name: {q_safe_ascii(f"{compose_project}_default")}
     labels:
-      techcards.verify.run_id: {q(run_id)}
-      techcards.verify.run_nonce: {q(run_nonce)}
-      techcards.verify.instance_dir: {q(instance_dir)}
+      techcards.verify.run_id: {q_safe_ascii(run_id)}
+      techcards.verify.run_nonce: {q_safe_ascii(run_nonce)}
+      techcards.verify.instance_dir_sha256: {q_safe_ascii(instance_dir_sha256)}
 """
 pathlib.Path(out_path).write_text(content, encoding="utf-8")
 PY
@@ -1363,18 +1455,39 @@ cmd_cleanup() {
   # Defensive guard: never delete scratch if evidence overlaps it.
   assert_disjoint_paths "$INSTANCE_DIR" "$EVIDENCE_DIR"
 
-  # Verify every existing container, volume, and network for this Compose project
-  # carries this exact run's ownership labels before tearing anything down.
-  verify_project_ownership 0 >/dev/null || die "Refusing to tear down '$COMPOSE_PROJECT' because ownership verification failed"
+  # Verify every existing container, volume (including mounted volumes), and network
+  # for this Compose project carries this exact run's ownership labels, and capture
+  # the exact list of verified volumes to delete after containers stop.
+  local verified_volumes=()
+  local verified_volumes_raw
+  if ! verified_volumes_raw="$(verify_project_ownership 0 volumes)"; then
+    die "Refusing to tear down '$COMPOSE_PROJECT' because ownership verification failed"
+  fi
+  while IFS= read -r vol; do
+    [[ -n "$vol" ]] && verified_volumes+=("$vol")
+  done <<<"$verified_volumes_raw"
 
   echo "Tearing down isolated Compose project '$COMPOSE_PROJECT'..."
-  compose_cmd down --volumes --remove-orphans --rmi local
+  # Never pass --volumes to compose down: volume deletion is bound exclusively to
+  # the exact volumes whose ownership labels were verified above.
+  compose_cmd down --remove-orphans --rmi local
 
-  local remaining_containers remaining_volumes
+  if [[ ${#verified_volumes[@]} -gt 0 ]]; then
+    remove_verified_volumes "${verified_volumes[@]}"
+  fi
+
+  local remaining_containers remaining_volumes remaining_networks
   remaining_containers="$(docker ps -a --filter "label=com.docker.compose.project=${COMPOSE_PROJECT}" -q)"
   remaining_volumes="$(docker volume ls --filter "label=com.docker.compose.project=${COMPOSE_PROJECT}" -q)"
-  if [[ -n "$remaining_containers" || -n "$remaining_volumes" ]]; then
-    die "Cleanup incomplete: remaining resources for $COMPOSE_PROJECT (containers='${remaining_containers}' volumes='${remaining_volumes}')"
+  remaining_networks="$(docker network ls --filter "label=com.docker.compose.project=${COMPOSE_PROJECT}" -q)"
+  if [[ -z "$remaining_volumes" ]] && docker volume inspect "${COMPOSE_PROJECT}_postgres_data" >/dev/null 2>&1; then
+    remaining_volumes="${COMPOSE_PROJECT}_postgres_data"
+  fi
+  if [[ -z "$remaining_networks" ]] && docker network inspect "${COMPOSE_PROJECT}_default" >/dev/null 2>&1; then
+    remaining_networks="${COMPOSE_PROJECT}_default"
+  fi
+  if [[ -n "$remaining_containers" || -n "$remaining_volumes" || -n "$remaining_networks" ]]; then
+    die "Cleanup incomplete: remaining resources for $COMPOSE_PROJECT (containers='${remaining_containers}' volumes='${remaining_volumes}' networks='${remaining_networks}')"
   fi
 
   rm -rf "$INSTANCE_DIR"
