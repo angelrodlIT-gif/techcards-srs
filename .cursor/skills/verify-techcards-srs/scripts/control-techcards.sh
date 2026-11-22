@@ -970,7 +970,15 @@ PY
 
   load_instance "$run_id"
 
-  # Reservation is now committed (instance.json exists and cleanup <run-id> can tear it down).
+  # Validate the saved Compose model while reservation rollback is still active
+  # so a syntax or model error in compose.yaml rolls back the reservation cleanly
+  # instead of stranding the run-id.
+  if ! compose_cmd config -q; then
+    die "Compose configuration validation failed for '$COMPOSE_PROJECT' (rolled back reservation for '$run_id')"
+  fi
+
+  # Reservation is now committed (valid Compose model + instance.json exist and
+  # cleanup <run-id> can tear down any resources created from this point on).
   _LAUNCH_RESERVATION_ACTIVE=0
   _LAUNCH_RESERVED_INSTANCE_DIR=""
   _LAUNCH_RESERVED_EVIDENCE_DIR=""
@@ -1470,7 +1478,20 @@ cmd_cleanup() {
   echo "Tearing down isolated Compose project '$COMPOSE_PROJECT'..."
   # Never pass --volumes to compose down: volume deletion is bound exclusively to
   # the exact volumes whose ownership labels were verified above.
-  compose_cmd down --remove-orphans --rmi local
+  if compose_cmd config -q 2>/dev/null; then
+    compose_cmd down --remove-orphans --rmi local
+  else
+    # If the saved Compose snapshot is invalid, still allow releasing the reservation
+    # ONLY when zero containers, volumes, networks, or project-scoped images exist.
+    local live_containers live_networks live_images
+    live_containers="$(docker ps -a --filter "label=com.docker.compose.project=${COMPOSE_PROJECT}" -q)"
+    live_networks="$(docker network ls --filter "label=com.docker.compose.project=${COMPOSE_PROJECT}" -q)"
+    live_images="$(docker images -q --filter "reference=${COMPOSE_PROJECT}-*")"
+    if [[ -n "$live_containers" || -n "$live_networks" || -n "$live_images" || ${#verified_volumes[@]} -gt 0 ]]; then
+      die "Saved Compose snapshot for '$COMPOSE_PROJECT' is invalid while resources still exist; cannot safely run compose down"
+    fi
+    echo "Warning: saved Compose snapshot for '$COMPOSE_PROJECT' is invalid, but no Docker resources exist; releasing scratch state." >&2
+  fi
 
   if [[ ${#verified_volumes[@]} -gt 0 ]]; then
     remove_verified_volumes "${verified_volumes[@]}"

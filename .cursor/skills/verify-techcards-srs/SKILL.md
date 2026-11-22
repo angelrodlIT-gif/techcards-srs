@@ -20,7 +20,7 @@ Run from the repository root (requires Docker with Compose v2, `curl`, and `pyth
 Optional flags: `--run-id <id>`, `--api-port <port>`, `--db-port <port>`, `--evidence-dir <dir>`.
 
 - `--run-id` must match `^[a-z0-9][a-z0-9_-]*$`. Each launch also generates a random 12-hex `run_nonce` so the Compose project is `verify-techcards-<run-id>-<nonce>` and every container, volume, and network carries pure-ASCII ownership labels (`techcards.verify.run_id`, `techcards.verify.run_nonce`, `techcards.verify.instance_dir_sha256`, which encodes the canonical instance directory path as SHA-256 hex so Compose variable interpolation and Unicode paths cannot corrupt it).
-- `--evidence-dir` must not already exist and must be strictly outside the scratch state tree (`.../instances/`), so separate runs never mix evidence and cleanup can never delete proof files. If creating the evidence parent or directory fails before `instance.json` is written, `launch` rolls back the scratch reservation automatically so the same `--run-id` can be retried.
+- `--evidence-dir` must not already exist and must be strictly outside the scratch state tree (`.../instances/`), so separate runs never mix evidence and cleanup can never delete proof files. If creating the evidence parent/directory or validating the saved Compose model (`docker compose config -q`) fails before launching containers, `launch` rolls back the scratch and fresh evidence reservation automatically so the same `--run-id` can be retried.
 
 What `launch` does:
 1. Atomically reserves the scratch directory (`${XDG_STATE_HOME:-$HOME/.local/state}/verify-techcards-srs/instances/<run-id>/`) and a fresh evidence directory (rolling back the scratch reservation on failure), picks two unused `127.0.0.1` ports (leaving `8000` and `5435` untouched), generates a random per-run `run_nonce` and `techcards_ro` password (stored `0600` in scratch only), confirms no Docker resources exist for `verify-techcards-<run-id>-<nonce>`, writes JSON instance metadata (`instance.json`) and a scratch Compose override (`!override` on `db.ports` and `api.ports`, plus ownership labels on services, volume, and network), and passes fixed verification settings explicitly to `docker compose` (`POSTGRES_USER=techcards`, `POSTGRES_DB=techcards`, `GENERATOR_PROVIDER=mock`, unsetting `DATABASE_URL` and `COMPOSE_PROFILES`) so exported shell variables cannot hijack the isolated run or activate extra Compose profiles such as `test`.
@@ -107,8 +107,8 @@ ${XDG_STATE_HOME:-$HOME/.local/state}/verify-techcards-srs/evidence/<run-id>/
 (Override with `--evidence-dir <dir>` or `VERIFY_EVIDENCE_DIR`; the target directory must not already exist and must lie outside the scratch `instances/` tree.)
 
 Saved end-to-end proof runs on the author's host (outside the repository, surviving cleanup):
-- Latest verified proof (`features/study-reviews.md`): `~/.local/state/verify-techcards-srs/evidence/proof-study-reviews-v4/`
-- Previous proof runs (`features/study-reviews.md`): `~/.local/state/verify-techcards-srs/evidence/proof-study-reviews-v3/`, `~/.local/state/verify-techcards-srs/evidence/proof-study-reviews-v2/`, `~/.local/state/verify-techcards-srs/evidence/proof-study-reviews/`
+- Latest verified proof (`features/study-reviews.md`): `~/.local/state/verify-techcards-srs/evidence/proof-study-reviews-v5/`
+- Previous proof runs (`features/study-reviews.md`): `~/.local/state/verify-techcards-srs/evidence/proof-study-reviews-v4/`, `~/.local/state/verify-techcards-srs/evidence/proof-study-reviews-v3/`, `~/.local/state/verify-techcards-srs/evidence/proof-study-reviews-v2/`, `~/.local/state/verify-techcards-srs/evidence/proof-study-reviews/`
 
 What every proof run captures in `<evidence-dir>/`:
 - `run-meta.json`: run ID, run nonce, Compose project, git SHA, source hash, base URL, loopback ports, database/role/provider settings, UTC timestamp (no credentials).
