@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Disposable PostgreSQL 16 backup/restore drill for techcards-srs.
-# Uses fresh Compose projects (-p), ephemeral ports, owner-only permissions, and
-# non-secret placeholder credentials. Never reads .env or touches techcards-srs.
+# Uses fresh Compose projects (-p), ephemeral ports, exclusive owner-only dumps,
+# and non-secret placeholder credentials. Never reads .env or touches techcards-srs.
 set -euo pipefail
 set -o noclobber
 umask 077
@@ -20,6 +20,10 @@ DST_PROJECT="techcards-backup-dst-${RUN_ID}"
 SRC_PORT="${SRC_PORT:-15435}"
 DST_PORT="${DST_PORT:-15436}"
 
+if [[ ! "$SRC_PORT" =~ ^[0-9]+$ || ! "$DST_PORT" =~ ^[0-9]+$ ]]; then
+  echo "SRC_PORT and DST_PORT must be numeric." >&2
+  exit 1
+fi
 if [[ "$SRC_PORT" == "5435" || "$DST_PORT" == "5435" || "$SRC_PORT" == "$DST_PORT" ]]; then
   echo "Use distinct disposable ports (not the default live port 5435)." >&2
   exit 1
@@ -28,6 +32,8 @@ fi
 SRC_OWNED=0
 DST_OWNED=0
 DUMP_DIR=""
+DUMP_FILE=""
+DUMP_READY=0
 
 compose_src() {
   POSTGRES_HOST_PORT="$SRC_PORT" docker compose --env-file /dev/null -p "$SRC_PROJECT" "$@"
@@ -54,6 +60,26 @@ assert_fresh_project() {
   fi
 }
 
+assert_regular_dump_target() {
+  local path="$1"
+  if [[ -z "$DUMP_DIR" || -z "$path" || "$path" != "${DUMP_DIR}/"* || -L "$path" || -p "$path" || ! -f "$path" ]]; then
+    echo "Refusing non-regular or unowned dump path '${path}'." >&2
+    exit 1
+  fi
+}
+
+assert_ready_dump() {
+  if [[ "$DUMP_READY" != "1" ]]; then
+    echo "Refusing to inspect or restore: dump was not completed in this run." >&2
+    exit 1
+  fi
+  assert_regular_dump_target "$DUMP_FILE"
+  if [[ ! -s "$DUMP_FILE" ]]; then
+    echo "Refusing to inspect or restore empty dump '${DUMP_FILE}'." >&2
+    exit 1
+  fi
+}
+
 cleanup() {
   local exit_code=$?
   set +e
@@ -65,7 +91,7 @@ cleanup() {
     echo "==> Cleaning up owned disposable stack (${DST_PROJECT})..."
     compose_dst down --volumes --remove-orphans --rmi local >/dev/null 2>&1
   fi
-  if [[ -n "$DUMP_DIR" ]]; then
+  if [[ -n "$DUMP_DIR" && -d "$DUMP_DIR" && ! -L "$DUMP_DIR" ]]; then
     rm -rf "$DUMP_DIR"
   fi
   exit "$exit_code"
@@ -73,7 +99,11 @@ cleanup() {
 trap cleanup EXIT
 
 DUMP_DIR="$(mktemp -d)"
-DUMP_FILE="${DUMP_DIR}/disposable-${RUN_ID}.dump"
+chmod 700 "$DUMP_DIR"
+if [[ ! -d "$DUMP_DIR" || -L "$DUMP_DIR" ]]; then
+  echo "Invalid temporary dump directory '${DUMP_DIR}'." >&2
+  exit 1
+fi
 
 assert_fresh_project "$SRC_PROJECT"
 SRC_OWNED=1
@@ -120,8 +150,19 @@ SRC_BREAKDOWN="$(compose_src exec -T db psql -At -F '|' -v ON_ERROR_STOP=1 -U "$
 echo "Source summary (decks|cards|reviews|joined_reviews|orphan_cards|orphan_reviews): ${SRC_SUMMARY}"
 
 echo "==> Dumping disposable source with pg_dump --format=custom..."
+DUMP_FILE="$(mktemp "${DUMP_DIR}/disposable-${RUN_ID}-XXXXXX")"
+chmod 600 "$DUMP_FILE"
+assert_regular_dump_target "$DUMP_FILE"
 compose_src exec -T db pg_dump --format=custom --no-owner --no-privileges \
-  -U "$POSTGRES_USER" -d "$POSTGRES_DB" > "$DUMP_FILE"
+  -U "$POSTGRES_USER" -d "$POSTGRES_DB" >| "$DUMP_FILE"
+assert_regular_dump_target "$DUMP_FILE"
+if [[ ! -s "$DUMP_FILE" ]]; then
+  echo "ERROR: pg_dump produced an empty file." >&2
+  exit 1
+fi
+DUMP_READY=1
+
+assert_ready_dump
 DUMP_TOC_LINES="$(compose_src exec -T db pg_restore --list < "$DUMP_FILE" | wc -l | tr -d ' ')"
 echo "Dump created (${DUMP_TOC_LINES} TOC entries)."
 
@@ -131,6 +172,7 @@ echo "==> Starting fresh disposable target PostgreSQL (${DST_PROJECT}, port ${DS
 compose_dst up -d --wait db
 
 echo "==> Restoring dump into disposable target..."
+assert_ready_dump
 compose_dst exec -T db pg_restore --no-owner --no-privileges --single-transaction --exit-on-error \
   -U "$POSTGRES_USER" -d "$POSTGRES_DB" < "$DUMP_FILE"
 
