@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Disposable PostgreSQL 16 backup/restore verification drill for techcards-srs.
-# Uses isolated Compose projects (-p), ephemeral ports, and non-secret placeholder
-# credentials. Never reads .env and never touches the live techcards-srs stack.
+# Disposable PostgreSQL 16 backup/restore drill for techcards-srs.
+# Uses fresh Compose projects (-p), ephemeral ports, owner-only permissions, and
+# non-secret placeholder credentials. Never reads .env or touches techcards-srs.
 set -euo pipefail
+umask 077
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
@@ -12,7 +13,7 @@ export POSTGRES_USER="disposable_user"
 export POSTGRES_PASSWORD="disposable-local-test-only"
 export POSTGRES_DB="techcards_disposable"
 
-RUN_ID="$$"
+RUN_ID="$(date -u +%Y%m%d%H%M%S)-$(od -An -tx1 -N6 /dev/urandom | tr -d ' \n')"
 SRC_PROJECT="techcards-backup-src-${RUN_ID}"
 DST_PROJECT="techcards-backup-dst-${RUN_ID}"
 SRC_PORT="${SRC_PORT:-15435}"
@@ -23,8 +24,9 @@ if [[ "$SRC_PORT" == "5435" || "$DST_PORT" == "5435" || "$SRC_PORT" == "$DST_POR
   exit 1
 fi
 
-DUMP_DIR="$(mktemp -d)"
-DUMP_FILE="${DUMP_DIR}/disposable.dump"
+SRC_OWNED=0
+DST_OWNED=0
+DUMP_DIR=""
 
 compose_src() {
   POSTGRES_HOST_PORT="$SRC_PORT" docker compose --env-file /dev/null -p "$SRC_PROJECT" "$@"
@@ -34,17 +36,42 @@ compose_dst() {
   POSTGRES_HOST_PORT="$DST_PORT" docker compose --env-file /dev/null -p "$DST_PROJECT" "$@"
 }
 
+assert_fresh_project() {
+  local project="$1"
+  local containers volumes_by_name volumes_by_label networks
+  containers="$(docker ps -aq --filter "label=com.docker.compose.project=${project}")"
+  volumes_by_name="$(docker volume ls -q --filter "name=^${project}_")"
+  volumes_by_label="$(docker volume ls -q --filter "label=com.docker.compose.project=${project}")"
+  networks="$(docker network ls -q --filter "label=com.docker.compose.project=${project}")"
+  if [[ -n "${containers}${volumes_by_name}${volumes_by_label}${networks}" ]]; then
+    echo "Refusing to reuse existing Compose project '${project}'." >&2
+    exit 1
+  fi
+}
+
 cleanup() {
   local exit_code=$?
   set +e
-  echo "==> Cleaning up disposable stacks (${SRC_PROJECT}, ${DST_PROJECT})..."
-  compose_src down --volumes --remove-orphans --rmi local >/dev/null 2>&1
-  compose_dst down --volumes --remove-orphans --rmi local >/dev/null 2>&1
-  rm -rf "$DUMP_DIR"
+  if [[ "$SRC_OWNED" == "1" ]]; then
+    echo "==> Cleaning up owned disposable stack (${SRC_PROJECT})..."
+    compose_src down --volumes --remove-orphans --rmi local >/dev/null 2>&1
+  fi
+  if [[ "$DST_OWNED" == "1" ]]; then
+    echo "==> Cleaning up owned disposable stack (${DST_PROJECT})..."
+    compose_dst down --volumes --remove-orphans --rmi local >/dev/null 2>&1
+  fi
+  if [[ -n "$DUMP_DIR" ]]; then
+    rm -rf "$DUMP_DIR"
+  fi
   exit "$exit_code"
 }
 trap cleanup EXIT
 
+DUMP_DIR="$(mktemp -d)"
+DUMP_FILE="${DUMP_DIR}/disposable.dump"
+
+assert_fresh_project "$SRC_PROJECT"
+SRC_OWNED=1
 echo "==> Starting disposable source PostgreSQL (${SRC_PROJECT}, port ${SRC_PORT})..."
 compose_src up -d --wait db
 
@@ -73,23 +100,15 @@ INSERT INTO reviews (card_id, quality, reviewed_at, interval_days, ease_factor, 
 SQL
 
 SUMMARY_SQL="
-SELECT
-  (SELECT COUNT(*) FROM decks) AS decks,
-  (SELECT COUNT(*) FROM cards) AS cards,
-  (SELECT COUNT(*) FROM reviews) AS reviews,
-  (SELECT COUNT(*) FROM reviews r JOIN cards c ON c.id = r.card_id JOIN decks d ON d.id = c.deck_id) AS joined_reviews,
-  (SELECT COUNT(*) FROM cards c LEFT JOIN decks d ON d.id = c.deck_id WHERE d.id IS NULL) AS orphan_cards,
-  (SELECT COUNT(*) FROM reviews r LEFT JOIN cards c ON c.id = r.card_id WHERE c.id IS NULL) AS orphan_reviews;
-"
+SELECT (SELECT COUNT(*) FROM decks), (SELECT COUNT(*) FROM cards), (SELECT COUNT(*) FROM reviews),
+  (SELECT COUNT(*) FROM reviews r JOIN cards c ON c.id = r.card_id JOIN decks d ON d.id = c.deck_id),
+  (SELECT COUNT(*) FROM cards c LEFT JOIN decks d ON d.id = c.deck_id WHERE d.id IS NULL),
+  (SELECT COUNT(*) FROM reviews r LEFT JOIN cards c ON c.id = r.card_id WHERE c.id IS NULL);"
 
 BREAKDOWN_SQL="
-SELECT d.id, d.name, COUNT(DISTINCT c.id) AS card_count, COUNT(r.id) AS review_count
-FROM decks d
-LEFT JOIN cards c ON c.deck_id = d.id
-LEFT JOIN reviews r ON r.card_id = c.id
-GROUP BY d.id, d.name
-ORDER BY d.id;
-"
+SELECT d.id, d.name, COUNT(DISTINCT c.id), COUNT(r.id)
+FROM decks d LEFT JOIN cards c ON c.deck_id = d.id LEFT JOIN reviews r ON r.card_id = c.id
+GROUP BY d.id, d.name ORDER BY d.id;"
 
 SRC_SUMMARY="$(compose_src exec -T db psql -At -F '|' -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "$SUMMARY_SQL")"
 SRC_BREAKDOWN="$(compose_src exec -T db psql -At -F '|' -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "$BREAKDOWN_SQL")"
@@ -101,6 +120,8 @@ compose_src exec -T db pg_dump --format=custom --no-owner --no-privileges \
 DUMP_TOC_LINES="$(compose_src exec -T db pg_restore --list < "$DUMP_FILE" | wc -l | tr -d ' ')"
 echo "Dump created (${DUMP_TOC_LINES} TOC entries)."
 
+assert_fresh_project "$DST_PROJECT"
+DST_OWNED=1
 echo "==> Starting fresh disposable target PostgreSQL (${DST_PROJECT}, port ${DST_PORT})..."
 compose_dst up -d --wait db
 
@@ -113,33 +134,22 @@ DST_SUMMARY="$(compose_dst exec -T db psql -At -F '|' -v ON_ERROR_STOP=1 -U "$PO
 DST_BREAKDOWN="$(compose_dst exec -T db psql -At -F '|' -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "$BREAKDOWN_SQL")"
 echo "Target summary (decks|cards|reviews|joined_reviews|orphan_cards|orphan_reviews): ${DST_SUMMARY}"
 
-if [[ "$SRC_SUMMARY" != "2|4|5|5|0|0" || "$DST_SUMMARY" != "$SRC_SUMMARY" ]]; then
-  echo "ERROR: Count or relationship summary mismatch (src=${SRC_SUMMARY}, dst=${DST_SUMMARY})." >&2
-  exit 1
-fi
-
-if [[ "$DST_BREAKDOWN" != "$SRC_BREAKDOWN" ]]; then
-  echo "ERROR: Per-deck breakdown mismatch." >&2
+if [[ "$SRC_SUMMARY" != "2|4|5|5|0|0" || "$DST_SUMMARY" != "$SRC_SUMMARY" || "$DST_BREAKDOWN" != "$SRC_BREAKDOWN" ]]; then
+  echo "ERROR: Count or relationship verification mismatch." >&2
   exit 1
 fi
 echo "Per-deck breakdown (id|name|cards|reviews):"
 echo "$DST_BREAKDOWN"
 
-# Verify sequences and FK/check constraints work cleanly after restore without mutating data.
 compose_dst exec -T db psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<'SQL' >/dev/null
 BEGIN;
-WITH new_deck AS (
-  INSERT INTO decks (name, description) VALUES ('Probe Deck', 'Rolled back') RETURNING id
-),
+WITH new_deck AS (INSERT INTO decks (name, description) VALUES ('Probe Deck', 'Rolled back') RETURNING id),
 new_card AS (
   INSERT INTO cards (deck_id, front, back, kind, repetitions, interval_days, ease_factor, due_date)
-  SELECT id, 'probe front', 'probe back', 'vocabulary', 0, 0, 2.5, DATE '2026-11-22'
-  FROM new_deck
-  RETURNING id
+  SELECT id, 'probe front', 'probe back', 'vocabulary', 0, 0, 2.5, DATE '2026-11-22' FROM new_deck RETURNING id
 )
 INSERT INTO reviews (card_id, quality, reviewed_at, interval_days, ease_factor, repetitions, due_date)
-SELECT id, 4, TIMESTAMPTZ '2026-11-22T16:00:00Z', 1, 2.5, 1, DATE '2026-11-23'
-FROM new_card;
+SELECT id, 4, TIMESTAMPTZ '2026-11-22T16:00:00Z', 1, 2.5, 1, DATE '2026-11-23' FROM new_card;
 ROLLBACK;
 SQL
 echo "Sequence and FK/check-constraint probe passed (rolled back)."
@@ -152,5 +162,4 @@ if [[ "$ALEMBIC_CURRENT" != *"(head)"* ]]; then
   exit 1
 fi
 compose_dst run --rm migrate alembic check
-
 echo "==> Disposable backup/restore verification PASSED."

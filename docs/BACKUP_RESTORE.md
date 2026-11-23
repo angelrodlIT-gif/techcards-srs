@@ -2,41 +2,33 @@
 
 This runbook covers local PostgreSQL backup/restore verification, migration
 failure recovery, and non-destructive Docker volume handling for `techcards-srs`.
-It uses the repository's existing `compose.yaml` (`postgres:16-alpine` and the
-`migrate` service) without adding a second database stack.
+It uses the existing `compose.yaml` (`postgres:16-alpine` and `migrate`) without
+adding a second database stack.
 
 ## Safety rules
 
-- **Disposable data only for exercises:** Always run backup/restore drills with
-  isolated Compose project names (`-p`) and dedicated loopback ports so the live
-  `techcards-srs` stack and its `techcards-srs_postgres_data` volume are never
-  touched.
+- **Fresh disposable projects only:** Generate unique Compose project names
+  (`-p`) per run and verify no existing containers, volumes, or networks match
+  those names before starting or tearing them down. Never touch the live
+  `techcards-srs` stack or `techcards-srs_postgres_data` during practice.
 - **No secrets:** Exercises use obvious disposable credentials
   (`disposable_user` / `disposable-local-test-only` / `techcards_disposable`).
   Never read `.env` during a drill, never pass passwords in CLI arguments, and
   never commit `.dump`, `.sql`, or `.env` files to Git.
-- **Keep backups outside the repository:** Store real study backups in a local
-  directory outside this checkout (for example, `~/backups/techcards-srs/`).
+- **Owner-only backups outside the repo:** Store real study backups outside this
+  checkout with `umask 077` and `0700` directory / `0600` file permissions.
 
 ## Current storage and schema layout
 
 From `compose.yaml` and `migrations/versions/0001_initial.py`:
 
-- **Database engine:** `postgres:16-alpine` (service `db`, internal port `5432`,
-  loopback host port `${POSTGRES_HOST_PORT:-5435}`).
-- **Persistent volume:** Named Compose volume `postgres_data`, prefixed by the
-  Compose project name (default: `techcards-srs_postgres_data`).
-- **Migrations:** One-shot `migrate` service runs `alembic upgrade head`.
-  `migrations/env.py` executes migrations inside `context.begin_transaction()`.
-- **Tables and relationships:** `decks` -> `cards` (`deck_id` FK, `ON DELETE
-  CASCADE`, check constraints on SM-2 fields) -> `reviews` (`card_id` FK,
-  `ON DELETE CASCADE`, `quality` check constraint), plus `alembic_version`.
+- **Engine & volume:** `postgres:16-alpine` (`db:5432`, loopback `${POSTGRES_HOST_PORT:-5435}`) with named volume `postgres_data` (default: `techcards-srs_postgres_data`).
+- **Migrations:** One-shot `migrate` service runs `alembic upgrade head`; `migrations/env.py` wraps migrations in `context.begin_transaction()`.
+- **Schema:** `decks` -> `cards` (`deck_id` FK, `ON DELETE CASCADE`, SM-2 check constraints) -> `reviews` (`card_id` FK, `ON DELETE CASCADE`, `quality` check constraint), plus `alembic_version`.
 
 ## Repeatable disposable backup/restore drill
 
-To run the full automated exercise on two isolated disposable Compose projects
-(Linux/macOS/WSL/Git Bash; leaves the live stack untouched and cleans up only
-its own disposable projects on exit):
+Run the automated exercise on two fresh disposable Compose projects (Linux/macOS/WSL/Git Bash; checks both names are unused before claiming ownership and cleans up only owned projects):
 
 ```bash
 ./scripts/verify_backup_restore.sh
@@ -44,24 +36,29 @@ its own disposable projects on exit):
 
 ### Step-by-step manual exercise
 
-All commands run from the repository root using disposable credentials and
-ephemeral loopback ports (`15435` and `15436`) so they do not conflict with the
-live stack (`5435` / `8000`). Only `db` and `migrate` are started (`api` is not
-started). On Windows PowerShell, set the environment variables with
-`$env:NAME = "value"` and omit `--env-file /dev/null`.
+Run from the repo root with disposable credentials and ports (`15435`/`15436`; `api` is not started). On PowerShell, set `$env:NAME = "value"` and omit `--env-file /dev/null`.
 
-1. **Set disposable variables (never real credentials):**
+1. **Generate fresh disposable project names and verify they are unused:**
 
    ```bash
    export POSTGRES_USER=disposable_user
    export POSTGRES_PASSWORD=disposable-local-test-only
    export POSTGRES_DB=techcards_disposable
-   export SRC_PROJECT=techcards-backup-src
-   export DST_PROJECT=techcards-backup-dst
-   export DUMP_DIR="$(mktemp -d)"
+   export RUN_ID="$(date -u +%Y%m%d%H%M%S)-$(od -An -tx1 -N6 /dev/urandom | tr -d ' \n')"
+   export SRC_PROJECT="techcards-backup-src-${RUN_ID}"
+   export DST_PROJECT="techcards-backup-dst-${RUN_ID}"
+   export DUMP_DIR="$(umask 077 && mktemp -d)"
+
+   # All checks must exit 0 (empty output) before starting or later cleaning up:
+   for p in "$SRC_PROJECT" "$DST_PROJECT"; do
+     out="$(docker ps -aq --filter "label=com.docker.compose.project=$p")" && test -z "$out"
+     out="$(docker volume ls -q --filter "name=^${p}_")" && test -z "$out"
+     out="$(docker volume ls -q --filter "label=com.docker.compose.project=$p")" && test -z "$out"
+     out="$(docker network ls -q --filter "label=com.docker.compose.project=$p")" && test -z "$out"
+   done
    ```
 
-2. **Start a disposable source database and apply migrations:**
+2. **Start the fresh disposable source database and apply migrations:**
 
    ```bash
    POSTGRES_HOST_PORT=15435 docker compose --env-file /dev/null -p "$SRC_PROJECT" up -d --wait db
@@ -92,18 +89,18 @@ started). On Windows PowerShell, set the environment variables with
    SQL
    ```
 
-4. **Create and inspect a custom-format `pg_dump` backup:**
+4. **Create and inspect a custom-format `pg_dump` backup (owner-only file):**
 
    ```bash
-   POSTGRES_HOST_PORT=15435 docker compose --env-file /dev/null -p "$SRC_PROJECT" exec -T db \
+   (umask 077 && POSTGRES_HOST_PORT=15435 docker compose --env-file /dev/null -p "$SRC_PROJECT" exec -T db \
      pg_dump --format=custom --no-owner --no-privileges \
-     -U "$POSTGRES_USER" -d "$POSTGRES_DB" > "$DUMP_DIR/disposable.dump"
+     -U "$POSTGRES_USER" -d "$POSTGRES_DB" > "$DUMP_DIR/disposable.dump")
 
    POSTGRES_HOST_PORT=15435 docker compose --env-file /dev/null -p "$SRC_PROJECT" exec -T db \
      pg_restore --list < "$DUMP_DIR/disposable.dump" | head -n 25
    ```
 
-5. **Start a fresh disposable target database and restore (without running `migrate` first):**
+5. **Start the fresh disposable target database and restore (without running `migrate` first):**
 
    ```bash
    POSTGRES_HOST_PORT=15436 docker compose --env-file /dev/null -p "$DST_PROJECT" up -d --wait db
@@ -113,7 +110,7 @@ started). On Windows PowerShell, set the environment variables with
      -U "$POSTGRES_USER" -d "$POSTGRES_DB" < "$DUMP_DIR/disposable.dump"
    ```
 
-6. **Verify counts, relationships, sequences, and Alembic parity on the target:**
+6. **Verify counts, relationships, and Alembic parity on the target:**
 
    ```bash
    POSTGRES_HOST_PORT=15436 docker compose --env-file /dev/null -p "$DST_PROJECT" exec -T db \
@@ -122,14 +119,9 @@ started). On Windows PowerShell, set the environment variables with
    UNION ALL SELECT 'cards', COUNT(*) FROM cards
    UNION ALL SELECT 'reviews', COUNT(*) FROM reviews;
 
-   SELECT d.id, d.name,
-          COUNT(DISTINCT c.id) AS card_count,
-          COUNT(r.id) AS review_count
-   FROM decks d
-   LEFT JOIN cards c ON c.deck_id = d.id
-   LEFT JOIN reviews r ON r.card_id = c.id
-   GROUP BY d.id, d.name
-   ORDER BY d.id;
+   SELECT d.id, d.name, COUNT(DISTINCT c.id) AS card_count, COUNT(r.id) AS review_count
+   FROM decks d LEFT JOIN cards c ON c.deck_id = d.id LEFT JOIN reviews r ON r.card_id = c.id
+   GROUP BY d.id, d.name ORDER BY d.id;
 
    SELECT
      (SELECT COUNT(*) FROM reviews r JOIN cards c ON c.id = r.card_id JOIN decks d ON d.id = c.deck_id) AS joined_reviews,
@@ -145,9 +137,10 @@ started). On Windows PowerShell, set the environment variables with
    `orphan_cards=0`, `orphan_reviews=0`; `alembic current` reports `0001 (head)`
    and `alembic check` reports no new upgrade operations.
 
-7. **Tear down only the disposable projects and temp directory:**
+7. **Tear down only the fresh projects created in this session:**
 
    ```bash
+   # Run only for the fresh $SRC_PROJECT and $DST_PROJECT verified in step 1:
    POSTGRES_HOST_PORT=15435 docker compose --env-file /dev/null -p "$SRC_PROJECT" down --volumes --remove-orphans --rmi local
    POSTGRES_HOST_PORT=15436 docker compose --env-file /dev/null -p "$DST_PROJECT" down --volumes --remove-orphans --rmi local
    rm -rf "$DUMP_DIR"
@@ -155,20 +148,27 @@ started). On Windows PowerShell, set the environment variables with
 
 ## Taking a read-only backup of your live local database
 
-Before applying any new schema migration to real study data, dump the running
-`db` service into a timestamped file **outside** the Git repository (this uses
-the container's existing `POSTGRES_USER` and `POSTGRES_DB` environment variables
-over the local socket, so no secrets appear in shell history):
+Before applying a schema migration to real study data, dump the running `db`
+service into a private directory **outside** the Git repository. Setting
+`umask 077` in a subshell and `chmod 700` on the target directory ensures the
+backup directory (`0700`) and dump file (`0600`) are owner-only from creation:
 
 ```bash
-mkdir -p ~/backups/techcards-srs
-docker compose exec -T db sh -c \
-  'pg_dump --format=custom --no-owner --no-privileges -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
-  > "$HOME/backups/techcards-srs/techcards-$(date -u +%Y%m%dT%H%M%SZ).dump"
+(
+  set -e
+  umask 077
+  BACKUP_DIR="$HOME/backups/techcards-srs"
+  mkdir -p "$BACKUP_DIR"
+  chmod 700 "$BACKUP_DIR"
+  DUMP_PATH="$BACKUP_DIR/techcards-$(date -u +%Y%m%dT%H%M%SZ).dump"
+  docker compose exec -T db sh -c \
+    'pg_dump --format=custom --no-owner --no-privileges -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
+    > "$DUMP_PATH"
+)
 ```
 
-Verify the backup by restoring it into a **disposable** Compose project (`-p`)
-as shown above before running the migration.
+Verify the backup by restoring it into a fresh **disposable** Compose project
+(`-p`) as shown above before running the migration.
 
 ## Migration failure recovery
 
@@ -181,8 +181,8 @@ the schema partially updated.
 If `docker compose up` or `docker compose run --rm migrate` fails:
 
 1. **Stop and protect data.** Do **not** run `docker compose down --volumes` or
-   `docker volume rm`. Leave the volume intact and stop the API if needed
-   (`docker compose stop api`).
+   `docker volume rm`. Leave the volume intact and run `docker compose stop api`
+   if needed.
 2. **Inspect the failure and current revision:**
 
    ```bash
@@ -193,47 +193,40 @@ If `docker compose up` or `docker compose run --rm migrate` fails:
      'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT version_num FROM alembic_version;" -c "\dt"'
    ```
 
-3. **Take a safety dump of the current state** before touching anything manually
-   (use a distinct filename such as `pre-recovery-<timestamp>.dump` outside the
-   repo).
-4. **Choose the recovery path based on what `alembic current` and `\dt` show:**
-   - **Clean transaction rollback (`alembic_version` stayed at the previous
-     revision and no partial objects exist):** Revert to the previous working
-     commit if you need the app running immediately, fix the migration bug, and
-     rehearse `pg_restore` + `alembic upgrade head` + `alembic check` on a
-     disposable Compose project before retrying on the real volume.
+3. **Take a private safety dump of the current state** (using the `umask 077`
+   pattern above with a distinct `pre-recovery-<timestamp>.dump` filename)
+   before making manual changes.
+4. **Recover based on what `alembic current` and `\dt` show:**
+   - **Clean rollback (`alembic_version` stayed at the prior revision and no
+     partial objects exist):** Revert to the previous commit if you need the app
+     running now, fix the migration, and rehearse `pg_restore` + `alembic
+     upgrade head` + `alembic check` on a fresh disposable project before
+     retrying on the real volume.
    - **Partial migration or schema drift:** Restore your pre-migration backup
-     into a **fresh target volume / new Compose project** (`-p`), verify table
-     counts, relationships, and `alembic current`, fix the migration, test the
-     upgrade on that restored copy, and only then cut over.
+     into a **fresh target volume / new Compose project** (`-p`), verify counts,
+     relationships, and `alembic current`, fix and test the upgrade on that
+     copy, and only then cut over.
 5. **Avoid destructive shortcuts:**
-   - Never run `alembic downgrade base` against real study data:
-     `migrations/versions/0001_initial.py`'s `downgrade()` drops `reviews`,
-     `cards`, and `decks`.
-   - Never run `alembic stamp <rev>` to silence an error unless you have
-     verified the actual PostgreSQL schema matches that revision and confirmed
-     zero drift with `alembic check`.
+   - Never run `alembic downgrade base` on real study data:
+     `migrations/versions/0001_initial.py` drops `reviews`, `cards`, and `decks`.
+   - Never run `alembic stamp <rev>` unless you verified the schema matches that
+     revision and confirmed zero drift with `alembic check`.
 
 ## Non-destructive volume handling
 
 `compose.yaml` stores PostgreSQL data in the named volume `postgres_data`
 (default full name: `techcards-srs_postgres_data`).
 
-- **Avoid these destructive commands during routine work or recovery:**
-  - `docker compose down --volumes` (or `-v`) on the live project
-  - `docker volume rm techcards-srs_postgres_data`
-  - `docker system prune --volumes`
-  - `pg_restore --clean` against the live database without a verified backup
-- **Preferred non-destructive workflow:**
-  - Inspect volumes read-only with `docker volume ls` and
-    `docker volume inspect techcards-srs_postgres_data`.
-  - Stop containers without deleting data using `docker compose stop` or
-    `docker compose down` (without `--volumes`).
-  - Always test restores and new migrations in a **separate** Compose project
-    (`-p`) with its own fresh volume and `POSTGRES_HOST_PORT`.
-  - When cutting over to a restored volume, keep the old volume stopped as a
-    fallback until you have verified decks, cards, and reviews in the new stack.
-- **Destructive cleanup is opt-in and last-resort only:** Only run
-  `down --volumes` or `docker volume rm` after confirming the exact `-p`
-  project name or volume name and verifying that no unbacked-up study data
-  remains in it.
+- **Avoid destructive commands during routine work or recovery:**
+  `docker compose down --volumes` (`-v`), `docker volume rm`,
+  `docker system prune --volumes`, and `pg_restore --clean` against the live DB
+  without a verified backup.
+- **Preferred non-destructive workflow:** Inspect volumes with `docker volume ls`
+  and `docker volume inspect techcards-srs_postgres_data`; stop containers
+  without deleting data via `docker compose stop` or `docker compose down`;
+  test restores and migrations in a fresh Compose project (`-p`); and keep the
+  prior volume stopped as a fallback until counts and relationships are verified
+  in the new stack.
+- **Destructive cleanup is opt-in and last-resort only:** Run `down --volumes`
+  or `docker volume rm` only after confirming the exact `-p` project or volume
+  name, verifying ownership, and confirming no unbacked-up study data remains.
