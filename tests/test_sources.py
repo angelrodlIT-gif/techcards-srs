@@ -294,6 +294,31 @@ def test_source_multibyte_url_utf8_byte_limit(client):
         )
 
 
+def test_source_embedded_nul_rejected(client):
+    did = create_deck(client)
+    draft = client.post("/sources", json={"label": "Clean Draft"}).json()
+    sid = draft["id"]
+
+    bad_source_payloads = [
+        {"label": "AWS\x00Notes"},
+        {"label": "Clean", "excerpt": "Line 1\x00Line 2"},
+        {"label": "Clean", "excerpt": "  \x00  "},
+        {"label": "Clean", "url": "https://example.com/\x00bad"},
+    ]
+    for payload in bad_source_payloads:
+        assert client.post("/sources", json=payload).status_code == 422
+        assert client.put(f"/sources/{sid}", json=payload).status_code == 422
+
+    for bad_approve in (
+        {"deck_id": did, "front": "What\x00is IAM?", "back": "Access control"},
+        {"deck_id": did, "front": "What is IAM?", "back": "Access\x00control"},
+    ):
+        assert client.post(f"/sources/{sid}/approve", json=bad_approve).status_code == 422
+
+    assert client.get(f"/sources/{sid}").json()["status"] == "draft"
+    assert client.get("/cards").json() == []
+
+
 def test_sources_migration_round_trip(tmp_path, monkeypatch):
     repo_root = Path(__file__).resolve().parents[1]
     db_url = f"sqlite:///{tmp_path / 'sources_migration.db'}"

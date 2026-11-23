@@ -2,18 +2,35 @@ from datetime import date, datetime
 from typing import Annotated, Literal
 from urllib.parse import urlsplit, urlunsplit
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+)
 
-Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=5000)]
+
+def reject_nul(value: str) -> str:
+    if "\x00" in value:
+        raise ValueError("value must not contain NUL bytes")
+    return value
+
+
+NoNul = AfterValidator(reject_nul)
+Text = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=5000), NoNul
+]
 Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120)]
 SourceLabel = Annotated[str, StringConstraints(min_length=1, max_length=255)]
 RequiredSourceLabel = Annotated[
-    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255), NoNul
 ]
-SourceUrl = Annotated[str, StringConstraints(min_length=1, max_length=2048)]
+SourceUrl = Annotated[str, StringConstraints(min_length=1, max_length=2048), NoNul]
 MAX_SOURCE_URL_CHARS = 2048
 MAX_SOURCE_URL_UTF8_BYTES = 2048
-Excerpt = Annotated[str, StringConstraints(min_length=1, max_length=20000)]
+Excerpt = Annotated[str, StringConstraints(min_length=1, max_length=20000), NoNul]
 Kind = Literal["vocabulary", "interview_phrase", "behavioral"]
 SourceStatus = Literal["draft", "approved", "discarded"]
 
