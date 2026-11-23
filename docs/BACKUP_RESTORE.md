@@ -40,7 +40,7 @@ From `compose.yaml` and `migrations/versions/0001_initial.py`:
 ### Prerequisites
 
 - Docker with Compose v2
-- Bash (Linux, macOS, WSL, or Git Bash)
+- Bash (Linux, macOS, WSL, or Git Bash) and Python 3
 - Run from the repository root (the live `techcards-srs` stack may stay running
   on ports `5435`/`8000`; the drill starts only disposable `db` and `migrate`
   services on separate loopback ports)
@@ -64,10 +64,15 @@ shell state):
 
 ### What the script verifies
 
-1. Generates unique timestamp+random Compose project names
-   (`techcards-backup-src-*` and `techcards-backup-dst-*`) and fails closed if
-   any Docker query fails or any container, volume, or network already exists
-   for those names before claiming ownership or running startup/cleanup.
+1. Pins Compose explicitly to the repository's `compose.yaml` (`-f` and
+   `--project-directory`) while clearing `COMPOSE_FILE`, `COMPOSE_PROFILES`,
+   and `COMPOSE_PROJECT_NAME` so local override files or inherited env vars
+   cannot redirect `postgres_data`. Generates unique timestamp+random Compose
+   project names (`techcards-backup-src-*` and `techcards-backup-dst-*`),
+   inspects the rendered Compose config to verify `postgres_data` resolves to
+   `<project>_postgres_data`, and fails closed if any Docker query fails or any
+   container, volume, or network already exists before claiming ownership or
+   running startup/cleanup.
 2. Starts the disposable source PostgreSQL 16 database, runs `alembic upgrade
    head`, and seeds disposable `decks`, `cards`, and `reviews`.
 3. Creates a private `0700` temporary directory (`umask 077`, `mktemp -d`) and

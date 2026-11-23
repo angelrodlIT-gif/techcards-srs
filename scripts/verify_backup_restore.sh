@@ -1,13 +1,26 @@
 #!/usr/bin/env bash
 # Disposable PostgreSQL 16 backup/restore drill for techcards-srs.
-# Uses fresh Compose projects (-p), ephemeral ports, exclusive owner-only dumps,
-# and non-secret placeholder credentials. Never reads .env or touches techcards-srs.
+# Pins compose.yaml, clears Compose override env vars, uses fresh Compose projects
+# (-p), ephemeral ports, exclusive owner-only dumps, and placeholder credentials.
+# Never reads .env and never touches the live techcards-srs stack or volume.
 set -euo pipefail
 set -o noclobber
 umask 077
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
+
+COMPOSE_FILE_PATH="${REPO_ROOT}/compose.yaml"
+if [[ ! -f "$COMPOSE_FILE_PATH" || -L "$COMPOSE_FILE_PATH" ]]; then
+  echo "Missing or non-regular compose file '${COMPOSE_FILE_PATH}'." >&2
+  exit 1
+fi
+
+PYTHON_BIN="$(command -v python3 || command -v python || true)"
+if [[ -z "$PYTHON_BIN" ]]; then
+  echo "python3 (or python) is required to validate rendered Compose config." >&2
+  exit 1
+fi
 
 # Obvious disposable local-test credentials (not real secrets).
 export POSTGRES_USER="disposable_user"
@@ -35,27 +48,68 @@ DUMP_DIR=""
 DUMP_FILE=""
 DUMP_READY=0
 
+run_compose() {
+  local project="$1"
+  local host_port="$2"
+  shift 2
+  env -u COMPOSE_FILE -u COMPOSE_PROFILES -u COMPOSE_PROJECT_NAME -u COMPOSE_PATH_SEPARATOR \
+    POSTGRES_HOST_PORT="$host_port" \
+    docker compose --env-file /dev/null --project-directory "$REPO_ROOT" -f "$COMPOSE_FILE_PATH" -p "$project" "$@"
+}
+
 compose_src() {
-  POSTGRES_HOST_PORT="$SRC_PORT" docker compose --env-file /dev/null -p "$SRC_PROJECT" "$@"
+  run_compose "$SRC_PROJECT" "$SRC_PORT" "$@"
 }
 
 compose_dst() {
-  POSTGRES_HOST_PORT="$DST_PORT" docker compose --env-file /dev/null -p "$DST_PROJECT" "$@"
+  run_compose "$DST_PROJECT" "$DST_PORT" "$@"
+}
+
+resolve_verified_db_volume() {
+  local project="$1"
+  local rendered_json="$2"
+  "$PYTHON_BIN" -c '
+import json, sys
+project = sys.argv[1]
+expected = f"{project}_postgres_data"
+cfg = json.load(sys.stdin)
+name = cfg.get("name")
+if name != project:
+    sys.exit(f"Rendered project name {name!r} does not match {project!r}.")
+db_mounts = (cfg.get("services") or {}).get("db", {}).get("volumes") or []
+if len(db_mounts) != 1 or db_mounts[0].get("type") != "volume" or db_mounts[0].get("source") != "postgres_data":
+    sys.exit(f"Unexpected db volume mounts in rendered Compose config: {db_mounts!r}")
+vol = (cfg.get("volumes") or {}).get("postgres_data")
+if not isinstance(vol, dict) or vol.get("external"):
+    sys.exit(f"Refusing missing or external postgres_data volume definition: {vol!r}")
+resolved = vol.get("name")
+if resolved != expected:
+    sys.exit(f"Refusing non-project postgres_data volume name {resolved!r} (expected {expected!r}).")
+print(resolved)
+' "$project" <<<"$rendered_json"
 }
 
 assert_fresh_project() {
   local project="$1"
-  local containers volumes_by_name volumes_by_label networks
+  local host_port="$2"
+  local rendered_json resolved_vol exact_vol containers volumes_by_name volumes_by_label networks
   if [[ "$project" != techcards-backup-src-?* && "$project" != techcards-backup-dst-?* ]]; then
     echo "Refusing unexpected Compose project name '${project}'." >&2
     exit 1
   fi
+  rendered_json="$(run_compose "$project" "$host_port" config --format json)"
+  resolved_vol="$(resolve_verified_db_volume "$project" "$rendered_json")"
+  if [[ "$resolved_vol" != "${project}_postgres_data" ]]; then
+    echo "Refusing unexpected resolved volume '${resolved_vol}' for project '${project}'." >&2
+    exit 1
+  fi
+  exact_vol="$(docker volume ls -q --filter "name=^${resolved_vol}$")"
   containers="$(docker ps -aq --filter "label=com.docker.compose.project=${project}")"
   volumes_by_name="$(docker volume ls -q --filter "name=^${project}_")"
   volumes_by_label="$(docker volume ls -q --filter "label=com.docker.compose.project=${project}")"
   networks="$(docker network ls -q --filter "label=com.docker.compose.project=${project}")"
-  if [[ -n "${containers}${volumes_by_name}${volumes_by_label}${networks}" ]]; then
-    echo "Refusing to reuse existing Compose project '${project}'." >&2
+  if [[ -n "${exact_vol}${containers}${volumes_by_name}${volumes_by_label}${networks}" ]]; then
+    echo "Refusing to reuse existing Compose project '${project}' or volume '${resolved_vol}'." >&2
     exit 1
   fi
 }
@@ -105,7 +159,7 @@ if [[ ! -d "$DUMP_DIR" || -L "$DUMP_DIR" ]]; then
   exit 1
 fi
 
-assert_fresh_project "$SRC_PROJECT"
+assert_fresh_project "$SRC_PROJECT" "$SRC_PORT"
 SRC_OWNED=1
 echo "==> Starting disposable source PostgreSQL (${SRC_PROJECT}, port ${SRC_PORT})..."
 compose_src up -d --wait db
@@ -166,7 +220,7 @@ assert_ready_dump
 DUMP_TOC_LINES="$(compose_src exec -T db pg_restore --list < "$DUMP_FILE" | wc -l | tr -d ' ')"
 echo "Dump created (${DUMP_TOC_LINES} TOC entries)."
 
-assert_fresh_project "$DST_PROJECT"
+assert_fresh_project "$DST_PROJECT" "$DST_PORT"
 DST_OWNED=1
 echo "==> Starting fresh disposable target PostgreSQL (${DST_PROJECT}, port ${DST_PORT})..."
 compose_dst up -d --wait db
