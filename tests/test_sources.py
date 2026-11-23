@@ -7,8 +7,11 @@ from alembic.config import Config
 from sqlalchemy import create_engine, inspect
 from sqlalchemy import text as sa_text
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
+import app.main as main_module
 from app.config import get_settings
+from app.models import Source
 
 
 def create_deck(client, name="Cloud English"):
@@ -213,7 +216,52 @@ def test_source_edit_discard_approve_and_delete_lifecycle(client, set_clock):
         ).status_code
         == 201
     )
+    # Delete discarded source also returns 204.
     assert client.delete(f"/sources/{s2['id']}").status_code == 204
+
+
+def test_source_concurrent_duplicate_url_integrity_error_returns_409(
+    client, db_engine, monkeypatch
+):
+    # Create a URL-less draft first (previous persisted normalized_url is NULL).
+    draft = client.post("/sources", json={"label": "URL-less Draft"}).json()
+    assert draft["normalized_url"] is None
+
+    original_check = main_module.ensure_unique_source_url
+
+    def claim_url_after_precheck(db, normalized_url, exclude_id=None):
+        original_check(db, normalized_url, exclude_id=exclude_id)
+        if normalized_url is not None:
+            with Session(db_engine) as peer:
+                peer.add(
+                    Source(
+                        label="Peer Claim",
+                        url=normalized_url,
+                        normalized_url=normalized_url,
+                        status="draft",
+                    )
+                )
+                peer.commit()
+
+    monkeypatch.setattr(main_module, "ensure_unique_source_url", claim_url_after_precheck)
+
+    # PUT from NULL -> raced URL hits unique index; rollback expires draft, still returns 409.
+    put_resp = client.put(
+        f"/sources/{draft['id']}",
+        json={"label": "Updated", "url": "https://example.com/raced-put/"},
+    )
+    assert put_resp.status_code == 409
+    reloaded = client.get(f"/sources/{draft['id']}").json()
+    assert reloaded["label"] == "URL-less Draft"
+    assert reloaded["url"] is None
+    assert reloaded["normalized_url"] is None
+
+    # POST racing after precheck also maps the DB unique index violation to 409.
+    post_resp = client.post(
+        "/sources",
+        json={"label": "Raced Create", "url": "https://example.com/raced-post/"},
+    )
+    assert post_resp.status_code == 409
 
 
 def test_sources_migration_round_trip(tmp_path, monkeypatch):

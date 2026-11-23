@@ -228,11 +228,12 @@ def ensure_unique_source_url(
 
 
 def save_source(db: Session, source: Source) -> Source:
+    attempted_url = source.normalized_url
     try:
         return save(db, source)
     except IntegrityError as exc:
         db.rollback()
-        if source.normalized_url is not None:
+        if attempted_url is not None:
             raise HTTPException(409, "A source with this URL already exists") from exc
         raise
 
