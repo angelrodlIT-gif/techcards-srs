@@ -66,7 +66,9 @@ Grades: 0–2 recall failure, 3 difficult correct recall, 4 correct with hesitat
 not idempotent—a second request counts as another review, so do not blindly auto-retry
 after a timeout or `5xx` (see [MVP design](docs/MVP.md#review-transactions-and-retry-semantics)).
 PUT replaces editable fields and keeps the schedule; deleting a deck removes its cards
-and review history.
+and review history. For full request/response examples, SM-2 grading, UTC rules,
+deletion cascades, loopback limits and a clean-install checklist, see the
+[Core API study and troubleshooting runbook](docs/API_RUNBOOK.md).
 
 ## Local Python development (optional)
 
@@ -114,6 +116,7 @@ output/error handling; no network fallback or hidden data upload exists now.
 - `migrations/`: versioned schema; `tests/`: scheduling and API checks.
 - [Personal English learning plan](docs/PROJECT_PLAN.md): vision, Saturday milestones and workflow.
 - [MVP design](docs/MVP.md): scope, endpoints, architecture and role/skills mapping.
+- [Core API study and troubleshooting runbook](docs/API_RUNBOOK.md): end-to-end study walkthrough, SM-2 grades, UTC dates, deletion cascades, loopback limits and clean-install checklist.
 - [Backup, restore and migration recovery](docs/BACKUP_RESTORE.md): disposable `pg_dump`/`pg_restore` drill, migration recovery and volume safety.
 - [Saturday exercises](docs/NEXT_STEPS.md): six optional learning tasks.
 
