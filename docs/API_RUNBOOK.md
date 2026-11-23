@@ -145,14 +145,17 @@ Response: `201 Created` (returns 6 cards — IDs `1`–`4` `vocabulary` for `aws
 Key generator behaviors (`app/generator.py` and `app/schemas.py`):
 
 - `text` is trimmed and must be 10–20,000 characters; `max_cards` is 1–20
-  (default `6`). Missing `deck_id` returns `404` (`{"detail":"Deck not found"}`).
+  (default `6`). Omitting `deck_id` returns `422`; a supplied `deck_id` with no
+  matching deck returns `404` (`{"detail":"Deck not found"}`).
 - `MockGenerator` is deterministic and offline: it matches whole lowercase ASCII
   words against a fixed 10-term glossary (`aws`, `python`, `postgresql`, `docker`,
   `linux`, `terraform`, `monitoring`, `troubleshooting`, `api`, `sql`), then
   appends one `interview_phrase` and one `behavioral` prompt, truncated to
   `max_cards`.
-- It returns **up to** `max_cards` cards. Text with no glossary matches still
-  produces 2 generic practice prompts (`interview_phrase` and `behavioral`).
+- It returns **up to** `max_cards` cards. Text with no glossary matches falls
+  back to up to 2 generic practice prompts (`interview_phrase`, then
+  `behavioral`), still truncated to `max_cards` (for example, `max_cards: 1`
+  returns only the `interview_phrase` prompt).
 - Pasted source `text` is not stored in the database, though matched terms appear
   in generated cards. You can also create single cards manually via `POST /cards`.
 
@@ -215,11 +218,12 @@ curl -i http://127.0.0.1:8000/decks/1/due
 
 ### Common error responses
 
-- `404 Not Found`: missing deck or card — e.g. `{"detail":"Card not found"}` or
-  `{"detail":"Deck not found"}`. Never mutates state.
+- `404 Not Found`: nonexistent deck or card ID — e.g. `{"detail":"Card not found"}`
+  or `{"detail":"Deck not found"}`. Never mutates state.
 - `422 Unprocessable Entity`: validation error with FastAPI's `{"detail":[...]}`
-  list — for example, `quality: 6`, `quality: "4"`, `quality: true`, `text`
-  shorter than 10 characters, or `limit > 100`. Never mutates state.
+  list — for example, an omitted required field such as `deck_id`, `quality: 6`,
+  `quality: "4"`, `quality: true`, `text` shorter than 10 characters, or
+  `limit > 100`. Never mutates state.
 
 ## Grades (0–5) and SM-2 scheduling
 
