@@ -3,10 +3,12 @@ set -euo pipefail
 
 # Isolated verification harness for TechCards SRS.
 # Manages dedicated Docker Compose projects (db + migrate + api) on free loopback
-# ports so verification never interferes with a running local dev stack, drives
-# real HTTP endpoints with curl, inspects PostgreSQL side effects via a dedicated
-# read-only role, captures proof artifacts (including failed transport attempts),
-# and tears down only what it started.
+# ports with per-run random nonces and ownership labels so verification never
+# interferes with a running local dev stack or another verification run (even
+# under a different XDG_STATE_HOME), drives real HTTP endpoints with curl,
+# inspects PostgreSQL side effects via Python/psycopg using a dedicated read-only
+# role (no psql client meta-commands), captures proof artifacts (including failed
+# transport attempts), and tears down only resources verified to belong to this run.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
@@ -21,6 +23,12 @@ VERIFY_POSTGRES_DB="techcards"
 VERIFY_DB_RO_USER="techcards_ro"
 VERIFY_GENERATOR_PROVIDER="mock"
 
+# Pre-commit reservation state rolled back by EXIT trap if launch fails before
+# instance.json is written.
+_LAUNCH_RESERVATION_ACTIVE=0
+_LAUNCH_RESERVED_INSTANCE_DIR=""
+_LAUNCH_RESERVED_EVIDENCE_DIR=""
+
 usage() {
   cat <<'EOF'
 Usage: control-techcards.sh <command> [args...]
@@ -30,11 +38,13 @@ Commands:
       Start an isolated Docker Compose stack (fresh Postgres volume -> migrate -> api),
       provision a read-only DB inspection role, and wait until DB, migrations, and API
       are fully usable.
-      Run IDs must match ^[a-z0-9][a-z0-9_-]*$ (1-to-1 with Compose project names).
+      Run IDs must match ^[a-z0-9][a-z0-9_-]*$; each launch adds a random run nonce
+      (verify-techcards-<run-id>-<nonce>) and ownership labels so runs cannot collide
+      even across different XDG_STATE_HOME directories.
       Evidence directories must be fresh (not already existing) and outside scratch state.
 
   doctor <run-id> [--save]
-      Read-only health, build-freshness, port-ownership, DB, and migration check.
+      Read-only health, ownership, build-freshness, port-ownership, DB, and migration check.
       Pass --save to also record the report to <evidence-dir>/doctor.txt.
 
   req <run-id> <step-name> <METHOD> <PATH> [JSON_BODY] [--body-only]
@@ -44,9 +54,10 @@ Commands:
       Pass --body-only to print only the response body to stdout.
 
   db-query <run-id> <label> <SQL>
-      Run a read-only SQL query against the isolated Postgres container using the
-      dedicated non-superuser SELECT-only role (techcards_ro), save the query and
-      output to <evidence-dir>/db/<label>.txt, and print to stdout.
+      Run a read-only SQL query against the isolated Postgres database over
+      Python/psycopg using the dedicated non-superuser SELECT-only role (techcards_ro)
+      with default_transaction_read_only=on (no psql meta-commands), save the query
+      and output to <evidence-dir>/db/<label>.txt, and print to stdout.
 
   logs <run-id> [service...]
       Capture Docker Compose logs (default: db migrate api) to
@@ -56,8 +67,9 @@ Commands:
       Print key paths and connection values for an active run (no credentials).
 
   cleanup <run-id>
-      Tear down ONLY the Compose project, containers, network, volume, and scratch
-      state for <run-id>. Preserves <evidence-dir> untouched.
+      Verify resource ownership labels, then tear down ONLY the Compose project,
+      containers, network, volume, and scratch state for <run-id>. Preserves
+      <evidence-dir> untouched.
 EOF
 }
 
@@ -78,10 +90,21 @@ resolve_repo_root() {
   fi
 }
 
+canonical_path() {
+  python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1"
+}
+
 validate_run_id() {
   local run_id="$1"
   if [[ ! "$run_id" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
-    die "Invalid run-id '$run_id' (must match ^[a-z0-9][a-z0-9_-]*$; lowercase letters, digits, _, - only so project names are strictly 1-to-1)"
+    die "Invalid run-id '$run_id' (must match ^[a-z0-9][a-z0-9_-]*$; lowercase letters, digits, _, - only)"
+  fi
+}
+
+validate_run_nonce() {
+  local run_nonce="$1"
+  if [[ ! "$run_nonce" =~ ^[0-9a-f]{12}$ ]]; then
+    die "Invalid run_nonce '$run_nonce' (expected 12 lowercase hex characters)"
   fi
 }
 
@@ -174,10 +197,25 @@ sys.exit(0)
 PY
 }
 
+rollback_launch_reservation() {
+  if (( _LAUNCH_RESERVATION_ACTIVE == 1 )); then
+    if [[ -n "$_LAUNCH_RESERVED_EVIDENCE_DIR" ]]; then
+      rm -rf "$_LAUNCH_RESERVED_EVIDENCE_DIR" 2>/dev/null || true
+      _LAUNCH_RESERVED_EVIDENCE_DIR=""
+    fi
+    if [[ -n "$_LAUNCH_RESERVED_INSTANCE_DIR" ]]; then
+      rm -rf "$_LAUNCH_RESERVED_INSTANCE_DIR" 2>/dev/null || true
+      _LAUNCH_RESERVED_INSTANCE_DIR=""
+    fi
+    _LAUNCH_RESERVATION_ACTIVE=0
+  fi
+}
+
 load_instance() {
   local run_id="$1"
   validate_run_id "$run_id"
-  local meta_file="$INSTANCES_ROOT/$run_id/instance.json"
+  local expected_dir="$INSTANCES_ROOT/$run_id"
+  local meta_file="$expected_dir/instance.json"
   [[ -f "$meta_file" ]] || die "No active verification instance found for run-id '$run_id' (missing $meta_file)"
 
   local fields=()
@@ -191,6 +229,7 @@ import sys
 data = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 keys = [
     "run_id",
+    "run_nonce",
     "compose_project",
     "repo_root",
     "instance_dir",
@@ -215,32 +254,51 @@ for key in keys:
 PY
   )
 
-  [[ ${#fields[@]} -eq 15 ]] || die "Corrupt instance metadata in $meta_file"
+  [[ ${#fields[@]} -eq 16 ]] || die "Corrupt instance metadata in $meta_file"
 
   RUN_ID="${fields[0]}"
-  COMPOSE_PROJECT="${fields[1]}"
-  REPO_ROOT="${fields[2]}"
-  INSTANCE_DIR="${fields[3]}"
-  EVIDENCE_DIR="${fields[4]}"
-  API_PORT="${fields[5]}"
-  DB_PORT="${fields[6]}"
-  BASE_URL="${fields[7]}"
-  GIT_SHA="${fields[8]}"
-  SOURCE_HASH="${fields[9]}"
-  POSTGRES_USER="${fields[10]}"
-  POSTGRES_DB="${fields[11]}"
-  DB_RO_USER="${fields[12]}"
-  GENERATOR_PROVIDER="${fields[13]}"
-  CREATED_AT="${fields[14]}"
+  RUN_NONCE="${fields[1]}"
+  COMPOSE_PROJECT="${fields[2]}"
+  REPO_ROOT="${fields[3]}"
+  INSTANCE_DIR="${fields[4]}"
+  EVIDENCE_DIR="${fields[5]}"
+  API_PORT="${fields[6]}"
+  DB_PORT="${fields[7]}"
+  BASE_URL="${fields[8]}"
+  GIT_SHA="${fields[9]}"
+  SOURCE_HASH="${fields[10]}"
+  POSTGRES_USER="${fields[11]}"
+  POSTGRES_DB="${fields[12]}"
+  DB_RO_USER="${fields[13]}"
+  GENERATOR_PROVIDER="${fields[14]}"
+  CREATED_AT="${fields[15]}"
 
-  [[ "$COMPOSE_PROJECT" == "verify-techcards-${RUN_ID}" ]] || die "Refusing to operate on unexpected Compose project: $COMPOSE_PROJECT"
+  [[ "$RUN_ID" == "$run_id" ]] || die "Instance metadata run_id mismatch: expected '$run_id', got '$RUN_ID'"
+  validate_run_nonce "$RUN_NONCE"
+  [[ "$COMPOSE_PROJECT" == "verify-techcards-${RUN_ID}-${RUN_NONCE}" ]] || die "Refusing to operate on unexpected Compose project: $COMPOSE_PROJECT"
+
+  local resolved_expected_dir resolved_instance_dir
+  resolved_expected_dir="$(canonical_path "$expected_dir")"
+  resolved_instance_dir="$(canonical_path "$INSTANCE_DIR")"
+  [[ "$resolved_expected_dir" == "$resolved_instance_dir" ]] || die "Instance directory mismatch: metadata claims '$resolved_instance_dir', loaded from '$resolved_expected_dir'"
+  INSTANCE_DIR="$resolved_instance_dir"
 }
 
 compose_cmd() {
-  # Explicitly override exported Compose variables so caller's shell env cannot
-  # hijack POSTGRES_*, GENERATOR_PROVIDER, or DATABASE_URL for this isolated run.
+  # Explicitly unset/override exported Compose variables so caller's shell env
+  # cannot hijack POSTGRES_*, GENERATOR_PROVIDER, DATABASE_URL, or COMPOSE_PROFILES
+  # (e.g. COMPOSE_PROFILES=test activating the SQLite test service).
+  # Use the launch-time snapshot of compose.yaml (when present) so mid-run edits
+  # to the working tree's compose.yaml cannot redirect teardown resources.
+  local compose_base="$INSTANCE_DIR/compose.base.yaml"
+  [[ -f "$compose_base" ]] || compose_base="$REPO_ROOT/compose.yaml"
+
   env \
     -u DATABASE_URL \
+    -u COMPOSE_PROFILES \
+    -u COMPOSE_FILE \
+    -u COMPOSE_PROJECT_NAME \
+    -u COMPOSE_PATH_SEPARATOR \
     COMPOSE_ANSI=never \
     BUILDKIT_PROGRESS=plain \
     POSTGRES_USER="$POSTGRES_USER" \
@@ -250,31 +308,373 @@ compose_cmd() {
     GENERATOR_PROVIDER="$GENERATOR_PROVIDER" \
     docker compose \
     --progress=plain \
+    --project-directory "$REPO_ROOT" \
     -p "$COMPOSE_PROJECT" \
     --env-file "$INSTANCE_DIR/verify.env" \
-    -f "$REPO_ROOT/compose.yaml" \
+    -f "$compose_base" \
     -f "$INSTANCE_DIR/compose.override.yaml" \
     "$@"
 }
 
+assert_project_unused() {
+  local project="$1"
+  local existing_containers existing_volumes existing_networks existing_named_vol existing_named_net
+  existing_containers="$(docker ps -a --filter "label=com.docker.compose.project=${project}" -q)"
+  existing_volumes="$(docker volume ls --filter "label=com.docker.compose.project=${project}" -q)"
+  existing_networks="$(docker network ls --filter "label=com.docker.compose.project=${project}" -q)"
+  existing_named_vol=""
+  if docker volume inspect "${project}_postgres_data" >/dev/null 2>&1; then
+    existing_named_vol="${project}_postgres_data"
+  fi
+  existing_named_net=""
+  if docker network inspect "${project}_default" >/dev/null 2>&1; then
+    existing_named_net="${project}_default"
+  fi
+
+  if [[ -n "$existing_containers" || -n "$existing_volumes" || -n "$existing_networks" || -n "$existing_named_vol" || -n "$existing_named_net" ]]; then
+    die "Compose project '$project' already has resources on this Docker daemon; refusing to reuse an existing project"
+  fi
+}
+
+verify_project_ownership() {
+  local require_present="${1:-0}"
+  local output_mode="${2:-summary}"
+  python3 - "$COMPOSE_PROJECT" "$RUN_ID" "$RUN_NONCE" "$INSTANCE_DIR" "$require_present" "$output_mode" <<'PY'
+import hashlib
+import json
+import os
+import subprocess
+import sys
+
+project, run_id, run_nonce, instance_dir, require_present_raw, output_mode = sys.argv[1:]
+require_present = require_present_raw == "1"
+instance_dir_sha256 = hashlib.sha256(os.fsencode(instance_dir)).hexdigest()
+
+expected = {
+    "com.docker.compose.project": project,
+    "techcards.verify.run_id": run_id,
+    "techcards.verify.run_nonce": run_nonce,
+    "techcards.verify.instance_dir_sha256": instance_dir_sha256,
+}
+
+
+def run_lines(cmd):
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        print(f"ERROR: {' '.join(cmd)} failed: {proc.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
+    return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+
+def inspect_json(cmd):
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        print(f"ERROR: {' '.join(cmd)} failed: {proc.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
+    return json.loads(proc.stdout)
+
+
+containers = run_lines(["docker", "ps", "-a", "--no-trunc", "--filter", f"label=com.docker.compose.project={project}", "-q"])
+volumes = run_lines(["docker", "volume", "ls", "--filter", f"label=com.docker.compose.project={project}", "-q"])
+networks = run_lines(["docker", "network", "ls", "--no-trunc", "--filter", f"label=com.docker.compose.project={project}", "-q"])
+
+# Also check the default Compose volume and network names even if they lack Compose labels.
+expected_vol_name = f"{project}_postgres_data"
+if expected_vol_name not in volumes:
+    probe = subprocess.run(["docker", "volume", "inspect", expected_vol_name], capture_output=True, text=True, check=False)
+    if probe.returncode == 0:
+        volumes.append(expected_vol_name)
+
+expected_net_name = f"{project}_default"
+if expected_net_name not in networks:
+    probe = subprocess.run(["docker", "network", "inspect", expected_net_name], capture_output=True, text=True, check=False)
+    if probe.returncode == 0:
+        net_items = json.loads(probe.stdout)
+        if net_items and net_items[0].get("Id") not in networks:
+            networks.append(net_items[0]["Id"])
+
+errors = []
+
+
+def check_labels(kind, ident, labels):
+    labels = labels or {}
+    mismatches = []
+    for key, want in expected.items():
+        got = labels.get(key)
+        if got != want:
+            mismatches.append(f"{key}: expected {want!r}, got {got!r}")
+    if mismatches:
+        errors.append(f"{kind} {ident}: " + "; ".join(mismatches))
+
+
+if containers:
+    for item in inspect_json(["docker", "inspect", *containers]):
+        cid = item.get("Id", "")[:12]
+        name = item.get("Name", "").lstrip("/")
+        labels = (item.get("Config") or {}).get("Labels") or {}
+        check_labels("container", f"{name}({cid})", labels)
+        for mount in item.get("Mounts") or []:
+            if mount.get("Type") == "volume" and mount.get("Name"):
+                vol_name = mount["Name"]
+                if vol_name not in volumes:
+                    volumes.append(vol_name)
+
+if require_present and (not containers or not volumes):
+    print(
+        f"Expected owned containers and volume for project '{project}', "
+        f"found containers={len(containers)} volumes={len(volumes)} networks={len(networks)}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+verified_volumes = []
+if volumes:
+    for item in inspect_json(["docker", "volume", "inspect", *volumes]):
+        name = item.get("Name", "")
+        labels = item.get("Labels") or {}
+        before_err_count = len(errors)
+        check_labels("volume", name, labels)
+        if len(errors) == before_err_count and name:
+            verified_volumes.append(name)
+
+if networks:
+    for item in inspect_json(["docker", "network", "inspect", *networks]):
+        name = item.get("Name", "")
+        nid = item.get("Id", "")[:12]
+        labels = item.get("Labels") or {}
+        check_labels("network", f"{name}({nid})", labels)
+
+if errors:
+    print(
+        f"Ownership verification failed for Compose project '{project}' (refusing to operate):",
+        file=sys.stderr,
+    )
+    for err in errors:
+        print(f"  - {err}", file=sys.stderr)
+    sys.exit(1)
+
+if output_mode == "volumes":
+    for vol_name in verified_volumes:
+        print(vol_name)
+else:
+    print(f"verified containers={len(containers)} volumes={len(volumes)} networks={len(networks)}")
+PY
+}
+
+remove_verified_volumes() {
+  python3 - "$COMPOSE_PROJECT" "$RUN_ID" "$RUN_NONCE" "$INSTANCE_DIR" "$@" <<'PY'
+import hashlib
+import json
+import os
+import subprocess
+import sys
+
+project, run_id, run_nonce, instance_dir, *volume_names = sys.argv[1:]
+if not volume_names:
+    sys.exit(0)
+
+instance_dir_sha256 = hashlib.sha256(os.fsencode(instance_dir)).hexdigest()
+expected = {
+    "com.docker.compose.project": project,
+    "techcards.verify.run_id": run_id,
+    "techcards.verify.run_nonce": run_nonce,
+    "techcards.verify.instance_dir_sha256": instance_dir_sha256,
+}
+
+for vol_name in volume_names:
+    probe = subprocess.run(["docker", "volume", "inspect", vol_name], capture_output=True, text=True, check=False)
+    if probe.returncode != 0:
+        continue
+    items = json.loads(probe.stdout)
+    if not items:
+        continue
+    labels = items[0].get("Labels") or {}
+    mismatches = [
+        f"{key}: expected {want!r}, got {labels.get(key)!r}"
+        for key, want in expected.items()
+        if labels.get(key) != want
+    ]
+    if mismatches:
+        print(
+            f"ERROR: Refusing to delete volume '{vol_name}' because ownership labels changed or did not match: "
+            + "; ".join(mismatches),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    rm = subprocess.run(["docker", "volume", "rm", "--", vol_name], capture_output=True, text=True, check=False)
+    if rm.returncode != 0:
+        print(f"ERROR: Failed to remove verified volume '{vol_name}': {rm.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
+PY
+}
+
+read_ro_password() {
+  local secret_file="$INSTANCE_DIR/db-ro.secret"
+  [[ -f "$secret_file" ]] || die "Missing read-only role secret file: $secret_file"
+  tr -d '\r\n' <"$secret_file"
+}
+
 provision_readonly_role() {
-  compose_cmd exec -T db \
-    psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<SQL >/dev/null
-DO \$\$
-BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${DB_RO_USER}') THEN
-    CREATE ROLE ${DB_RO_USER} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;
-  END IF;
-END \$\$;
-REVOKE CREATE ON SCHEMA public FROM PUBLIC;
-REVOKE ALL ON DATABASE ${POSTGRES_DB} FROM ${DB_RO_USER};
-GRANT CONNECT ON DATABASE ${POSTGRES_DB} TO ${DB_RO_USER};
-REVOKE ALL ON SCHEMA public FROM ${DB_RO_USER};
-GRANT USAGE ON SCHEMA public TO ${DB_RO_USER};
-REVOKE ALL ON ALL TABLES IN SCHEMA public FROM ${DB_RO_USER};
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO ${DB_RO_USER};
-ALTER DEFAULT PRIVILEGES FOR ROLE ${POSTGRES_USER} IN SCHEMA public GRANT SELECT ON TABLES TO ${DB_RO_USER};
-SQL
+  local ro_password
+  ro_password="$(read_ro_password)"
+
+  python3 - "$POSTGRES_USER" "$VERIFY_POSTGRES_PASSWORD" "$POSTGRES_DB" "$DB_RO_USER" "$ro_password" <<'PY' | \
+    compose_cmd exec -T api python -c '
+import json
+import sys
+import psycopg
+from psycopg import sql
+
+cfg = json.load(sys.stdin)
+pg_user = cfg["pg_user"]
+pg_pass = cfg["pg_pass"]
+pg_db = cfg["pg_db"]
+ro_user = cfg["ro_user"]
+ro_pass = cfg["ro_pass"]
+
+with psycopg.connect(
+    host="db",
+    port=5432,
+    dbname=pg_db,
+    user=pg_user,
+    password=pg_pass,
+    autocommit=True,
+) as conn:
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (ro_user,))
+        if cur.fetchone() is None:
+            cur.execute(
+                sql.SQL("CREATE ROLE {} LOGIN PASSWORD {} NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT").format(
+                    sql.Identifier(ro_user),
+                    sql.Literal(ro_pass),
+                )
+            )
+        else:
+            cur.execute(
+                sql.SQL("ALTER ROLE {} WITH LOGIN PASSWORD {} NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT").format(
+                    sql.Identifier(ro_user),
+                    sql.Literal(ro_pass),
+                )
+            )
+        cur.execute(sql.SQL("REVOKE CREATE ON SCHEMA public FROM PUBLIC"))
+        cur.execute(sql.SQL("REVOKE ALL ON DATABASE {} FROM {}").format(sql.Identifier(pg_db), sql.Identifier(ro_user)))
+        cur.execute(sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(sql.Identifier(pg_db), sql.Identifier(ro_user)))
+        cur.execute(sql.SQL("REVOKE ALL ON SCHEMA public FROM {}").format(sql.Identifier(ro_user)))
+        cur.execute(sql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(sql.Identifier(ro_user)))
+        cur.execute(sql.SQL("REVOKE ALL ON ALL TABLES IN SCHEMA public FROM {}").format(sql.Identifier(ro_user)))
+        cur.execute(sql.SQL("GRANT SELECT ON ALL TABLES IN SCHEMA public TO {}").format(sql.Identifier(ro_user)))
+        cur.execute(
+            sql.SQL("ALTER DEFAULT PRIVILEGES FOR ROLE {} IN SCHEMA public GRANT SELECT ON TABLES TO {}").format(
+                sql.Identifier(pg_user),
+                sql.Identifier(ro_user),
+            )
+        )
+'
+import json
+import sys
+
+pg_user, pg_pass, pg_db, ro_user, ro_pass = sys.argv[1:]
+json.dump(
+    {
+        "pg_user": pg_user,
+        "pg_pass": pg_pass,
+        "pg_db": pg_db,
+        "ro_user": ro_user,
+        "ro_pass": ro_pass,
+    },
+    sys.stdout,
+)
+PY
+}
+
+run_ro_sql() {
+  local sql_text="$1"
+  local mode="${2:-table}"
+  local ro_password
+  ro_password="$(read_ro_password)"
+
+  python3 - "$POSTGRES_DB" "$DB_RO_USER" "$ro_password" "$sql_text" "$mode" <<'PY' | \
+    compose_cmd exec -T api python -c '
+import json
+import sys
+import psycopg
+
+cfg = json.load(sys.stdin)
+mode = cfg["mode"]
+
+
+def format_table(headers, rows):
+    str_rows = [["" if v is None else str(v) for v in row] for row in rows]
+    widths = [len(h) for h in headers]
+    for row in str_rows:
+        for idx, cell in enumerate(row):
+            if len(cell) > widths[idx]:
+                widths[idx] = len(cell)
+    header_line = " | ".join(h.center(widths[idx]) for idx, h in enumerate(headers))
+    sep_line = "-+-".join("-" * w for w in widths)
+    lines = [" " + header_line, "-" + sep_line + "-"]
+    for row in str_rows:
+        line = " | ".join(cell.ljust(widths[idx]) for idx, cell in enumerate(row))
+        lines.append(" " + line)
+    row_count = len(str_rows)
+    suffix = "row" if row_count == 1 else "rows"
+    lines.append(f"({row_count} {suffix})")
+    return "\n".join(lines)
+
+
+try:
+    with psycopg.connect(
+        host="db",
+        port=5432,
+        dbname=cfg["pg_db"],
+        user=cfg["ro_user"],
+        password=cfg["ro_pass"],
+        options="-c default_transaction_read_only=on",
+        autocommit=False,
+    ) as conn:
+        conn.read_only = True
+        try:
+            with conn.cursor() as cur:
+                cur.execute(cfg["sql"])
+                if mode == "tsv":
+                    rows = cur.fetchall() if cur.description is not None else []
+                    for row in rows:
+                        print("\t".join("" if v is None else str(v) for v in row))
+                else:
+                    tables = []
+                    while True:
+                        if cur.description is not None:
+                            headers = [col.name for col in cur.description]
+                            rows = cur.fetchall()
+                            tables.append(format_table(headers, rows))
+                        if not cur.nextset():
+                            break
+                    if tables:
+                        print("\n\n".join(tables))
+                    else:
+                        print("(no rows returned)")
+        finally:
+            conn.rollback()
+except psycopg.Error as exc:
+    msg = str(exc).strip() or exc.__class__.__name__
+    print(f"SQL ERROR: {msg}", file=sys.stderr)
+    sys.exit(1)
+'
+import json
+import sys
+
+pg_db, ro_user, ro_pass, sql_text, mode = sys.argv[1:]
+json.dump(
+    {
+        "pg_db": pg_db,
+        "ro_user": ro_user,
+        "ro_pass": ro_pass,
+        "sql": sql_text,
+        "mode": mode,
+    },
+    sys.stdout,
+)
+PY
 }
 
 cmd_launch() {
@@ -346,31 +746,56 @@ cmd_launch() {
     port_is_free "$db_port" || die "Requested DB port 127.0.0.1:$db_port is already in use"
   fi
 
+  # Guard the pre-instance.json reservation phase so any failure (such as an
+  # unwritable or regular-file evidence parent) rolls back the scratch reservation
+  # instead of stranding the run-id.
+  _LAUNCH_RESERVATION_ACTIVE=0
+  _LAUNCH_RESERVED_INSTANCE_DIR=""
+  _LAUNCH_RESERVED_EVIDENCE_DIR=""
+  trap 'rollback_launch_reservation' EXIT
+
   # Atomically reserve both the scratch instance directory and a fresh evidence directory
   # so concurrent launches with the same run-id or reused evidence paths cannot collide.
   if ! mkdir "$instance_dir" 2>/dev/null; then
     die "Instance '$run_id' already exists or is currently launching ($instance_dir)"
   fi
+  instance_dir="$(canonical_path "$instance_dir")"
+  _LAUNCH_RESERVED_INSTANCE_DIR="$instance_dir"
+  _LAUNCH_RESERVATION_ACTIVE=1
 
-  mkdir -p "$(dirname "$evidence_dir")"
-  if ! mkdir "$evidence_dir" 2>/dev/null; then
-    rmdir "$instance_dir" 2>/dev/null || true
-    die "Evidence directory already exists ($evidence_dir). Use a fresh --run-id or --evidence-dir so runs are never mixed."
+  local evidence_parent
+  evidence_parent="$(dirname "$evidence_dir")"
+  if ! mkdir -p "$evidence_parent" 2>/dev/null; then
+    die "Failed to create evidence parent directory '$evidence_parent' (check permissions and that no path component is a regular file)"
   fi
+  if ! mkdir "$evidence_dir" 2>/dev/null; then
+    if [[ -e "$evidence_dir" ]]; then
+      die "Evidence directory already exists ($evidence_dir). Use a fresh --run-id or --evidence-dir so runs are never mixed."
+    else
+      die "Failed to create evidence directory '$evidence_dir' (check permissions)"
+    fi
+  fi
+  evidence_dir="$(canonical_path "$evidence_dir")"
 
   # Re-verify canonicalized disjointness now that both directories exist on disk.
   if ! assert_disjoint_paths "$INSTANCES_ROOT" "$evidence_dir"; then
-    rmdir "$evidence_dir" "$instance_dir" 2>/dev/null || true
+    rmdir "$evidence_dir" 2>/dev/null || true
     exit 1
   fi
+  _LAUNCH_RESERVED_EVIDENCE_DIR="$evidence_dir"
 
-  local repo_root git_sha source_hash compose_project base_url created_at
+  local repo_root git_sha source_hash run_nonce compose_project base_url created_at ro_password
   repo_root="$(resolve_repo_root)"
   git_sha="$(git -C "$repo_root" rev-parse --short HEAD 2>/dev/null || echo unknown)"
   source_hash="$(compute_source_hash "$repo_root")"
-  compose_project="verify-techcards-${run_id}"
+  run_nonce="$(python3 -c 'import secrets; print(secrets.token_hex(6))')"
+  validate_run_nonce "$run_nonce"
+  compose_project="verify-techcards-${run_id}-${run_nonce}"
   base_url="http://127.0.0.1:${api_port}"
   created_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  ro_password="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+
+  assert_project_unused "$compose_project"
 
   mkdir -p "$evidence_dir/steps" "$evidence_dir/db" "$evidence_dir/logs"
 
@@ -382,33 +807,89 @@ POSTGRES_HOST_PORT=${db_port}
 GENERATOR_PROVIDER=${VERIFY_GENERATOR_PROVIDER}
 EOF
 
-  cat >"$instance_dir/compose.override.yaml" <<EOF
-services:
+  (
+    umask 077
+    printf '%s\n' "$ro_password" >"$instance_dir/db-ro.secret"
+  )
+
+  cp "$repo_root/compose.yaml" "$instance_dir/compose.base.yaml"
+
+  python3 - \
+    "$instance_dir/compose.override.yaml" \
+    "$compose_project" \
+    "$db_port" \
+    "$api_port" \
+    "$run_id" \
+    "$run_nonce" \
+    "$instance_dir" \
+    "$git_sha" \
+    "$source_hash" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import sys
+
+out_path, compose_project, db_port, api_port, run_id, run_nonce, instance_dir, git_sha, source_hash = sys.argv[1:]
+instance_dir_sha256 = hashlib.sha256(os.fsencode(instance_dir)).hexdigest()
+
+
+def q_safe_ascii(val):
+    text = str(val)
+    if "$" in text or not text.isascii():
+        raise ValueError(f"Unsafe Compose YAML label/scalar value: {text!r}")
+    return json.dumps(text, ensure_ascii=True)
+
+
+content = f"""services:
   db:
     ports: !override
-      - "127.0.0.1:${db_port}:5432"
+      - {q_safe_ascii(f"127.0.0.1:{db_port}:5432")}
     labels:
-      techcards.verify.run_id: "${run_id}"
-      techcards.verify.git_sha: "${git_sha}"
-      techcards.verify.source_hash: "${source_hash}"
+      techcards.verify.run_id: {q_safe_ascii(run_id)}
+      techcards.verify.run_nonce: {q_safe_ascii(run_nonce)}
+      techcards.verify.instance_dir_sha256: {q_safe_ascii(instance_dir_sha256)}
+      techcards.verify.git_sha: {q_safe_ascii(git_sha)}
+      techcards.verify.source_hash: {q_safe_ascii(source_hash)}
   migrate:
     labels:
-      techcards.verify.run_id: "${run_id}"
-      techcards.verify.git_sha: "${git_sha}"
-      techcards.verify.source_hash: "${source_hash}"
+      techcards.verify.run_id: {q_safe_ascii(run_id)}
+      techcards.verify.run_nonce: {q_safe_ascii(run_nonce)}
+      techcards.verify.instance_dir_sha256: {q_safe_ascii(instance_dir_sha256)}
+      techcards.verify.git_sha: {q_safe_ascii(git_sha)}
+      techcards.verify.source_hash: {q_safe_ascii(source_hash)}
   api:
     ports: !override
-      - "127.0.0.1:${api_port}:8000"
+      - {q_safe_ascii(f"127.0.0.1:{api_port}:8000")}
     labels:
-      techcards.verify.run_id: "${run_id}"
-      techcards.verify.git_sha: "${git_sha}"
-      techcards.verify.source_hash: "${source_hash}"
-EOF
+      techcards.verify.run_id: {q_safe_ascii(run_id)}
+      techcards.verify.run_nonce: {q_safe_ascii(run_nonce)}
+      techcards.verify.instance_dir_sha256: {q_safe_ascii(instance_dir_sha256)}
+      techcards.verify.git_sha: {q_safe_ascii(git_sha)}
+      techcards.verify.source_hash: {q_safe_ascii(source_hash)}
+volumes:
+  postgres_data:
+    name: {q_safe_ascii(f"{compose_project}_postgres_data")}
+    labels:
+      techcards.verify.run_id: {q_safe_ascii(run_id)}
+      techcards.verify.run_nonce: {q_safe_ascii(run_nonce)}
+      techcards.verify.instance_dir_sha256: {q_safe_ascii(instance_dir_sha256)}
+networks:
+  default:
+    name: {q_safe_ascii(f"{compose_project}_default")}
+    labels:
+      techcards.verify.run_id: {q_safe_ascii(run_id)}
+      techcards.verify.run_nonce: {q_safe_ascii(run_nonce)}
+      techcards.verify.instance_dir_sha256: {q_safe_ascii(instance_dir_sha256)}
+"""
+pathlib.Path(out_path).write_text(content, encoding="utf-8")
+PY
 
   python3 - \
     "$instance_dir/instance.json" \
     "$evidence_dir/run-meta.json" \
     "$run_id" \
+    "$run_nonce" \
     "$compose_project" \
     "$repo_root" \
     "$instance_dir" \
@@ -431,6 +912,7 @@ import sys
     instance_json,
     evidence_json,
     run_id,
+    run_nonce,
     compose_project,
     repo_root,
     instance_dir,
@@ -449,6 +931,7 @@ import sys
 
 instance_meta = {
     "run_id": run_id,
+    "run_nonce": run_nonce,
     "compose_project": compose_project,
     "repo_root": repo_root,
     "instance_dir": instance_dir,
@@ -468,6 +951,7 @@ pathlib.Path(instance_json).write_text(json.dumps(instance_meta, indent=2) + "\n
 
 evidence_meta = {
     "run_id": run_id,
+    "run_nonce": run_nonce,
     "compose_project": compose_project,
     "repo_root": repo_root,
     "base_url": base_url,
@@ -485,6 +969,20 @@ pathlib.Path(evidence_json).write_text(json.dumps(evidence_meta, indent=2) + "\n
 PY
 
   load_instance "$run_id"
+
+  # Validate the saved Compose model while reservation rollback is still active
+  # so a syntax or model error in compose.yaml rolls back the reservation cleanly
+  # instead of stranding the run-id.
+  if ! compose_cmd config -q; then
+    die "Compose configuration validation failed for '$COMPOSE_PROJECT' (rolled back reservation for '$run_id')"
+  fi
+
+  # Reservation is now committed (valid Compose model + instance.json exist and
+  # cleanup <run-id> can tear down any resources created from this point on).
+  _LAUNCH_RESERVATION_ACTIVE=0
+  _LAUNCH_RESERVED_INSTANCE_DIR=""
+  _LAUNCH_RESERVED_EVIDENCE_DIR=""
+  trap - EXIT
 
   echo "Launching isolated TechCards SRS stack ($COMPOSE_PROJECT) on $BASE_URL (db 127.0.0.1:$DB_PORT)..."
   if ! compose_cmd up --build -d; then
@@ -532,6 +1030,7 @@ PY
 
   echo "READY"
   echo "RUN_ID=$RUN_ID"
+  echo "RUN_NONCE=$RUN_NONCE"
   echo "COMPOSE_PROJECT=$COMPOSE_PROJECT"
   echo "BASE_URL=$BASE_URL"
   echo "DB_PORT=$DB_PORT"
@@ -583,7 +1082,12 @@ cmd_doctor() {
     fi
   }
 
-  record "PASS" "instance_state" "run_id=$RUN_ID project=$COMPOSE_PROJECT"
+  local ownership_info
+  if ownership_info="$(verify_project_ownership 1 2>&1)"; then
+    record "PASS" "instance_state" "run_id=$RUN_ID nonce=$RUN_NONCE project=$COMPOSE_PROJECT ($ownership_info)"
+  else
+    record "FAIL" "instance_state" "ownership check failed for project=$COMPOSE_PROJECT: ${ownership_info//$'\n'/; }"
+  fi
 
   local db_cid migrate_cid api_cid
   db_cid="$(compose_cmd ps -q db 2>/dev/null || true)"
@@ -709,12 +1213,11 @@ PY
   fi
 
   local ro_check
-  ro_check="$(compose_cmd exec -T -e PGOPTIONS="-c default_transaction_read_only=on" db \
-    psql -At -v ON_ERROR_STOP=1 -U "$DB_RO_USER" -d "$POSTGRES_DB" -c "SELECT current_user;" 2>/dev/null || true)"
-  if [[ "$ro_check" == "$DB_RO_USER" ]]; then
-    record "PASS" "db_readonly_role" "role=$DB_RO_USER connected to db=$POSTGRES_DB"
+  ro_check="$(run_ro_sql "SELECT current_user, current_setting('transaction_read_only');" tsv 2>/dev/null || true)"
+  if [[ "$ro_check" == "${DB_RO_USER}"$'\t'"on" ]]; then
+    record "PASS" "db_readonly_role" "role=$DB_RO_USER transaction_read_only=on via psycopg to db=$POSTGRES_DB"
   else
-    record "FAIL" "db_readonly_role" "failed to connect as read-only role '$DB_RO_USER'"
+    record "FAIL" "db_readonly_role" "failed to connect read-only via psycopg as '$DB_RO_USER'"
   fi
 
   printf '%s' "$report"
@@ -875,6 +1378,7 @@ PY
 
 cmd_db_query() {
   require_cmd docker
+  require_cmd python3
   [[ $# -eq 3 ]] || die "Usage: control-techcards.sh db-query <run-id> <label> <SQL>"
 
   local run_id="$1"
@@ -893,11 +1397,10 @@ cmd_db_query() {
   timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
   local result
-  result="$(compose_cmd exec -T -e PGOPTIONS="-c default_transaction_read_only=on" db \
-    psql -v ON_ERROR_STOP=1 -U "$DB_RO_USER" -d "$POSTGRES_DB" -c "$sql")"
+  result="$(run_ro_sql "$sql" table)"
 
   {
-    echo "=== DB QUERY (${timestamp}, role=${DB_RO_USER}) ==="
+    echo "=== DB QUERY (${timestamp}, role=${DB_RO_USER}, driver=psycopg) ==="
     echo "$sql"
     echo ""
     echo "=== RESULT ==="
@@ -933,6 +1436,7 @@ cmd_env() {
   load_instance "$1"
   cat <<EOF
 RUN_ID=$RUN_ID
+RUN_NONCE=$RUN_NONCE
 COMPOSE_PROJECT=$COMPOSE_PROJECT
 BASE_URL=$BASE_URL
 API_PORT=$API_PORT
@@ -959,13 +1463,52 @@ cmd_cleanup() {
   # Defensive guard: never delete scratch if evidence overlaps it.
   assert_disjoint_paths "$INSTANCE_DIR" "$EVIDENCE_DIR"
 
-  echo "Tearing down isolated Compose project '$COMPOSE_PROJECT'..."
-  compose_cmd down --volumes --remove-orphans --rmi local
+  # Verify every existing container, volume (including mounted volumes), and network
+  # for this Compose project carries this exact run's ownership labels, and capture
+  # the exact list of verified volumes to delete after containers stop.
+  local verified_volumes=()
+  local verified_volumes_raw
+  if ! verified_volumes_raw="$(verify_project_ownership 0 volumes)"; then
+    die "Refusing to tear down '$COMPOSE_PROJECT' because ownership verification failed"
+  fi
+  while IFS= read -r vol; do
+    [[ -n "$vol" ]] && verified_volumes+=("$vol")
+  done <<<"$verified_volumes_raw"
 
-  local remaining
-  remaining="$(docker ps -a --filter "label=com.docker.compose.project=${COMPOSE_PROJECT}" -q)"
-  if [[ -n "$remaining" ]]; then
-    die "Cleanup incomplete: containers still remain for $COMPOSE_PROJECT: $remaining"
+  echo "Tearing down isolated Compose project '$COMPOSE_PROJECT'..."
+  # Never pass --volumes to compose down: volume deletion is bound exclusively to
+  # the exact volumes whose ownership labels were verified above.
+  if compose_cmd config -q 2>/dev/null; then
+    compose_cmd down --remove-orphans --rmi local
+  else
+    # If the saved Compose snapshot is invalid, still allow releasing the reservation
+    # ONLY when zero containers, volumes, networks, or project-scoped images exist.
+    local live_containers live_networks live_images
+    live_containers="$(docker ps -a --filter "label=com.docker.compose.project=${COMPOSE_PROJECT}" -q)"
+    live_networks="$(docker network ls --filter "label=com.docker.compose.project=${COMPOSE_PROJECT}" -q)"
+    live_images="$(docker images -q --filter "reference=${COMPOSE_PROJECT}-*")"
+    if [[ -n "$live_containers" || -n "$live_networks" || -n "$live_images" || ${#verified_volumes[@]} -gt 0 ]]; then
+      die "Saved Compose snapshot for '$COMPOSE_PROJECT' is invalid while resources still exist; cannot safely run compose down"
+    fi
+    echo "Warning: saved Compose snapshot for '$COMPOSE_PROJECT' is invalid, but no Docker resources exist; releasing scratch state." >&2
+  fi
+
+  if [[ ${#verified_volumes[@]} -gt 0 ]]; then
+    remove_verified_volumes "${verified_volumes[@]}"
+  fi
+
+  local remaining_containers remaining_volumes remaining_networks
+  remaining_containers="$(docker ps -a --filter "label=com.docker.compose.project=${COMPOSE_PROJECT}" -q)"
+  remaining_volumes="$(docker volume ls --filter "label=com.docker.compose.project=${COMPOSE_PROJECT}" -q)"
+  remaining_networks="$(docker network ls --filter "label=com.docker.compose.project=${COMPOSE_PROJECT}" -q)"
+  if [[ -z "$remaining_volumes" ]] && docker volume inspect "${COMPOSE_PROJECT}_postgres_data" >/dev/null 2>&1; then
+    remaining_volumes="${COMPOSE_PROJECT}_postgres_data"
+  fi
+  if [[ -z "$remaining_networks" ]] && docker network inspect "${COMPOSE_PROJECT}_default" >/dev/null 2>&1; then
+    remaining_networks="${COMPOSE_PROJECT}_default"
+  fi
+  if [[ -n "$remaining_containers" || -n "$remaining_volumes" || -n "$remaining_networks" ]]; then
+    die "Cleanup incomplete: remaining resources for $COMPOSE_PROJECT (containers='${remaining_containers}' volumes='${remaining_volumes}' networks='${remaining_networks}')"
   fi
 
   rm -rf "$INSTANCE_DIR"
