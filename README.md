@@ -114,6 +114,7 @@ output/error handling; no network fallback or hidden data upload exists now.
 - `migrations/`: versioned schema; `tests/`: scheduling and API checks.
 - [Personal English learning plan](docs/PROJECT_PLAN.md): vision, Saturday milestones and workflow.
 - [MVP design](docs/MVP.md): scope, endpoints, architecture and role/skills mapping.
+- [Backup, restore and migration recovery](docs/BACKUP_RESTORE.md): disposable `pg_dump`/`pg_restore` drill, migration recovery and volume safety.
 - [Saturday exercises](docs/NEXT_STEPS.md): six optional learning tasks.
 
 If startup fails, inspect `docker compose ps -a` and `docker compose logs db migrate api`.
