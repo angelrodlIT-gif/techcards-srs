@@ -109,7 +109,8 @@ Use **issue → branch from current main → focused PR → CI → merge**. Name
 with `Closes #N`. Include behavior, verification and limitations in the PR. Never
 commit credentials. Keep unrelated features separate. Angel's
 [Saturday exercises](NEXT_STEPS.md) are for him to implement, one focused branch at
-a time; creating their issues does not implement them.
+a time; creating their issues does not implement them. For agent roles, review
+gates, and merge rules, see [docs/INTEGRATION_LOOP.md](INTEGRATION_LOOP.md).
 
 ## Repository labels and planning
 
