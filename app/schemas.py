@@ -1,4 +1,5 @@
 from datetime import date, datetime
+from ipaddress import IPv6Address
 from typing import Annotated, Literal
 from urllib.parse import urlsplit, urlunsplit
 
@@ -50,7 +51,14 @@ def normalize_source_url(raw: str) -> tuple[str, str]:
         raise ValueError("url has an invalid port")
 
     is_default = (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
-    host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+    if parsed.netloc.startswith("["):
+        try:
+            IPv6Address(parsed.hostname)
+        except ValueError as exc:
+            raise ValueError("url has an unsupported bracketed host literal") from exc
+        host = f"[{parsed.hostname}]"
+    else:
+        host = parsed.hostname
     netloc = host if (port is None or is_default) else f"{host}:{port}"
     path = parsed.path or "/"
     if len(path) > 1 and path.endswith("/"):
@@ -89,8 +97,13 @@ class CardInput(BaseModel):
         return value
 
 
-class CardOut(CardInput):
+class CardOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
+    deck_id: int
+    front: str
+    back: str
+    kind: Kind
+    source_label: str | None
     id: int
     repetitions: int
     interval_days: int

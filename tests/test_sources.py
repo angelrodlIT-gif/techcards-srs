@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 import app.main as main_module
 from app.config import get_settings
-from app.models import Source
+from app.models import Card, Source
 
 
 def create_deck(client, name="Cloud English"):
@@ -317,6 +317,56 @@ def test_source_embedded_nul_rejected(client):
 
     assert client.get(f"/sources/{sid}").json()["status"] == "draft"
     assert client.get("/cards").json() == []
+
+
+def test_existing_sqlite_card_with_embedded_nul_remains_readable(client, db_engine):
+    if db_engine.dialect.name != "sqlite":
+        pytest.skip("PostgreSQL rejects NUL bytes in text columns")
+    did = create_deck(client)
+    with Session(db_engine) as session:
+        card = Card(deck_id=did, front="Legacy\x00Front", back="Legacy\x00Back")
+        session.add(card)
+        session.commit()
+        cid = card.id
+
+    got = client.get(f"/cards/{cid}")
+    assert got.status_code == 200
+    assert (got.json()["front"], got.json()["back"]) == ("Legacy\x00Front", "Legacy\x00Back")
+    assert [c["id"] for c in client.get("/cards").json()] == [cid]
+    assert [c["id"] for c in client.get(f"/decks/{did}/due").json()] == [cid]
+    assert (
+        client.post(
+            "/cards", json={"deck_id": did, "front": "Bad\x00Front", "back": "Ok"}
+        ).status_code
+        == 422
+    )
+
+
+def test_source_bracketed_ipvfuture_rejected_and_ipv6_preserved(client):
+    normal = client.post("/sources", json={"label": "Host", "url": "https://v1.example/"})
+    assert normal.status_code == 201
+    assert normal.json()["normalized_url"] == "https://v1.example/"
+
+    draft_id = client.post("/sources", json={"label": "Draft"}).json()["id"]
+    for bad_bracketed in ("https://[v1.example]/", "https://[v1.a:b]/"):
+        assert (
+            client.post("/sources", json={"label": "IPvFuture", "url": bad_bracketed}).status_code
+            == 422
+        )
+        assert (
+            client.put(
+                f"/sources/{draft_id}", json={"label": "IPvFuture", "url": bad_bracketed}
+            ).status_code
+            == 422
+        )
+
+    ipv6 = client.post("/sources", json={"label": "IPv6", "url": "https://[::1]:443/docs/"})
+    assert ipv6.status_code == 201
+    assert ipv6.json()["normalized_url"] == "https://[::1]/docs"
+    assert (
+        client.post("/sources", json={"label": "IPv6 dup", "url": "https://[::1]/docs"}).status_code
+        == 409
+    )
 
 
 def test_sources_migration_round_trip(tmp_path, monkeypatch):
