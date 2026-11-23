@@ -40,6 +40,31 @@ The original SM-2 also describes same-session relearning: that UI loop is outsid
 API; failed cards become due tomorrow.
 Reference: [original SM-2 algorithm](https://super-memory.org/english/ol/sm2.htm).
 
+## Review transactions and retry semantics
+- **Atomic card + history updates:** `POST /reviews` locks the target `cards` row with
+  `SELECT ... FOR UPDATE`, computes the next SM-2 schedule from that committed state,
+  updates `cards`, inserts the matching `reviews` row, flushes and validates the response
+  inside the same transaction, and commits both writes together. Any scheduling or
+  database error rolls back the entire transaction so neither `cards` nor `reviews`
+  commits partial state.
+- **Concurrency:** PostgreSQL row locks serialize overlapping `POST /reviews` requests
+  for the same card so each subsequent review reads the committed state of the previous
+  one (or the unmodified state if the previous transaction rolled back). SQLite is used
+  only for sequential unit tests and does not provide PostgreSQL row locking.
+- **UTC boundaries and submission timing:** Card creation (`due_date`), due queries
+  (`due_date <= today(UTC)`), and review scheduling all use the server's UTC date.
+  Reviews at `23:59:59Z` schedule from that UTC day; reviews at `00:00:00Z` schedule from
+  the next UTC day, when cards due on that date enter the due queue immediately. Early
+  and overdue submissions are both accepted and scheduled from the current UTC review date.
+- **Intentional non-idempotent retries:** `POST /reviews` is **not idempotent** and has
+  no idempotency key or request deduplication. Every accepted request appends a new
+  `reviews` row and advances or resets the card schedule again.
+  - `404` and `422` errors never mutate state.
+  - `5xx` errors or dropped connections / timeouts have an ambiguous outcome (the
+    transaction may have rolled back or committed before the connection dropped). Do not
+    blindly auto-retry `POST /reviews`; inspect `GET /cards/{id}` before deciding whether
+    to submit again. Idempotency keys are deferred until a client requires safe auto-retry.
+
 ## API
 Interactive schemas and examples are available at `/docs` and `/openapi.json`.
 
