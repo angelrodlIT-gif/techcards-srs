@@ -25,6 +25,9 @@ them, and approve only reviewed material into scheduled study cards.
 
 - `url` is optional (blank -> `null`) and must be an absolute `http` or `https`
   URL without whitespace, control characters, or credentials (`422` otherwise).
+  `url` is capped at 2,048 characters and `normalized_url` is capped at 2,048
+  UTF-8 bytes (safely below PostgreSQL's 2,704-byte B-tree index entry limit;
+  oversized URLs return `422`).
 - Deterministic `normalized_url` (while keeping trimmed input in `url`): trim;
   lowercase scheme and host; drop default ports (`80`/`443`); drop `#fragment`;
   normalize empty path to `/` and remove a trailing `/` on non-root paths; keep

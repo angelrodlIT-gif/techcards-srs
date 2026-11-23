@@ -11,6 +11,8 @@ RequiredSourceLabel = Annotated[
     str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)
 ]
 SourceUrl = Annotated[str, StringConstraints(min_length=1, max_length=2048)]
+MAX_SOURCE_URL_CHARS = 2048
+MAX_SOURCE_URL_UTF8_BYTES = 2048
 Excerpt = Annotated[str, StringConstraints(min_length=1, max_length=20000)]
 Kind = Literal["vocabulary", "interview_phrase", "behavioral"]
 SourceStatus = Literal["draft", "approved", "discarded"]
@@ -37,8 +39,10 @@ def normalize_source_url(raw: str) -> tuple[str, str]:
     if len(path) > 1 and path.endswith("/"):
         path = path[:-1]
     normalized = urlunsplit((scheme, netloc, path, parsed.query, ""))
-    if len(trimmed) > 2048 or len(normalized) > 2048:
-        raise ValueError("url must be at most 2048 characters")
+    if len(trimmed) > MAX_SOURCE_URL_CHARS:
+        raise ValueError(f"url must be at most {MAX_SOURCE_URL_CHARS} characters")
+    if len(normalized.encode("utf-8")) > MAX_SOURCE_URL_UTF8_BYTES:
+        raise ValueError(f"normalized url must be at most {MAX_SOURCE_URL_UTF8_BYTES} UTF-8 bytes")
     return trimmed, normalized
 
 

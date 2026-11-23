@@ -264,6 +264,36 @@ def test_source_concurrent_duplicate_url_integrity_error_returns_409(
     assert post_resp.status_code == 409
 
 
+def test_source_multibyte_url_utf8_byte_limit(client):
+    prefix = "https://example.com/"  # 20 ASCII bytes
+    # 507 distinct 4-byte UTF-8 codepoints -> 20 + 2028 = 2048 bytes (poorly compressible).
+    max_ok_create = prefix + "".join(chr(0x20000 + i) for i in range(507))
+    max_ok_update = prefix + "".join(chr(0x20300 + i) for i in range(507))
+    assert len(max_ok_create.encode("utf-8")) == 2048
+    assert len(max_ok_update.encode("utf-8")) == 2048
+
+    created = client.post("/sources", json={"label": "Max UTF-8", "url": max_ok_create})
+    assert created.status_code == 201
+    sid = created.json()["id"]
+    assert (
+        client.put(f"/sources/{sid}", json={"label": "Max UTF-8", "url": max_ok_update}).status_code
+        == 200
+    )
+
+    # Oversized poorly compressible multibyte paths (< 2048 chars, > 2048/2704 UTF-8 bytes) -> 422.
+    over_by_one = prefix + "a" + "".join(chr(0x20600 + i) for i in range(507))
+    over_btree = prefix + "".join(chr(0x20900 + i) for i in range(800))
+    assert len(over_by_one.encode("utf-8")) == 2049
+    assert len(over_btree) < 2048 and len(over_btree.encode("utf-8")) == 3220
+
+    for bad_url in (over_by_one, over_btree):
+        assert client.post("/sources", json={"label": "Too Big", "url": bad_url}).status_code == 422
+        assert (
+            client.put(f"/sources/{sid}", json={"label": "Too Big", "url": bad_url}).status_code
+            == 422
+        )
+
+
 def test_sources_migration_round_trip(tmp_path, monkeypatch):
     repo_root = Path(__file__).resolve().parents[1]
     db_url = f"sqlite:///{tmp_path / 'sources_migration.db'}"
