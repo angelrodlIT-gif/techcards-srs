@@ -62,9 +62,11 @@ Use **Try it out** in `/docs`, in this order (use IDs returned by the API):
 5. `GET /cards/1`: see its updated interval, ease and UTC due date.
 
 Grades: 0–2 recall failure, 3 difficult correct recall, 4 correct with hesitation,
-5 easy correct recall. Failed cards return tomorrow. A second review request counts
-as another review, so avoid accidental retries. PUT replaces editable fields and keeps
-the schedule; deleting a deck removes its cards and review history.
+5 easy correct recall. Failed cards return tomorrow. `POST /reviews` is intentionally
+not idempotent—a second request counts as another review, so do not blindly auto-retry
+after a timeout or `5xx` (see [MVP design](docs/MVP.md#review-transactions-and-retry-semantics)).
+PUT replaces editable fields and keeps the schedule; deleting a deck removes its cards
+and review history.
 
 ## Local Python development (optional)
 

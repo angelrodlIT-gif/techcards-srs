@@ -1,4 +1,4 @@
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
@@ -41,6 +41,34 @@ def test_invalid_quality(quality):
         schedule_review(Schedule(), quality, TODAY)
 
 
-def test_invalid_state():
+@pytest.mark.parametrize(
+    "state",
+    [
+        Schedule(-1, 0, 2.5),
+        Schedule(0, -1, 2.5),
+        Schedule(0, 0, 1.29),
+        Schedule(0, 0, float("nan")),
+        Schedule(0, 0, float("inf")),
+        Schedule(2, 0, 2.5),
+    ],
+)
+def test_invalid_state(state):
     with pytest.raises(ValueError):
-        schedule_review(Schedule(-1, 0, 2.5), 4, TODAY)
+        schedule_review(state, 4, TODAY)
+
+
+def test_rejects_datetime_as_reviewed_on():
+    with pytest.raises(ValueError):
+        schedule_review(Schedule(), 4, datetime(2026, 1, 1, tzinfo=UTC))
+
+
+@pytest.mark.parametrize(
+    ("reviewed_on", "expected_due"),
+    [
+        (date(2024, 2, 28), date(2024, 2, 29)),
+        (date(2025, 2, 28), date(2025, 3, 1)),
+        (date(2026, 12, 31), date(2027, 1, 1)),
+    ],
+)
+def test_calendar_rollover_boundaries(reviewed_on, expected_due):
+    assert schedule_review(Schedule(), 4, reviewed_on).due_date == expected_due

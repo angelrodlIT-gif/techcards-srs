@@ -1,8 +1,8 @@
 """Pure SM-2 scheduling; the caller supplies the review date."""
 
 from dataclasses import dataclass
-from datetime import date, timedelta
-from math import ceil
+from datetime import date, datetime, timedelta
+from math import ceil, isfinite
 
 
 @dataclass(frozen=True)
@@ -21,7 +21,15 @@ class ReviewResult:
 def schedule_review(state: Schedule, quality: int, reviewed_on: date) -> ReviewResult:
     if isinstance(quality, bool) or not isinstance(quality, int) or not 0 <= quality <= 5:
         raise ValueError("quality must be an integer from 0 to 5")
-    if state.repetitions < 0 or state.interval_days < 0 or state.ease_factor < 1.3:
+    if isinstance(reviewed_on, datetime) or not isinstance(reviewed_on, date):
+        raise ValueError("reviewed_on must be a date")
+    if (
+        state.repetitions < 0
+        or state.interval_days < 0
+        or not isfinite(state.ease_factor)
+        or state.ease_factor < 1.3
+        or (state.repetitions >= 2 and state.interval_days == 0)
+    ):
         raise ValueError("invalid scheduling state")
     if quality < 3:
         repetitions, interval = 0, 1
