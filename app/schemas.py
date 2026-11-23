@@ -1,10 +1,11 @@
 from datetime import date, datetime
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=5000)]
 Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120)]
+SourceLabel = Annotated[str, StringConstraints(min_length=1, max_length=255)]
 Kind = Literal["vocabulary", "interview_phrase", "behavioral"]
 
 
@@ -23,6 +24,15 @@ class CardInput(BaseModel):
     front: Text
     back: Text
     kind: Kind = "vocabulary"
+    source_label: SourceLabel | None = None
+
+    @field_validator("source_label", mode="before")
+    @classmethod
+    def normalize_source_label(cls, value: object) -> object:
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped or None
+        return value
 
 
 class CardOut(CardInput):

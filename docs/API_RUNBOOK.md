@@ -111,6 +111,7 @@ Response: `201 Created` (returns 6 cards — IDs `1`–`4` `vocabulary` for `aws
     "front": "Explain 'aws' in technical English.",
     "back": "Amazon Web Services: a cloud platform offering compute, storage and networking.",
     "kind": "vocabulary",
+    "source_label": null,
     "id": 1,
     "repetitions": 0,
     "interval_days": 0,
@@ -122,6 +123,7 @@ Response: `201 Created` (returns 6 cards — IDs `1`–`4` `vocabulary` for `aws
     "front": "How would you discuss your experience with aws?",
     "back": "Practice: I have worked with aws to [task]. Use a truthful example and explain your contribution.",
     "kind": "interview_phrase",
+    "source_label": null,
     "id": 5,
     "repetitions": 0,
     "interval_days": 0,
@@ -133,6 +135,7 @@ Response: `201 Created` (returns 6 cards — IDs `1`–`4` `vocabulary` for `aws
     "front": "Tell me about a time you solved a problem involving aws.",
     "back": "Use STAR: describe the Situation, Task, Action and Result. Choose a real experience; do not invent an outcome.",
     "kind": "behavioral",
+    "source_label": null,
     "id": 6,
     "repetitions": 0,
     "interval_days": 0,
@@ -206,8 +209,8 @@ curl -i http://127.0.0.1:8000/decks/1/due
   `ease_factor: 2.5`, and `due_date: "2026-11-24"`.
 - `GET /decks/1/due` now returns only the remaining 5 cards (IDs `2`–`6`).
 - Editing a card with `PUT /cards/{card_id}` replaces `deck_id`, `front`, `back`,
-  and `kind` while preserving `repetitions`, `interval_days`, `ease_factor`, and
-  `due_date`.
+  `kind`, and `source_label` (optional, trimmed; blank values normalize to `null`)
+  while preserving `repetitions`, `interval_days`, `ease_factor`, and `due_date`.
 - Review events are stored in PostgreSQL `reviews`, but no `GET` review history
   endpoint is implemented yet (tracked in issue `#7`).
 - **Retry caution:** `POST /reviews` is intentionally **not idempotent**. Every
