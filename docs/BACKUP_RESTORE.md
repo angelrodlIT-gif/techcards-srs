@@ -38,7 +38,7 @@ Run the automated exercise on two fresh disposable Compose projects (Linux/macOS
 
 Run from the repo root with disposable credentials and ports (`15435`/`15436`; `api` is not started). On PowerShell, set `$env:NAME = "value"` and omit `--env-file /dev/null`.
 
-1. **Generate fresh disposable project names and verify they are unused:**
+1. **Generate fresh disposable project names and define a fail-closed freshness check:**
 
    ```bash
    export POSTGRES_USER=disposable_user
@@ -47,28 +47,34 @@ Run from the repo root with disposable credentials and ports (`15435`/`15436`; `
    export RUN_ID="$(date -u +%Y%m%d%H%M%S)-$(od -An -tx1 -N6 /dev/urandom | tr -d ' \n')"
    export SRC_PROJECT="techcards-backup-src-${RUN_ID}"
    export DST_PROJECT="techcards-backup-dst-${RUN_ID}"
+   export SRC_OWNED=0 DST_OWNED=0
    export DUMP_DIR="$(umask 077 && mktemp -d)"
+   export DUMP_FILE="${DUMP_DIR}/disposable-${RUN_ID}.dump"
 
-   # All checks must exit 0 (empty output) before starting or later cleaning up:
-   for p in "$SRC_PROJECT" "$DST_PROJECT"; do
-     out="$(docker ps -aq --filter "label=com.docker.compose.project=$p")" && test -z "$out"
-     out="$(docker volume ls -q --filter "name=^${p}_")" && test -z "$out"
-     out="$(docker volume ls -q --filter "label=com.docker.compose.project=$p")" && test -z "$out"
+   # Fail-closed check: returns non-zero if any Docker query fails or any artifact exists.
+   check_fresh() {
+     local p="$1" out
+     case "$p" in techcards-backup-src-?*|techcards-backup-dst-?*) ;; *) return 1 ;; esac
+     out="$(docker ps -aq --filter "label=com.docker.compose.project=$p")" && test -z "$out" &&
+     out="$(docker volume ls -q --filter "name=^${p}_")" && test -z "$out" &&
+     out="$(docker volume ls -q --filter "label=com.docker.compose.project=$p")" && test -z "$out" &&
      out="$(docker network ls -q --filter "label=com.docker.compose.project=$p")" && test -z "$out"
-   done
+   }
    ```
 
-2. **Start the fresh disposable source database and apply migrations:**
+2. **Verify freshness, claim ownership, start the disposable source DB, and migrate:**
 
    ```bash
-   POSTGRES_HOST_PORT=15435 docker compose --env-file /dev/null -p "$SRC_PROJECT" up -d --wait db
-   POSTGRES_HOST_PORT=15435 docker compose --env-file /dev/null -p "$SRC_PROJECT" run --rm --build migrate
+   check_fresh "$SRC_PROJECT" && export SRC_OWNED=1 && \
+     POSTGRES_HOST_PORT=15435 docker compose --env-file /dev/null -p "$SRC_PROJECT" up -d --wait db && \
+     POSTGRES_HOST_PORT=15435 docker compose --env-file /dev/null -p "$SRC_PROJECT" run --rm --build migrate
    ```
 
 3. **Seed disposable decks, cards, and reviews:**
 
    ```bash
-   POSTGRES_HOST_PORT=15435 docker compose --env-file /dev/null -p "$SRC_PROJECT" exec -T db \
+   test "${SRC_OWNED:-0}" = "1" && \
+     POSTGRES_HOST_PORT=15435 docker compose --env-file /dev/null -p "$SRC_PROJECT" exec -T db \
      psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<'SQL'
    INSERT INTO decks (name, description) VALUES
      ('Cloud Interviews', 'Disposable AWS & Linux vocabulary'),
@@ -89,31 +95,34 @@ Run from the repo root with disposable credentials and ports (`15435`/`15436`; `
    SQL
    ```
 
-4. **Create and inspect a custom-format `pg_dump` backup (owner-only file):**
+4. **Create and inspect a custom-format `pg_dump` backup (exclusive owner-only file):**
 
    ```bash
-   (umask 077 && POSTGRES_HOST_PORT=15435 docker compose --env-file /dev/null -p "$SRC_PROJECT" exec -T db \
+   test "${SRC_OWNED:-0}" = "1" && (set -eC; umask 077; \
+     POSTGRES_HOST_PORT=15435 docker compose --env-file /dev/null -p "$SRC_PROJECT" exec -T db \
      pg_dump --format=custom --no-owner --no-privileges \
-     -U "$POSTGRES_USER" -d "$POSTGRES_DB" > "$DUMP_DIR/disposable.dump")
+     -U "$POSTGRES_USER" -d "$POSTGRES_DB" > "$DUMP_FILE")
 
-   POSTGRES_HOST_PORT=15435 docker compose --env-file /dev/null -p "$SRC_PROJECT" exec -T db \
-     pg_restore --list < "$DUMP_DIR/disposable.dump" | head -n 25
+   test "${SRC_OWNED:-0}" = "1" && \
+     POSTGRES_HOST_PORT=15435 docker compose --env-file /dev/null -p "$SRC_PROJECT" exec -T db \
+     pg_restore --list < "$DUMP_FILE" | head -n 25
    ```
 
-5. **Start the fresh disposable target database and restore (without running `migrate` first):**
+5. **Verify freshness, claim ownership, start the disposable target DB, and restore (without running `migrate` first):**
 
    ```bash
-   POSTGRES_HOST_PORT=15436 docker compose --env-file /dev/null -p "$DST_PROJECT" up -d --wait db
-
-   POSTGRES_HOST_PORT=15436 docker compose --env-file /dev/null -p "$DST_PROJECT" exec -T db \
-     pg_restore --no-owner --no-privileges --single-transaction --exit-on-error \
-     -U "$POSTGRES_USER" -d "$POSTGRES_DB" < "$DUMP_DIR/disposable.dump"
+   check_fresh "$DST_PROJECT" && export DST_OWNED=1 && \
+     POSTGRES_HOST_PORT=15436 docker compose --env-file /dev/null -p "$DST_PROJECT" up -d --wait db && \
+     POSTGRES_HOST_PORT=15436 docker compose --env-file /dev/null -p "$DST_PROJECT" exec -T db \
+       pg_restore --no-owner --no-privileges --single-transaction --exit-on-error \
+       -U "$POSTGRES_USER" -d "$POSTGRES_DB" < "$DUMP_FILE"
    ```
 
 6. **Verify counts, relationships, and Alembic parity on the target:**
 
    ```bash
-   POSTGRES_HOST_PORT=15436 docker compose --env-file /dev/null -p "$DST_PROJECT" exec -T db \
+   test "${DST_OWNED:-0}" = "1" && \
+     POSTGRES_HOST_PORT=15436 docker compose --env-file /dev/null -p "$DST_PROJECT" exec -T db \
      psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<'SQL'
    SELECT 'decks' AS tbl, COUNT(*) FROM decks
    UNION ALL SELECT 'cards', COUNT(*) FROM cards
@@ -129,38 +138,45 @@ Run from the repo root with disposable credentials and ports (`15435`/`15436`; `
      (SELECT COUNT(*) FROM reviews r LEFT JOIN cards c ON c.id = r.card_id WHERE c.id IS NULL) AS orphan_reviews;
    SQL
 
-   POSTGRES_HOST_PORT=15436 docker compose --env-file /dev/null -p "$DST_PROJECT" run --rm --build migrate alembic current
-   POSTGRES_HOST_PORT=15436 docker compose --env-file /dev/null -p "$DST_PROJECT" run --rm migrate alembic check
+   test "${DST_OWNED:-0}" = "1" && \
+     POSTGRES_HOST_PORT=15436 docker compose --env-file /dev/null -p "$DST_PROJECT" run --rm --build migrate alembic current && \
+     POSTGRES_HOST_PORT=15436 docker compose --env-file /dev/null -p "$DST_PROJECT" run --rm migrate alembic check
    ```
 
    Expected observations: `decks=2`, `cards=4`, `reviews=5`; `joined_reviews=5`,
    `orphan_cards=0`, `orphan_reviews=0`; `alembic current` reports `0001 (head)`
    and `alembic check` reports no new upgrade operations.
 
-7. **Tear down only the fresh projects created in this session:**
+7. **Tear down only projects whose freshness check succeeded and ownership was claimed:**
 
    ```bash
-   # Run only for the fresh $SRC_PROJECT and $DST_PROJECT verified in step 1:
-   POSTGRES_HOST_PORT=15435 docker compose --env-file /dev/null -p "$SRC_PROJECT" down --volumes --remove-orphans --rmi local
-   POSTGRES_HOST_PORT=15436 docker compose --env-file /dev/null -p "$DST_PROJECT" down --volumes --remove-orphans --rmi local
-   rm -rf "$DUMP_DIR"
+   if [ "${SRC_OWNED:-0}" = "1" ]; then
+     POSTGRES_HOST_PORT=15435 docker compose --env-file /dev/null -p "$SRC_PROJECT" down --volumes --remove-orphans --rmi local
+     export SRC_OWNED=0
+   fi
+   if [ "${DST_OWNED:-0}" = "1" ]; then
+     POSTGRES_HOST_PORT=15436 docker compose --env-file /dev/null -p "$DST_PROJECT" down --volumes --remove-orphans --rmi local
+     export DST_OWNED=0
+   fi
+   if [ -n "${DUMP_DIR:-}" ]; then rm -rf "$DUMP_DIR"; fi
    ```
 
 ## Taking a read-only backup of your live local database
 
 Before applying a schema migration to real study data, dump the running `db`
-service into a private directory **outside** the Git repository. Setting
-`umask 077` in a subshell and `chmod 700` on the target directory ensures the
-backup directory (`0700`) and dump file (`0600`) are owner-only from creation:
+service into a private directory **outside** the Git repository. Running in a
+subshell with `set -eC` (`noclobber`), `umask 077`, `chmod 700`, and a unique
+random suffix creates each dump exclusively (`O_EXCL`) at a fresh `0600` path
+inside a `0700` directory and refuses to reopen or truncate any existing file:
 
 ```bash
 (
-  set -e
+  set -eC
   umask 077
   BACKUP_DIR="$HOME/backups/techcards-srs"
   mkdir -p "$BACKUP_DIR"
   chmod 700 "$BACKUP_DIR"
-  DUMP_PATH="$BACKUP_DIR/techcards-$(date -u +%Y%m%dT%H%M%SZ).dump"
+  DUMP_PATH="$BACKUP_DIR/techcards-$(date -u +%Y%m%dT%H%M%SZ)-$(od -An -tx1 -N4 /dev/urandom | tr -d ' \n').dump"
   docker compose exec -T db sh -c \
     'pg_dump --format=custom --no-owner --no-privileges -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
     > "$DUMP_PATH"
@@ -193,9 +209,9 @@ If `docker compose up` or `docker compose run --rm migrate` fails:
      'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT version_num FROM alembic_version;" -c "\dt"'
    ```
 
-3. **Take a private safety dump of the current state** (using the `umask 077`
-   pattern above with a distinct `pre-recovery-<timestamp>.dump` filename)
-   before making manual changes.
+3. **Take a private safety dump of the current state** (using the `set -eC` +
+   `umask 077` exclusive-file pattern above with a distinct unique
+   `pre-recovery-<timestamp>-<random>.dump` filename) before manual changes.
 4. **Recover based on what `alembic current` and `\dt` show:**
    - **Clean rollback (`alembic_version` stayed at the prior revision and no
      partial objects exist):** Revert to the previous commit if you need the app

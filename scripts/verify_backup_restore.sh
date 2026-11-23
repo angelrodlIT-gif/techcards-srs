@@ -3,6 +3,7 @@
 # Uses fresh Compose projects (-p), ephemeral ports, owner-only permissions, and
 # non-secret placeholder credentials. Never reads .env or touches techcards-srs.
 set -euo pipefail
+set -o noclobber
 umask 077
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -39,6 +40,10 @@ compose_dst() {
 assert_fresh_project() {
   local project="$1"
   local containers volumes_by_name volumes_by_label networks
+  if [[ "$project" != techcards-backup-src-?* && "$project" != techcards-backup-dst-?* ]]; then
+    echo "Refusing unexpected Compose project name '${project}'." >&2
+    exit 1
+  fi
   containers="$(docker ps -aq --filter "label=com.docker.compose.project=${project}")"
   volumes_by_name="$(docker volume ls -q --filter "name=^${project}_")"
   volumes_by_label="$(docker volume ls -q --filter "label=com.docker.compose.project=${project}")"
@@ -68,7 +73,7 @@ cleanup() {
 trap cleanup EXIT
 
 DUMP_DIR="$(mktemp -d)"
-DUMP_FILE="${DUMP_DIR}/disposable.dump"
+DUMP_FILE="${DUMP_DIR}/disposable-${RUN_ID}.dump"
 
 assert_fresh_project "$SRC_PROJECT"
 SRC_OWNED=1
