@@ -1,6 +1,6 @@
 from datetime import UTC, date, datetime
 
-from sqlalchemy import CheckConstraint, Date, DateTime, ForeignKey, Index, String, Text
+from sqlalchemy import CheckConstraint, Date, DateTime, ForeignKey, Index, String, Text, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -44,3 +44,23 @@ class Review(Base):
     ease_factor: Mapped[float]
     repetitions: Mapped[int]
     due_date: Mapped[date]
+
+
+class Source(Base):
+    __tablename__ = "sources"
+    __table_args__ = (
+        CheckConstraint("status IN ('draft', 'approved', 'discarded')"),
+        Index(
+            "uq_sources_normalized_url",
+            "normalized_url",
+            unique=True,
+            postgresql_where=text("normalized_url IS NOT NULL"),
+            sqlite_where=text("normalized_url IS NOT NULL"),
+        ),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    label: Mapped[str] = mapped_column(String(255))
+    url: Mapped[str | None] = mapped_column(String(2048), nullable=True, default=None)
+    normalized_url: Mapped[str | None] = mapped_column(String(2048), nullable=True, default=None)
+    excerpt: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
+    status: Mapped[str] = mapped_column(String(20), default="draft")

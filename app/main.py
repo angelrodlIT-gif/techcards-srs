@@ -4,11 +4,12 @@ from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.generator import CardGenerator, get_generator
-from app.models import Card, Deck, Review
+from app.models import Card, Deck, Review, Source
 from app.schemas import (
     CardInput,
     CardOut,
@@ -17,6 +18,11 @@ from app.schemas import (
     GenerateInput,
     ReviewInput,
     ReviewOut,
+    SourceApproveInput,
+    SourceApproveOut,
+    SourceInput,
+    SourceOut,
+    SourceStatus,
 )
 from app.sm2 import Schedule, schedule_review
 
@@ -207,3 +213,129 @@ def create_review(payload: ReviewInput, db: DB, clock: Clock):
         db.rollback()
         raise
     return review_out
+
+
+def ensure_unique_source_url(
+    db: Session, normalized_url: str | None, exclude_id: int | None = None
+) -> None:
+    if normalized_url is None:
+        return
+    query = select(Source.id).where(Source.normalized_url == normalized_url)
+    if exclude_id is not None:
+        query = query.where(Source.id != exclude_id)
+    if db.scalar(query) is not None:
+        raise HTTPException(409, "A source with this URL already exists")
+
+
+def save_source(db: Session, source: Source) -> Source:
+    attempted_url = source.normalized_url
+    try:
+        return save(db, source)
+    except IntegrityError as exc:
+        db.rollback()
+        if attempted_url is not None:
+            raise HTTPException(409, "A source with this URL already exists") from exc
+        raise
+
+
+def lock_draft_source(db: Session, source_id: int, action: str) -> Source:
+    source = db.scalar(select(Source).where(Source.id == source_id).with_for_update())
+    if source is None:
+        raise HTTPException(404, "Source not found")
+    if source.status != "draft":
+        raise HTTPException(409, f"Cannot {action} source in '{source.status}' status")
+    return source
+
+
+@app.post("/sources", response_model=SourceOut, status_code=201)
+def create_source(payload: SourceInput, db: DB):
+    normalized_url = payload.normalized_url
+    ensure_unique_source_url(db, normalized_url)
+    source = Source(
+        label=payload.label,
+        url=payload.url,
+        normalized_url=normalized_url,
+        excerpt=payload.excerpt,
+        status="draft",
+    )
+    return save_source(db, source)
+
+
+@app.get("/sources", response_model=list[SourceOut])
+def list_sources(
+    db: DB,
+    status: SourceStatus | None = None,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=100),
+):
+    query = select(Source).order_by(Source.id)
+    if status is not None:
+        query = query.where(Source.status == status)
+    return db.scalars(query.offset(offset).limit(limit)).all()
+
+
+@app.get("/sources/{source_id}", response_model=SourceOut)
+def get_source(source_id: int, db: DB):
+    return require(db, Source, source_id)
+
+
+@app.put("/sources/{source_id}", response_model=SourceOut)
+def update_source(source_id: int, payload: SourceInput, db: DB):
+    try:
+        source = lock_draft_source(db, source_id, "edit")
+        normalized_url = payload.normalized_url
+        ensure_unique_source_url(db, normalized_url, exclude_id=source_id)
+        source.label = payload.label
+        source.url = payload.url
+        source.normalized_url = normalized_url
+        source.excerpt = payload.excerpt
+        return save_source(db, source)
+    except Exception:
+        db.rollback()
+        raise
+
+
+@app.delete("/sources/{source_id}", status_code=204)
+def delete_source(source_id: int, db: DB):
+    db.delete(require(db, Source, source_id))
+    db.commit()
+    return Response(status_code=204)
+
+
+@app.post("/sources/{source_id}/discard", response_model=SourceOut)
+def discard_source(source_id: int, db: DB):
+    try:
+        source = lock_draft_source(db, source_id, "discard")
+        source.status = "discarded"
+        return save(db, source)
+    except Exception:
+        db.rollback()
+        raise
+
+
+@app.post("/sources/{source_id}/approve", response_model=SourceApproveOut, status_code=201)
+def approve_source(source_id: int, payload: SourceApproveInput, db: DB, clock: Clock):
+    try:
+        source = lock_draft_source(db, source_id, "approve")
+        require(db, Deck, payload.deck_id)
+        today = normalize_utc(clock()).date()
+        card = Card(
+            deck_id=payload.deck_id,
+            front=payload.front,
+            back=payload.back,
+            kind=payload.kind,
+            source_label=source.label,
+            due_date=today,
+        )
+        source.status = "approved"
+        db.add(card)
+        db.flush()
+        result = SourceApproveOut(
+            source=SourceOut.model_validate(source),
+            card=CardOut.model_validate(card),
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return result

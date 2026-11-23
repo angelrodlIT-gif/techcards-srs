@@ -339,3 +339,6 @@ accounts, no authorization checks, no rate limiting, and no TLS**:
 - **Design boundaries and concurrency/retry semantics:** See
   [MVP design](MVP.md) and
   [Review transactions and retry semantics](MVP.md#review-transactions-and-retry-semantics).
+- **Manual source-to-card curation:** See [Source curation](SOURCES.md) for
+  `/sources` draft/edit/approve/discard workflows, URL normalization and `409`
+  duplicate handling, privacy warnings, and non-cascading source deletion.

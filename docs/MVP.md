@@ -27,7 +27,11 @@ API publicly. The public repository is a portfolio artifact, not a deployed serv
 - `reviews`: id, card_id, quality, reviewed_at and resulting scheduling fields.
   Each event and its card update commit in one transaction. PostgreSQL row locks
   serialize reviews of the same card.
-- Foreign keys cascade deck → cards → reviews on deletion. There is no user table yet.
+- `sources`: id, label, optional url/normalized_url, optional excerpt, and
+  status (`draft`/`approved`/`discarded`). Partial unique index on non-null
+  `normalized_url`; see [Source curation](SOURCES.md).
+- Foreign keys cascade deck → cards → reviews on deletion. Deleting a source
+  removes only the `sources` row and leaves approved cards intact. There is no user table yet.
 
 ## SM-2
 The pure function accepts prior state, quality (integer 0–5) and review date.
@@ -79,6 +83,10 @@ Interactive schemas and examples are available at `/docs` and `/openapi.json`.
 | GET | /decks/{id}/due | Cards due on or before UTC today |
 | POST | /reviews | Record quality and update schedule atomically |
 | POST | /cards/generate | Persist cards from pasted text in a selected deck |
+| POST / GET | /sources | Create draft source / list (optional `status` filter) |
+| GET / PUT / DELETE | /sources/{id} | Read / edit draft / delete source (cards stay intact) |
+| POST | /sources/{id}/approve | Approve draft into a scheduled card with `source_label` |
+| POST | /sources/{id}/discard | Discard draft without creating a card |
 
 Lists accept `offset` (default 0) and `limit` (1–100, default 100).
 Missing resources return 404; invalid input returns 422; creation returns 201;
