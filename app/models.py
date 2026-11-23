@@ -26,6 +26,7 @@ class Card(Base):
     front: Mapped[str] = mapped_column(Text)
     back: Mapped[str] = mapped_column(Text)
     kind: Mapped[str] = mapped_column(String(30), default="vocabulary")
+    source_label: Mapped[str | None] = mapped_column(String(255), nullable=True, default=None)
     repetitions: Mapped[int] = mapped_column(default=0)
     interval_days: Mapped[int] = mapped_column(default=0)
     ease_factor: Mapped[float] = mapped_column(default=2.5)

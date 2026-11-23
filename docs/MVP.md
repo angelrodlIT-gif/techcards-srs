@@ -22,7 +22,8 @@ API publicly. The public repository is a portfolio artifact, not a deployed serv
 ## Data model
 - `decks`: id, name, description.
 - `cards`: id, deck_id, front, back, kind (vocabulary/interview_phrase/behavioral),
-  repetitions, interval_days, ease_factor and due_date. Indexed by deck and due date.
+  source_label (nullable), repetitions, interval_days, ease_factor and due_date.
+  Indexed by deck and due date.
 - `reviews`: id, card_id, quality, reviewed_at and resulting scheduling fields.
   Each event and its card update commit in one transaction. PostgreSQL row locks
   serialize reviews of the same card.
