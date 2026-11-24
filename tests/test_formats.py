@@ -365,26 +365,91 @@ def test_card_practice_formats_migration_round_trip(tmp_path, monkeypatch):
             assert (serialized.accepted_answers, serialized.explanation) == ([], None)
             assert schedule_of(serialized.model_dump(mode="json")) == (2, 6, 2.6, "2026-05-10")
             card.accepted_answers, card.explanation = ["Alt A"], "Why A works."
+            session.add_all(
+                [
+                    Card(
+                        id=2,
+                        deck_id=1,
+                        front="The check timed out.",
+                        back="timed out",
+                        kind="sentence",
+                        source_label="S1",
+                        accepted_answers=["expired"],
+                        explanation="Deadline hit.",
+                        repetitions=1,
+                        interval_days=1,
+                        ease_factor=2.5,
+                        due_date=datetime(2026, 5, 11, tzinfo=UTC).date(),
+                    ),
+                    Card(
+                        id=3,
+                        deck_id=1,
+                        front="We ____ the pool.",
+                        back="drain",
+                        kind="cloze",
+                        source_label="S2",
+                        accepted_answers=["flush"],
+                        explanation="Graceful shutdown.",
+                        repetitions=2,
+                        interval_days=6,
+                        ease_factor=2.36,
+                        due_date=datetime(2026, 5, 16, tzinfo=UTC).date(),
+                    ),
+                    Card(
+                        id=4,
+                        deck_id=1,
+                        front="Revertir el despliegue",
+                        back="Roll back the deployment",
+                        kind="es_en",
+                        source_label="S3",
+                        accepted_answers=["Revert the release"],
+                        explanation="Standard verb.",
+                        repetitions=3,
+                        interval_days=15,
+                        ease_factor=2.6,
+                        due_date=datetime(2026, 5, 25, tzinfo=UTC).date(),
+                    ),
+                ]
+            )
             session.commit()
 
         command.downgrade(cfg, "0003")
         down_cols = {c["name"] for c in inspect(engine).get_columns("cards")}
         assert "accepted_answers" not in down_cols and "explanation" not in down_cols
+        expected_rows = [
+            (1, "Q", "A", "vocabulary", "M1", 2, 6, 2.6, "2026-05-10"),
+            (2, "The check timed out.", "timed out", "vocabulary", "S1", 1, 1, 2.5, "2026-05-11"),
+            (3, "We ____ the pool.", "drain", "vocabulary", "S2", 2, 6, 2.36, "2026-05-16"),
+            (
+                4,
+                "Revertir el despliegue",
+                "Roll back the deployment",
+                "vocabulary",
+                "S3",
+                3,
+                15,
+                2.6,
+                "2026-05-25",
+            ),
+        ]
         with engine.connect() as conn:
-            row = conn.execute(
+            rows = conn.execute(
                 sa_text(
-                    "SELECT front, back, kind, source_label, repetitions, interval_days, "
-                    "ease_factor, due_date FROM cards WHERE id = 1"
+                    "SELECT id, front, back, kind, source_label, repetitions, interval_days, "
+                    "ease_factor, due_date FROM cards ORDER BY id"
                 )
-            ).one()
-            assert tuple(row) == ("Q", "A", "vocabulary", "M1", 2, 6, 2.6, "2026-05-10")
+            ).all()
+            assert [tuple(r) for r in rows] == expected_rows
 
         command.upgrade(cfg, "head")
-        with engine.connect() as conn:
-            row = conn.execute(
-                sa_text("SELECT accepted_answers, explanation FROM cards WHERE id = 1")
-            ).one()
-            assert tuple(row) == (None, None)
+        with Session(engine) as session:
+            for exp in expected_rows:
+                card = session.get(Card, exp[0])
+                assert card is not None
+                assert (card.accepted_answers, card.explanation) == (None, None)
+                out = CardOut.model_validate(card)
+                assert (out.kind, out.accepted_answers, out.explanation) == ("vocabulary", [], None)
+                assert schedule_of(out.model_dump(mode="json")) == exp[5:]
     finally:
         engine.dispose()
         monkeypatch.undo()

@@ -34,4 +34,8 @@ Both optional fields work on every card `kind`:
 - **Safe migration (`0004`):** adds nullable `accepted_answers` (JSON) and
   `explanation` (Text) to `cards` without rewriting existing rows or schedules.
   Pre-migration rows with SQL `NULL` serialize as `accepted_answers: []` and
-  `explanation: null`. `PUT /cards/{id}` preserves scheduling fields.
+  `explanation: null`. `PUT /cards/{id}` preserves scheduling fields. Rolling
+  back (`downgrade` to `0003`) performs a lossy remap of `sentence`, `cloze`,
+  and `es_en` rows to `kind = 'vocabulary'` before dropping the new columns so
+  rolled-back cards remain readable on the pre-`0004` API (original kinds are
+  not recovered on a later re-upgrade).
