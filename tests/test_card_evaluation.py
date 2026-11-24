@@ -180,7 +180,7 @@ def test_approve_persists_supported_draft_and_handles_missing_deck(client, set_c
         "kind": "cloze",
         "source_label": "AWS VPC Docs",
         "accepted_answers": ["VPC security group"],
-        "explanation": "Return traffic is automatically allowed.",
+        "explanation": "Stateful security groups allow return traffic automatically.",
         "source_text": aws_doc.source_text,
     }
     approved = client.post("/cards/generate/approve", json=payload)
@@ -337,4 +337,139 @@ def test_single_word_cloze_completion_is_accepted_unit_and_approve(client):
     body = resp.json()
     assert body["evaluation"]["ready_for_review"] is True
     assert body["card"]["back"] == "transactions"
+    assert len(client.get("/cards", params={"deck_id": did}).json()) == 1
+
+
+def test_substring_metric_match_rejected_unit_and_approve(client):
+    src = "I increased PostgreSQL throughput by 170%."
+    front = "How did you improve PostgreSQL throughput?"
+    back = "I increased PostgreSQL throughput by 70%."
+
+    ev = evaluate_generated_card(front=front, back=back, kind="interview_phrase", source_text=src)
+    assert ev.status == "rejected"
+    assert ev.ready_for_review is False
+    assert ev.checks.technical_accuracy == "fail"
+
+    did = create_deck(client)
+    resp = client.post(
+        "/cards/generate/approve",
+        json={
+            "deck_id": did,
+            "front": front,
+            "back": back,
+            "kind": "interview_phrase",
+            "source_text": src,
+        },
+    )
+    assert resp.status_code == 422
+    assert client.get("/cards", params={"deck_id": did}).json() == []
+
+
+def test_unsupported_first_person_claim_with_different_pronoun_rejected(client):
+    src = "Our team uses PostgreSQL."
+    front = "What database does your team use?"
+    valid_back = "Our team uses PostgreSQL in production."
+    claim = "I led the PostgreSQL migration."
+
+    ev_alt = evaluate_generated_card(
+        front=front,
+        back=valid_back,
+        kind="interview_phrase",
+        source_text=src,
+        accepted_answers=[claim],
+    )
+    assert ev_alt.status == "rejected"
+    assert ev_alt.checks.technical_accuracy == "fail"
+
+    ev_back = evaluate_generated_card(
+        front=front,
+        back=claim,
+        kind="interview_phrase",
+        source_text=src,
+    )
+    assert ev_back.status == "rejected"
+    assert ev_back.checks.technical_accuracy == "fail"
+
+    did = create_deck(client)
+    for payload in (
+        {"back": valid_back, "accepted_answers": [claim]},
+        {"back": claim},
+    ):
+        resp = client.post(
+            "/cards/generate/approve",
+            json={
+                "deck_id": did,
+                "front": front,
+                "kind": "interview_phrase",
+                "source_text": src,
+                **payload,
+            },
+        )
+        assert resp.status_code == 422
+    assert client.get("/cards", params={"deck_id": did}).json() == []
+
+
+def test_explanation_usefulness_ambiguity_and_grounding_rejected(client):
+    src = "Amazon VPC security groups are stateful firewalls for EC2 instances."
+    front = "How do AWS VPC security groups work?"
+    back = "Security groups are stateful firewalls."
+
+    cases = (
+        ("12345 !!!", "english_usefulness"),
+        (front, "ambiguity"),
+        ("Helm charts package Kubernetes templates.", "source_grounding"),
+    )
+    did = create_deck(client)
+    for explanation, failed_check in cases:
+        ev = evaluate_generated_card(
+            front=front,
+            back=back,
+            kind="sentence",
+            source_text=src,
+            explanation=explanation,
+        )
+        assert ev.status == "rejected"
+        assert ev.checks.model_dump()[failed_check] == "fail"
+
+        resp = client.post(
+            "/cards/generate/approve",
+            json={
+                "deck_id": did,
+                "front": front,
+                "back": back,
+                "kind": "sentence",
+                "source_text": src,
+                "explanation": explanation,
+            },
+        )
+        assert resp.status_code == 422
+    assert client.get("/cards", params={"deck_id": did}).json() == []
+
+
+def test_two_char_technical_token_cloze_accepted_unit_and_approve(client):
+    src = "IP addresses identify hosts."
+    front = "____ addresses identify hosts."
+    back = "IP"
+
+    ev = evaluate_generated_card(front=front, back=back, kind="cloze", source_text=src)
+    assert ev.status == "draft"
+    assert ev.ready_for_review is True
+    assert ev.checks.english_usefulness == "pass"
+    assert ev.checks.source_grounding == "pass"
+
+    did = create_deck(client)
+    resp = client.post(
+        "/cards/generate/approve",
+        json={
+            "deck_id": did,
+            "front": front,
+            "back": back,
+            "kind": "cloze",
+            "source_text": src,
+        },
+    )
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["evaluation"]["ready_for_review"] is True
+    assert body["card"]["back"] == "IP"
     assert len(client.get("/cards", params={"deck_id": did}).json()) == 1

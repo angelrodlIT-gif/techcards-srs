@@ -16,18 +16,19 @@ from app.schemas import (
 
 URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*")
-ALPHA_WORD_RE = re.compile(r"[A-Za-z]{2,}")
+ALPHA_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9]+")
 UNRESOLVED_RE = re.compile(r"(?:\b(?:TODO|TBD)\b|\?\?\?)", re.IGNORECASE)
 PLACEHOLDER_RE = re.compile(r"\[[A-Za-z0-9 _-]{2,30}\]")
 SCAFFOLD_HINT_RE = re.compile(
     r"\b(?:use\s+a\s+truthful\s+example|do\s+not\s+invent|use\s+star\s*:|choose\s+a\s+real\s+experience)\b",
     re.IGNORECASE,
 )
-FIRST_PERSON_PRONOUN_RE = re.compile(r"\b(?:i|my|we|our)\b", re.IGNORECASE)
 FIRST_PERSON_CLAIM_RE = re.compile(
     r"\b(?:i|we)\s+(?:have\s+)?(?:reduced|cut|improved|increased|saved|led|managed|built|"
     r"migrated|resolved|fixed|deployed|architected|designed|scaled|achieved|delivered|"
-    r"maintained|automated|handled|owned|implemented|worked\s+with)\b"
+    r"maintained|automated|handled|owned|implemented|worked\s+with|"
+    r"configured|created|diagnosed|drove|launched|optimized|provisioned|restored|"
+    r"secured|supported|troubleshot)\b"
     r"|\bin\s+my\s+(?:last|previous)\s+(?:role|job|company|position)\b",
     re.IGNORECASE,
 )
@@ -93,6 +94,7 @@ TECHNICAL_CONTRADICTIONS: tuple[tuple[re.Pattern[str], str], ...] = tuple(
 
 STOPWORDS = frozenset(
     (
+        "am an as at be by do go he if in is it me my no of on or so to up us we "
         "about action after all also and answer any are been before but can card choose "
         "contribution could describe discuss does english example experience explain for from "
         "had has have how into invent involving its just like make may meaning more most must "
@@ -125,7 +127,7 @@ def _content_tokens(text: str) -> set[str]:
     return {
         stem
         for tok in _words(text)
-        if len(tok) >= 3 and (stem := _stem(tok.lower())) not in STOPWORDS
+        if len(tok) >= 2 and (stem := _stem(tok.lower())) not in STOPWORDS
     }
 
 
@@ -154,13 +156,16 @@ def evaluate_generated_card(
     uncertainty: list[str] = []
 
     cleaned_answers = [a.strip() for a in accepted_answers if a.strip()]
+    cleaned_explanation = (explanation or "").strip()
     front_words, back_words = _words(front), _words(back)
     min_back_words = 1 if kind == "cloze" else 2
     english_status: CheckStatus = "pass"
     if any("\x00" in part for part in (front, back, explanation or "", *accepted_answers)):
         english_status = "fail"
         reasons.append("Card fields must not contain NUL bytes.")
-    if any(len(part.strip()) > 5000 for part in (front, back, explanation or "")):
+    if any(
+        len(part.strip()) > 5000 for part in (front, back, cleaned_explanation, *cleaned_answers)
+    ):
         english_status = "fail"
         reasons.append("Card fields must be at most 5,000 characters.")
     for side, raw, words, min_words in (
@@ -177,12 +182,28 @@ def evaluate_generated_card(
         elif len(words) < min_words:
             english_status = "fail"
             reasons.append(f"{side} is a single-token fragment; use a clear English phrase.")
-    if any(not ALPHA_WORD_RE.findall(_strip_urls(ans)) for ans in cleaned_answers):
+    if cleaned_explanation and (
+        not ALPHA_WORD_RE.findall(_strip_urls(cleaned_explanation))
+        or len(_words(cleaned_explanation)) < 2
+    ):
+        english_status = "fail"
+        reasons.append("explanation must contain a meaningful English phrase.")
+    if any(
+        not ALPHA_WORD_RE.findall(_strip_urls(ans)) or len(_words(ans)) < min_back_words
+        for ans in cleaned_answers
+    ):
         english_status = "fail"
         reasons.append("accepted_answers contains an entry without meaningful English words.")
 
+    source_tokens = _content_tokens(source_text)
+    source_lower_words = {w.lower() for w in _words(source_text)}
+    allowed_answer_tokens = set(source_tokens)
+    for term, definition in GLOSSARY.items():
+        if term in source_lower_words or _stem(term) in source_tokens:
+            allowed_answer_tokens |= _content_tokens(definition)
+
     tech_status: CheckStatus = "pass"
-    answer_parts = tuple(part for part in (back, explanation or "", *cleaned_answers) if part)
+    answer_parts = tuple(part for part in (back, cleaned_explanation, *cleaned_answers) if part)
     combined_tech = "\n".join(part for part in (front, *answer_parts) if part)
     for pattern, message in TECHNICAL_CONTRADICTIONS:
         if pattern.search(combined_tech):
@@ -190,31 +211,50 @@ def evaluate_generated_card(
             reasons.append(message)
 
     source_norm = _norm_space(source_text)
-    combined_answer_text = "\n".join(answer_parts)
+    source_metrics = {_norm_space(m) for m in METRIC_RE.findall(source_text)}
     ungrounded_metrics = [
-        m for m in METRIC_RE.findall(combined_answer_text) if _norm_space(m) not in source_norm
+        m for m in METRIC_RE.findall(combined_tech) if _norm_space(m) not in source_metrics
     ]
     has_placeholder = bool(PLACEHOLDER_RE.search(front) or PLACEHOLDER_RE.search(back))
     is_practice = has_placeholder or _is_practice_text(back)
     if ungrounded_metrics:
         tech_status = "fail"
         reasons.append("Card contains ungrounded metrics not present in source_text.")
-    if any(
-        FIRST_PERSON_CLAIM_RE.search(part) and not _is_practice_text(part) for part in answer_parts
-    ) and not FIRST_PERSON_PRONOUN_RE.search(source_text):
-        tech_status = "fail"
-        reasons.append("Card makes a first-person achievement claim not supported by source_text.")
+    for part in (front, *answer_parts):
+        if _is_practice_text(part):
+            continue
+        claim_matches = [m.group(0) for m in FIRST_PERSON_CLAIM_RE.finditer(part)]
+        if not claim_matches:
+            continue
+        claims_in_source = all(
+            re.search(rf"\b{re.escape(_norm_space(claim))}\b", source_norm) is not None
+            for claim in claim_matches
+        )
+        if not (claims_in_source and _content_tokens(part) <= allowed_answer_tokens):
+            tech_status = "fail"
+            reasons.append(
+                "Card makes a first-person achievement claim not supported by source_text."
+            )
+            break
 
     ambiguity_status: CheckStatus = "pass"
     if _norm_space(front) == _norm_space(back):
         ambiguity_status = "fail"
         reasons.append("Front and back are identical.")
+    if cleaned_explanation and _norm_space(cleaned_explanation) == _norm_space(front):
+        ambiguity_status = "fail"
+        reasons.append("Explanation is identical to front.")
     if any(_norm_space(ans) == _norm_space(front) for ans in cleaned_answers):
         ambiguity_status = "fail"
         reasons.append("An accepted answer is identical to front.")
-    if len(front_words) < 2 or len(back_words) < min_back_words:
+    if (
+        len(front_words) < 2
+        or len(back_words) < min_back_words
+        or (cleaned_explanation and len(_words(cleaned_explanation)) < 2)
+        or any(len(_words(ans)) < min_back_words for ans in cleaned_answers)
+    ):
         ambiguity_status = "fail"
-        reasons.append("Front and back must meet minimum word counts to avoid ambiguity.")
+        reasons.append("Card fields must meet minimum word counts to avoid ambiguity.")
     if any(UNRESOLVED_RE.search(part) for part in (front, *answer_parts)):
         ambiguity_status = "fail"
         reasons.append("Card contains unresolved placeholder markers (TODO, TBD, or ???).")
@@ -228,14 +268,11 @@ def evaluate_generated_card(
         ambiguity_status = "warn"
 
     grounding_status: CheckStatus = "pass"
-    source_tokens = _content_tokens(source_text)
-    source_lower_words = {w.lower() for w in _words(source_text)}
-    allowed_answer_tokens = set(source_tokens)
-    for term, definition in GLOSSARY.items():
-        if term in source_lower_words or _stem(term) in source_tokens:
-            allowed_answer_tokens |= _content_tokens(definition)
     front_tokens, back_tokens = _content_tokens(front), _content_tokens(back)
-    if any(FALLBACK_TOPIC in part.lower() for part in (front, back, *cleaned_answers)):
+    if any(
+        FALLBACK_TOPIC in part.lower()
+        for part in (front, back, cleaned_explanation, *cleaned_answers)
+    ):
         grounding_status = "fail"
         reasons.append("Card uses the generic fallback placeholder instead of source content.")
     elif not (source_tokens & (front_tokens | back_tokens)):
@@ -251,6 +288,9 @@ def evaluate_generated_card(
     elif any(not (_content_tokens(ans) & allowed_answer_tokens) for ans in cleaned_answers):
         grounding_status = "fail"
         reasons.append("An accepted answer is not grounded in source_text.")
+    elif cleaned_explanation and not (_content_tokens(cleaned_explanation) & allowed_answer_tokens):
+        grounding_status = "fail"
+        reasons.append("Explanation is not grounded in source_text.")
 
     if has_placeholder:
         uncertainty.append(
