@@ -2,7 +2,15 @@
   "use strict";
 
   const $ = (id) => document.getElementById(id);
-  const state = { card: null, loadSeq: 0, grading: false, templatesLoaded: false, errorsLoaded: false };
+  const state = {
+    card: null,
+    loadSeq: 0,
+    grading: false,
+    templatesLoaded: false,
+    templateSeq: 0,
+    activeTemplateId: null,
+    errorsLoaded: false,
+  };
 
   function el(tag, props = {}, ...children) {
     const node = document.createElement(tag);
@@ -76,7 +84,9 @@
     const status = $("study-status");
     const deckId = deckIdValue();
     if (deckId === null) {
+      state.loadSeq++;
       state.card = null;
+      clearAnswer();
       $("study-card").hidden = true;
       return setStatus(status, "Enter or select a valid positive Deck ID.", "error");
     }
@@ -112,9 +122,10 @@
   async function revealCard() {
     if (!state.card) return;
     const cardId = state.card.card_id;
+    const seq = state.loadSeq;
     $("reveal-btn").disabled = true;
     const res = await post(`/study/${encodeURIComponent(cardId)}/reveal`);
-    if (!state.card || state.card.card_id !== cardId) return;
+    if (seq !== state.loadSeq || !state.card || state.card.card_id !== cardId) return;
     if (!res.ok || !res.data) {
       $("reveal-btn").disabled = false;
       return setStatus($("study-status"), res.error, "error");
@@ -146,21 +157,32 @@
   }
 
   async function loadTemplates() {
+    const seq = ++state.templateSeq;
+    state.activeTemplateId = null;
+    $("template-detail").hidden = true;
+    $("create-from-template-btn").disabled = true;
     const res = await api("/templates");
+    if (seq !== state.templateSeq) return;
     if (!res.ok || !Array.isArray(res.data)) return setStatus($("templates-status"), res.error, "error");
     state.templatesLoaded = true;
     const select = $("template-select");
     select.replaceChildren(new Option("-- Choose a template --", ""));
     for (const t of res.data) select.append(new Option(`[${t.category}] ${t.title}`, t.id));
-    $("template-detail").hidden = true;
     setStatus($("templates-status"), `${res.data.length} templates available.`);
   }
 
   async function viewTemplate(id) {
-    if (!id) { $("template-detail").hidden = true; return; }
+    const seq = ++state.templateSeq;
+    state.activeTemplateId = null;
+    $("template-detail").hidden = true;
+    $("create-from-template-btn").disabled = true;
+    if (!id) return setStatus($("templates-status"), "");
+    setStatus($("templates-status"), "Loading template...");
     const res = await api(`/templates/${encodeURIComponent(id)}`);
+    if (seq !== state.templateSeq) return;
     if (!res.ok || !res.data) return setStatus($("templates-status"), res.error, "error");
     const t = res.data;
+    state.activeTemplateId = t.id;
     $("tpl-title").textContent = t.title;
     $("tpl-meta").textContent = `(${t.category} · ${t.kind})`;
     $("tpl-front").textContent = t.front;
@@ -170,19 +192,21 @@
     $("tpl-followups-wrap").hidden = fups.length === 0;
     $("tpl-explanation").textContent = t.explanation || "";
     $("tpl-explanation").hidden = !t.explanation;
+    $("create-from-template-btn").disabled = false;
     $("template-detail").hidden = false;
     setStatus($("templates-status"), "");
   }
 
   async function createCardFromTemplate() {
     const btn = $("create-from-template-btn");
-    const templateId = $("template-select").value;
+    const templateId = state.activeTemplateId;
+    const seq = state.templateSeq;
     const deckId = deckIdValue();
     if (!templateId) return;
     if (deckId === null) return setStatus($("templates-status"), "Select a valid Deck ID above first.", "error");
     btn.disabled = true;
     const res = await post(`/templates/${encodeURIComponent(templateId)}/cards`, { deck_id: deckId });
-    btn.disabled = false;
+    if (seq === state.templateSeq && state.activeTemplateId === templateId) btn.disabled = false;
     if (!res.ok || !res.data) return setStatus($("templates-status"), res.error, "error");
     setStatus($("templates-status"), `Created card #${res.data.id} in deck #${deckId}.`, "ok");
   }
@@ -259,7 +283,7 @@
   $("deck-select").addEventListener("change", (e) => {
     $("deck-id").value = e.target.value;
     if (e.target.value) loadNextCard();
-    else { state.card = null; clearAnswer(); $("study-card").hidden = true; setStatus($("study-status"), ""); }
+    else { state.loadSeq++; state.card = null; clearAnswer(); $("study-card").hidden = true; setStatus($("study-status"), ""); }
   });
   $("deck-id").addEventListener("keydown", (e) => { if (e.key === "Enter") loadNextCard(); });
   $("load-next-btn").addEventListener("click", () => loadNextCard());
