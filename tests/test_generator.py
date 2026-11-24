@@ -1,3 +1,4 @@
+import http.client
 import io
 import json
 import urllib.error
@@ -17,6 +18,9 @@ from app.generator import (
     GeneratorUpstreamError,
     MockGenerator,
     OpenAICompatibleGenerator,
+    _DeadlineHTTPHandler,
+    _DeadlineHTTPSHandler,
+    _DeadlineSocket,
     _default_urlopen,
     _NoRedirectHandler,
     get_generator,
@@ -707,6 +711,8 @@ def test_default_urlopen_disables_proxies_for_loopback_http(
 
     assert len(captured_handlers) == 1
     handlers = captured_handlers[0]
+    assert any(isinstance(handler, _DeadlineHTTPHandler) for handler in handlers)
+    assert any(isinstance(handler, _DeadlineHTTPSHandler) for handler in handlers)
     assert any(isinstance(handler, _NoRedirectHandler) for handler in handlers)
     proxy_handlers = [h for h in handlers if isinstance(h, urllib.request.ProxyHandler)]
     if expect_proxy_disabled:
@@ -848,4 +854,225 @@ def test_deeply_nested_json_raises_upstream_502(client, raw_body):
     )
     assert res.status_code == 502
     assert "sk-recursion-secret" not in res.text
+    assert client.get("/cards", params={"deck_id": did}).json() == []
+
+
+def test_header_trickle_within_http_response_begin_enforces_deadline(client, monkeypatch):
+    now = 500.0
+
+    def fake_monotonic() -> float:
+        return now
+
+    monkeypatch.setattr("app.generator.time.monotonic", fake_monotonic)
+
+    class TrickleHeaderSocket:
+        def __init__(self, payload: bytes, chunk_size: int, step_seconds: float) -> None:
+            self._payload = payload
+            self._offset = 0
+            self._chunk_size = chunk_size
+            self._step_seconds = step_seconds
+            self.timeouts: list[float] = []
+            self.recv_calls = 0
+
+        def settimeout(self, value: float) -> None:
+            self.timeouts.append(value)
+
+        def recv_into(self, buffer, nbytes: int = 0) -> int:
+            nonlocal now
+            self.recv_calls += 1
+            now += self._step_seconds
+            limit = nbytes if nbytes else len(buffer)
+            size = min(self._chunk_size, limit, len(self._payload) - self._offset)
+            if size <= 0:
+                return 0
+            buffer[:size] = self._payload[self._offset : self._offset + size]
+            self._offset += size
+            return size
+
+        def _decref_socketios(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    raw_http = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"X-Header-1: value-one\r\n"
+        b"X-Header-2: value-two\r\n"
+        b"X-Header-3: value-three\r\n"
+        b"Content-Length: 2\r\n"
+        b"\r\n"
+        b"{}"
+    )
+    created_sockets: list[TrickleHeaderSocket] = []
+
+    def opener(request, timeout):
+        raw_sock = TrickleHeaderSocket(raw_http, chunk_size=8, step_seconds=0.3)
+        created_sockets.append(raw_sock)
+        deadline_sock = _DeadlineSocket(raw_sock, fake_monotonic() + timeout)
+        response = http.client.HTTPResponse(deadline_sock)
+        response.begin()
+        return response
+
+    generator = OpenAICompatibleGenerator(
+        api_key="sk-header-trickle-secret",
+        model="gpt-4o-mini",
+        timeout_seconds=1.0,
+        opener=opener,
+    )
+
+    with pytest.raises(GeneratorTimeoutError) as exc_info:
+        generator.generate("Python backend API troubleshooting", max_cards=2)
+    assert exc_info.value.status_code == 504
+    assert "1s" in str(exc_info.value)
+    assert len(created_sockets) == 1
+    sock = created_sockets[0]
+    assert sock.recv_calls == 4
+    assert sock.timeouts == pytest.approx([1.0, 0.7, 0.4, 0.1])
+
+    did = _create_deck(client)
+    now = 550.0
+    app.dependency_overrides[get_generator] = lambda: OpenAICompatibleGenerator(
+        api_key="sk-header-trickle-secret",
+        model="gpt-4o-mini",
+        timeout_seconds=1.0,
+        opener=opener,
+    )
+    res = client.post(
+        "/cards/generate",
+        json={"deck_id": did, "text": "Python backend API troubleshooting"},
+    )
+    assert res.status_code == 504
+    assert "sk-header-trickle-secret" not in res.text
+    assert client.get("/cards", params={"deck_id": did}).json() == []
+
+
+def test_buffered_body_trickle_within_single_read_enforces_deadline(client, monkeypatch):
+    now = 600.0
+
+    def fake_monotonic() -> float:
+        return now
+
+    monkeypatch.setattr("app.generator.time.monotonic", fake_monotonic)
+
+    class TrickleBodySocket:
+        def __init__(self, headers: bytes, body: bytes) -> None:
+            self._headers = headers
+            self._headers_sent = False
+            self._body = body
+            self._body_offset = 0
+            self.timeouts: list[float] = []
+            self.body_recv_calls = 0
+
+        def settimeout(self, value: float) -> None:
+            self.timeouts.append(value)
+
+        def recv_into(self, buffer, nbytes: int = 0) -> int:
+            nonlocal now
+            limit = nbytes if nbytes else len(buffer)
+            if not self._headers_sent:
+                size = min(limit, len(self._headers))
+                buffer[:size] = self._headers[:size]
+                self._headers = self._headers[size:]
+                if not self._headers:
+                    self._headers_sent = True
+                return size
+            self.body_recv_calls += 1
+            now += 0.35
+            size = min(64, limit, len(self._body) - self._body_offset)
+            if size <= 0:
+                return 0
+            buffer[:size] = self._body[self._body_offset : self._body_offset + size]
+            self._body_offset += size
+            return size
+
+        def makefile(self, mode: str = "rb", buffering: int | None = None):
+            import socket as _socket
+
+            return io.BufferedReader(_socket.SocketIO(self, "r"))
+
+        def _decref_socketios(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    body = b"{" + b" " * 16382 + b"}"
+    headers = f"HTTP/1.1 200 OK\r\nContent-Length: {len(body)}\r\n\r\n".encode()
+    created_sockets: list[TrickleBodySocket] = []
+
+    def opener(request, timeout):
+        raw_sock = TrickleBodySocket(headers, body)
+        created_sockets.append(raw_sock)
+        response = http.client.HTTPResponse(raw_sock)
+        response.begin()
+        return response
+
+    generator = OpenAICompatibleGenerator(
+        api_key="sk-body-trickle-secret",
+        model="gpt-4o-mini",
+        timeout_seconds=1.0,
+        opener=opener,
+    )
+
+    with pytest.raises(GeneratorTimeoutError) as exc_info:
+        generator.generate("Python backend API troubleshooting", max_cards=2)
+    assert exc_info.value.status_code == 504
+    assert "1s" in str(exc_info.value)
+    assert len(created_sockets) == 1
+    sock = created_sockets[0]
+    # BufferedReader.read(16384) loops internally over 64-byte recv_into calls;
+    # the deadline fires on the 3rd internal recv_into (0.35 * 3 = 1.05s > 1.0s).
+    assert sock.body_recv_calls == 3
+    assert sock.timeouts[-3:] == pytest.approx([1.0, 0.65, 0.3])
+
+    did = _create_deck(client)
+    now = 650.0
+    app.dependency_overrides[get_generator] = lambda: OpenAICompatibleGenerator(
+        api_key="sk-body-trickle-secret",
+        model="gpt-4o-mini",
+        timeout_seconds=1.0,
+        opener=opener,
+    )
+    res = client.post(
+        "/cards/generate",
+        json={"deck_id": did, "text": "Python backend API troubleshooting"},
+    )
+    assert res.status_code == 504
+    assert "sk-body-trickle-secret" not in res.text
+    assert client.get("/cards", params={"deck_id": did}).json() == []
+
+
+@pytest.mark.parametrize(
+    "raw_body",
+    [
+        b'{"big": ' + b"9" * 4500 + b"}",
+        _chat_completion_bytes('{"cards": [], "big": ' + "9" * 4500 + "}"),
+    ],
+)
+def test_oversized_integer_json_raises_upstream_502(client, raw_body):
+    assert len(raw_body) <= MAX_RESPONSE_BYTES
+    opener, _ = _make_opener(raw_body)
+    generator = OpenAICompatibleGenerator(
+        api_key="sk-bigint-secret",
+        model="gpt-4o-mini",
+        opener=opener,
+    )
+    with pytest.raises(GeneratorUpstreamError) as exc_info:
+        generator.generate("Python backend API troubleshooting", max_cards=2)
+    assert exc_info.value.status_code == 502
+
+    did = _create_deck(client)
+    opener_api, _ = _make_opener(raw_body)
+    app.dependency_overrides[get_generator] = lambda: OpenAICompatibleGenerator(
+        api_key="sk-bigint-secret",
+        model="gpt-4o-mini",
+        opener=opener_api,
+    )
+    res = client.post(
+        "/cards/generate",
+        json={"deck_id": did, "text": "Python backend API troubleshooting"},
+    )
+    assert res.status_code == 502
+    assert "sk-bigint-secret" not in res.text
     assert client.get("/cards", params={"deck_id": did}).json() == []

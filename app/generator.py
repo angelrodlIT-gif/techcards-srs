@@ -1,9 +1,11 @@
 """Card generator seam: offline deterministic mock and opt-in OpenAI-compatible adapter."""
 
 import http.client
+import io
 import json
 import math
 import re
+import socket
 import time
 import urllib.error
 import urllib.request
@@ -159,12 +161,188 @@ def _is_loopback_http_url(url: str) -> bool:
     )
 
 
-def _default_urlopen(request: urllib.request.Request, timeout: float):
-    handlers: list[urllib.request.BaseHandler] = [_NoRedirectHandler()]
+class _DeadlineSocket:
+    """Socket proxy that enforces an end-to-end monotonic deadline across every I/O call."""
+
+    def __init__(self, sock: Any, deadline: float) -> None:
+        self._sock = sock
+        self._deadline = deadline
+
+    def _remaining(self) -> float:
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("timed out")
+        settimeout = getattr(self._sock, "settimeout", None)
+        if callable(settimeout):
+            settimeout(remaining)
+        return remaining
+
+    def recv(self, bufsize: int, flags: int = 0) -> bytes:
+        self._remaining()
+        data = self._sock.recv(bufsize) if flags == 0 else self._sock.recv(bufsize, flags)
+        if time.monotonic() > self._deadline:
+            raise TimeoutError("timed out")
+        return data
+
+    def recv_into(self, buffer: Any, nbytes: int = 0, flags: int = 0) -> int:
+        self._remaining()
+        if flags:
+            count = self._sock.recv_into(buffer, nbytes, flags)
+        elif nbytes:
+            count = self._sock.recv_into(buffer, nbytes)
+        else:
+            count = self._sock.recv_into(buffer)
+        if time.monotonic() > self._deadline:
+            raise TimeoutError("timed out")
+        return count
+
+    def send(self, data: Any, flags: int = 0) -> int:
+        self._remaining()
+        sent = self._sock.send(data) if flags == 0 else self._sock.send(data, flags)
+        if time.monotonic() > self._deadline:
+            raise TimeoutError("timed out")
+        return sent
+
+    def sendall(self, data: Any, flags: int = 0) -> None:
+        self._remaining()
+        if flags == 0:
+            self._sock.sendall(data)
+        else:
+            self._sock.sendall(data, flags)
+        if time.monotonic() > self._deadline:
+            raise TimeoutError("timed out")
+
+    def makefile(
+        self,
+        mode: str = "r",
+        buffering: int | None = None,
+        *,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+    ) -> Any:
+        if not set(mode) <= {"r", "w", "b"}:
+            raise ValueError(f"invalid mode {mode!r} (only r, w, b allowed)")
+        writing = "w" in mode
+        reading = "r" in mode or not writing
+        binary = "b" in mode
+        rawmode = ("r" if reading else "") + ("w" if writing else "")
+        raw = socket.SocketIO(self, rawmode)
+        if hasattr(self._sock, "_io_refs"):
+            self._sock._io_refs += 1
+        if buffering is None:
+            buffering = -1
+        if buffering < 0:
+            buffering = io.DEFAULT_BUFFER_SIZE
+        if buffering == 0:
+            if not binary:
+                raise ValueError("unbuffered streams must be binary")
+            return raw
+        if reading and writing:
+            buffer: Any = io.BufferedRWPair(raw, raw, buffering)
+        elif reading:
+            buffer = io.BufferedReader(raw, buffering)
+        else:
+            buffer = io.BufferedWriter(raw, buffering)
+        if binary:
+            return buffer
+        text = io.TextIOWrapper(buffer, io.text_encoding(encoding), errors, newline)
+        text.mode = mode
+        return text
+
+    def _decref_socketios(self) -> None:
+        decref = getattr(self._sock, "_decref_socketios", None)
+        if callable(decref):
+            decref()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._sock, name)
+
+
+class _DeadlineHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, *args: Any, deadline: float, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._deadline = deadline
+
+    def connect(self) -> None:
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("timed out")
+        self.timeout = remaining
+        super().connect()
+        if time.monotonic() > self._deadline:
+            self.close()
+            raise TimeoutError("timed out")
+        self.sock = _DeadlineSocket(self.sock, self._deadline)
+
+
+class _DeadlineHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, *args: Any, deadline: float, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._deadline = deadline
+
+    def connect(self) -> None:
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("timed out")
+        self.timeout = remaining
+        super().connect()
+        if time.monotonic() > self._deadline:
+            self.close()
+            raise TimeoutError("timed out")
+        self.sock = _DeadlineSocket(self.sock, self._deadline)
+
+
+class _DeadlineHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, deadline: float) -> None:
+        super().__init__()
+        self._deadline = deadline
+
+    def http_open(self, req: urllib.request.Request) -> Any:
+        return self.do_open(_DeadlineHTTPConnection, req, deadline=self._deadline)
+
+
+class _DeadlineHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, deadline: float) -> None:
+        super().__init__()
+        self._deadline = deadline
+
+    def https_open(self, req: urllib.request.Request) -> Any:
+        return self.do_open(
+            _DeadlineHTTPSConnection,
+            req,
+            context=self._context,
+            deadline=self._deadline,
+        )
+
+
+def _default_urlopen(
+    request: urllib.request.Request,
+    timeout: float,
+    *,
+    deadline: float | None = None,
+) -> Any:
+    effective_deadline = deadline if deadline is not None else (time.monotonic() + timeout)
+    handlers: list[urllib.request.BaseHandler] = [
+        _DeadlineHTTPHandler(effective_deadline),
+        _DeadlineHTTPSHandler(effective_deadline),
+        _NoRedirectHandler(),
+    ]
     if _is_loopback_http_url(request.full_url):
         handlers.append(urllib.request.ProxyHandler({}))
     opener = urllib.request.build_opener(*handlers)
     return opener.open(request, timeout=timeout)
+
+
+def _ensure_response_deadline_socket(response: Any, deadline: float) -> None:
+    fp = getattr(response, "fp", None)
+    raw = getattr(fp, "raw", None)
+    sock = getattr(raw, "_sock", None)
+    if sock is not None and not isinstance(sock, _DeadlineSocket):
+        try:
+            raw._sock = _DeadlineSocket(sock, deadline)
+        except (AttributeError, TypeError):
+            pass
 
 
 def _set_response_socket_timeout(response: Any, timeout: float) -> None:
@@ -328,7 +506,13 @@ class OpenAICompatibleGenerator:
         raw_bytes = self._send(request)
         return self._parse_response(raw_bytes, max_cards)
 
+    def _open_request(self, request: urllib.request.Request, deadline: float) -> Any:
+        if self._opener is _default_urlopen:
+            return _default_urlopen(request, self.timeout_seconds, deadline=deadline)
+        return self._opener(request, self.timeout_seconds)
+
     def _read_response_with_deadline(self, response: Any, deadline: float) -> bytes:
+        _ensure_response_deadline_socket(response, deadline)
         chunks = bytearray()
         max_bytes = MAX_RESPONSE_BYTES + 1
         while len(chunks) < max_bytes:
@@ -356,7 +540,11 @@ class OpenAICompatibleGenerator:
     def _send(self, request: urllib.request.Request) -> bytes:
         deadline = time.monotonic() + self.timeout_seconds
         try:
-            with self._opener(request, self.timeout_seconds) as response:
+            with self._open_request(request, deadline) as response:
+                if time.monotonic() > deadline:
+                    raise GeneratorTimeoutError(
+                        f"AI generator provider timed out after {self.timeout_seconds:g}s."
+                    )
                 raw_bytes = self._read_response_with_deadline(response, deadline)
         except urllib.error.HTTPError as exc:
             code = exc.code
@@ -405,7 +593,7 @@ class OpenAICompatibleGenerator:
     def _parse_response(self, raw_bytes: bytes, max_cards: int) -> list[GeneratedCard]:
         try:
             envelope = json.loads(raw_bytes.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        except (ValueError, RecursionError) as exc:
             raise GeneratorUpstreamError(
                 "AI generator provider returned malformed JSON response."
             ) from exc
@@ -424,7 +612,7 @@ class OpenAICompatibleGenerator:
 
         try:
             structured = json.loads(content)
-        except (json.JSONDecodeError, RecursionError) as exc:
+        except (ValueError, RecursionError) as exc:
             raise GeneratorUpstreamError(
                 "AI generator provider content is not valid JSON."
             ) from exc
