@@ -168,6 +168,48 @@ Key generator behaviors (`app/generator.py` and `app/schemas.py`):
 - Pasted source `text` is not stored in the database, though matched terms appear
   in generated cards. You can also create single cards manually via `POST /cards`.
 
+#### Opt-in AI generator (`GENERATOR_PROVIDER=openai_compatible`)
+
+`GENERATOR_PROVIDER=mock` remains the default (strictly offline, deterministic,
+no API key). To opt in to an OpenAI-compatible chat completions endpoint, set
+the following environment variables (never hardcode secrets or commit `.env`):
+
+| Variable | Default | Rules / purpose |
+| --- | --- | --- |
+| `GENERATOR_PROVIDER` | `mock` | `mock` (offline) or `openai_compatible` (explicit opt-in; no silent fallback to `mock` on error) |
+| `GENERATOR_API_KEY` | unset | Required secret for `openai_compatible` (for keyless local servers, pass a placeholder such as `local-dev`) |
+| `GENERATOR_MODEL` | unset | Required model identifier (for example, `gpt-4o-mini`) |
+| `GENERATOR_BASE_URL` | `https://api.openai.com/v1` | Must use `https://`; `http://` is permitted only for `localhost` or `127.0.0.1`. Redirects are rejected. |
+| `GENERATOR_TIMEOUT_SECONDS` | `30` | Request timeout in seconds (`> 0` and `<= 120`) |
+| `GENERATOR_MAX_INPUT_CHARS` | `8000` | Max pasted `text` length (`10`–`20000`) enforced before any outbound call |
+
+Cost and privacy controls:
+
+- **No hidden uploads:** Pasted text leaves the machine only when
+  `GENERATOR_PROVIDER=openai_compatible` is explicitly set. Do not paste
+  credentials, private keys, or confidential employer/customer data when using a
+  remote provider.
+- **Bounded cost and output:** `GENERATOR_MAX_INPUT_CHARS`, `max_cards` (1–20),
+  `GENERATOR_TIMEOUT_SECONDS`, and a 1 MiB response cap bound outbound payload
+  size and duration. Nonexistent `deck_id` (`404`) and oversized input (`422`)
+  fail before any outbound request.
+- **Strict output validation:** Responses must contain structured JSON
+  `{"cards": [...]}` with 1–20 valid cards (`front` and `back` trimmed to
+  1–5,000 characters, `kind` in `vocabulary`, `interview_phrase`, or
+  `behavioral`, truncated to `max_cards`). No partial rows are persisted on error.
+
+Error semantics for `POST /cards/generate` (all return `{"detail": "..."}` and
+never echo `GENERATOR_API_KEY` or `Authorization` headers):
+
+- `422 Unprocessable Entity`: invalid request schema or `text` exceeding
+  `GENERATOR_MAX_INPUT_CHARS`.
+- `503 Service Unavailable`: missing or invalid provider configuration (such as
+  unset `GENERATOR_API_KEY` / `GENERATOR_MODEL`, disallowed `http://` remote
+  `GENERATOR_BASE_URL`, or unsupported `GENERATOR_PROVIDER`).
+- `504 Gateway Timeout`: upstream provider exceeded `GENERATOR_TIMEOUT_SECONDS`.
+- `502 Bad Gateway`: upstream HTTP error, network failure, disallowed redirect,
+  or malformed/empty/out-of-bounds structured output.
+
 ### 3. List cards due today (`GET /decks/{deck_id}/due`)
 
 ```console

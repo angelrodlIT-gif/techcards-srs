@@ -2,14 +2,15 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.db import get_db
-from app.generator import CardGenerator, get_generator
+from app.generator import CardGenerator, GeneratorError, GeneratorUpstreamError, get_generator
 from app.models import Card, Deck, ErrorLog, Review, Source
 from app.schemas import (
     CardInput,
@@ -57,6 +58,11 @@ app = FastAPI(title="TechCards SRS", version="0.1.0")
 DB = Annotated[Session, Depends(get_db)]
 Generator = Annotated[CardGenerator, Depends(get_generator)]
 Clock = Annotated[Callable[[], datetime], Depends(get_clock)]
+
+
+@app.exception_handler(GeneratorError)
+def handle_generator_error(_request: Request, exc: GeneratorError) -> JSONResponse:
+    return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
 
 
 def require(db: Session, model, identifier: int):
@@ -132,17 +138,22 @@ def due_cards(
 def generate_cards(payload: GenerateInput, db: DB, generator: Generator, clock: Clock):
     require(db, Deck, payload.deck_id)
     generated = generator.generate(payload.text, payload.max_cards)
+    if not generated:
+        raise GeneratorUpstreamError("Generator returned no cards.")
     today = normalize_utc(clock()).date()
     # Validate provider output before any rows are persisted.
-    cards = [
-        Card(
-            **CardInput(
-                deck_id=payload.deck_id, front=c.front, back=c.back, kind=c.kind
-            ).model_dump(),
-            due_date=today,
-        )
-        for c in generated[: payload.max_cards]
-    ]
+    try:
+        cards = [
+            Card(
+                **CardInput(
+                    deck_id=payload.deck_id, front=c.front, back=c.back, kind=c.kind
+                ).model_dump(),
+                due_date=today,
+            )
+            for c in generated[: payload.max_cards]
+        ]
+    except ValidationError as exc:
+        raise GeneratorUpstreamError("Generator returned invalid card output.") from exc
     db.add_all(cards)
     db.commit()
     for card in cards:
