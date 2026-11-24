@@ -4,6 +4,7 @@ import http.client
 import json
 import math
 import re
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
@@ -29,6 +30,7 @@ Transport = Callable[[urllib.request.Request, float], Any]
 
 MAX_GENERATED_CARDS = 20
 MAX_RESPONSE_BYTES = 1_048_576
+RESPONSE_READ_CHUNK_BYTES = 16_384
 LOOPBACK_HTTP_HOSTS = frozenset({"127.0.0.1", "localhost"})
 
 SYSTEM_PROMPT = (
@@ -108,7 +110,10 @@ def validate_generator_base_url(raw_url: str) -> str:
         raise GeneratorConfigError(
             "GENERATOR_BASE_URL must not contain whitespace or control characters."
         )
-    parsed = urlsplit(trimmed)
+    try:
+        parsed = urlsplit(trimmed)
+    except ValueError as exc:
+        raise GeneratorConfigError("GENERATOR_BASE_URL must be a valid URL.") from exc
     scheme = parsed.scheme.lower()
     if scheme not in ("https", "http") or not parsed.hostname:
         raise GeneratorConfigError("GENERATOR_BASE_URL must be an absolute https:// URL.")
@@ -142,9 +147,33 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
 
 
+def _is_loopback_http_url(url: str) -> bool:
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    return (
+        parsed.scheme.lower() == "http"
+        and parsed.hostname is not None
+        and parsed.hostname.lower() in LOOPBACK_HTTP_HOSTS
+    )
+
+
 def _default_urlopen(request: urllib.request.Request, timeout: float):
-    opener = urllib.request.build_opener(_NoRedirectHandler())
+    handlers: list[urllib.request.BaseHandler] = [_NoRedirectHandler()]
+    if _is_loopback_http_url(request.full_url):
+        handlers.append(urllib.request.ProxyHandler({}))
+    opener = urllib.request.build_opener(*handlers)
     return opener.open(request, timeout=timeout)
+
+
+def _set_response_socket_timeout(response: Any, timeout: float) -> None:
+    fp = getattr(response, "fp", None)
+    raw = getattr(fp, "raw", None)
+    sock = getattr(raw, "_sock", None)
+    settimeout = getattr(sock, "settimeout", None)
+    if callable(settimeout):
+        settimeout(timeout)
 
 
 GLOSSARY = {
@@ -299,10 +328,36 @@ class OpenAICompatibleGenerator:
         raw_bytes = self._send(request)
         return self._parse_response(raw_bytes, max_cards)
 
+    def _read_response_with_deadline(self, response: Any, deadline: float) -> bytes:
+        chunks = bytearray()
+        max_bytes = MAX_RESPONSE_BYTES + 1
+        while len(chunks) < max_bytes:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise GeneratorTimeoutError(
+                    f"AI generator provider timed out after {self.timeout_seconds:g}s."
+                )
+            _set_response_socket_timeout(response, remaining)
+            to_read = min(RESPONSE_READ_CHUNK_BYTES, max_bytes - len(chunks))
+            chunk = response.read(to_read)
+            if not isinstance(chunk, bytes | bytearray):
+                raise GeneratorUpstreamError(
+                    "AI generator provider returned an invalid response body."
+                )
+            if time.monotonic() > deadline:
+                raise GeneratorTimeoutError(
+                    f"AI generator provider timed out after {self.timeout_seconds:g}s."
+                )
+            if not chunk:
+                break
+            chunks.extend(chunk)
+        return bytes(chunks)
+
     def _send(self, request: urllib.request.Request) -> bytes:
+        deadline = time.monotonic() + self.timeout_seconds
         try:
             with self._opener(request, self.timeout_seconds) as response:
-                raw_bytes = response.read(MAX_RESPONSE_BYTES + 1)
+                raw_bytes = self._read_response_with_deadline(response, deadline)
         except urllib.error.HTTPError as exc:
             code = exc.code
             exc.close()
@@ -350,7 +405,7 @@ class OpenAICompatibleGenerator:
     def _parse_response(self, raw_bytes: bytes, max_cards: int) -> list[GeneratedCard]:
         try:
             envelope = json.loads(raw_bytes.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
             raise GeneratorUpstreamError(
                 "AI generator provider returned malformed JSON response."
             ) from exc
@@ -369,7 +424,7 @@ class OpenAICompatibleGenerator:
 
         try:
             structured = json.loads(content)
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, RecursionError) as exc:
             raise GeneratorUpstreamError(
                 "AI generator provider content is not valid JSON."
             ) from exc

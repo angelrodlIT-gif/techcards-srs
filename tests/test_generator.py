@@ -17,6 +17,7 @@ from app.generator import (
     GeneratorUpstreamError,
     MockGenerator,
     OpenAICompatibleGenerator,
+    _default_urlopen,
     _NoRedirectHandler,
     get_generator,
     validate_generator_base_url,
@@ -209,6 +210,8 @@ def test_validate_generator_base_url_allows_https_and_loopback_http(raw_url, exp
         "https://api.openai.com:99999/v1",
         "https://api.openai.com:0/v1",
         "https://api.openai.com/v1\nX-Injected: 1",
+        "https://[invalid/v1",
+        "http://[::1/v1",
     ],
 )
 def test_validate_generator_base_url_rejects_unsafe_urls(bad_url):
@@ -669,4 +672,180 @@ def test_api_generate_errors_return_clean_json_and_persist_no_rows(client, monke
     )
 
     # Confirm zero cards were persisted across every failed call.
+    assert client.get("/cards", params={"deck_id": did}).json() == []
+
+
+@pytest.mark.parametrize(
+    ("url", "expect_proxy_disabled"),
+    [
+        ("http://127.0.0.1:11434/v1/chat/completions", True),
+        ("http://localhost:8080/v1/chat/completions", True),
+        ("http://LOCALHOST:8080/v1/chat/completions", True),
+        ("https://api.openai.com/v1/chat/completions", False),
+    ],
+)
+def test_default_urlopen_disables_proxies_for_loopback_http(
+    monkeypatch, url, expect_proxy_disabled
+):
+    monkeypatch.setenv("http_proxy", "http://proxy.example:3128")
+    monkeypatch.delenv("no_proxy", raising=False)
+    captured_handlers: list[tuple[object, ...]] = []
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            return io.BytesIO(b"{}")
+
+    def fake_build_opener(*handlers):
+        captured_handlers.append(handlers)
+        return FakeOpener()
+
+    monkeypatch.setattr(urllib.request, "build_opener", fake_build_opener)
+
+    req = urllib.request.Request(url, data=b"{}", method="POST")
+    with _default_urlopen(req, timeout=5.0) as response:
+        assert response.read() == b"{}"
+
+    assert len(captured_handlers) == 1
+    handlers = captured_handlers[0]
+    assert any(isinstance(handler, _NoRedirectHandler) for handler in handlers)
+    proxy_handlers = [h for h in handlers if isinstance(h, urllib.request.ProxyHandler)]
+    if expect_proxy_disabled:
+        assert len(proxy_handlers) == 1
+        assert proxy_handlers[0].proxies == {}
+    else:
+        assert proxy_handlers == []
+
+
+def test_chunked_read_enforces_end_to_end_deadline(client, monkeypatch):
+    now = 100.0
+    socket_timeouts: list[float] = []
+
+    def fake_monotonic() -> float:
+        return now
+
+    monkeypatch.setattr("app.generator.time.monotonic", fake_monotonic)
+
+    class FakeSocket:
+        def settimeout(self, value: float) -> None:
+            socket_timeouts.append(value)
+
+    class FakeRaw:
+        _sock = FakeSocket()
+
+    class FakeFP:
+        raw = FakeRaw()
+
+    class TrickleResponse:
+        fp = FakeFP()
+
+        def __init__(self) -> None:
+            self._chunks = [b'{"choices":', b' [{"message":', b' {"content": "{}"}}]}']
+            self._index = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, size: int = -1) -> bytes:
+            nonlocal now
+            now += 0.4
+            if self._index >= len(self._chunks):
+                return b""
+            chunk = self._chunks[self._index]
+            self._index += 1
+            return chunk
+
+    def opener(request, timeout):
+        return TrickleResponse()
+
+    generator = OpenAICompatibleGenerator(
+        api_key="sk-trickle-secret",
+        model="gpt-4o-mini",
+        timeout_seconds=1.0,
+        opener=opener,
+    )
+
+    with pytest.raises(GeneratorTimeoutError) as exc_info:
+        generator.generate("Python backend API troubleshooting", max_cards=2)
+    assert exc_info.value.status_code == 504
+    assert "1s" in str(exc_info.value)
+    assert len(socket_timeouts) == 3
+    assert socket_timeouts[0] == pytest.approx(1.0)
+    assert socket_timeouts[1] == pytest.approx(0.6)
+    assert socket_timeouts[2] == pytest.approx(0.2)
+
+    # Also verify HTTP 504 through the API endpoint with zero persisted rows.
+    did = _create_deck(client)
+    now = 200.0
+    app.dependency_overrides[get_generator] = lambda: OpenAICompatibleGenerator(
+        api_key="sk-trickle-secret",
+        model="gpt-4o-mini",
+        timeout_seconds=1.0,
+        opener=opener,
+    )
+    res = client.post(
+        "/cards/generate",
+        json={"deck_id": did, "text": "Python backend API troubleshooting"},
+    )
+    assert res.status_code == 504
+    assert "sk-trickle-secret" not in res.text
+    assert client.get("/cards", params={"deck_id": did}).json() == []
+
+
+def test_api_generate_malformed_bracketed_base_url_returns_503(client, monkeypatch):
+    did = _create_deck(client)
+    secret = "sk-bracket-url-secret"
+    _clear_generator_env(monkeypatch)
+    monkeypatch.setenv("GENERATOR_PROVIDER", "openai_compatible")
+    monkeypatch.setenv("GENERATOR_API_KEY", secret)
+    monkeypatch.setenv("GENERATOR_MODEL", "gpt-4o-mini")
+    monkeypatch.setenv("GENERATOR_BASE_URL", "https://[invalid/v1")
+    get_settings.cache_clear()
+    try:
+        res = client.post(
+            "/cards/generate",
+            json={"deck_id": did, "text": "AWS Python troubleshooting role"},
+        )
+        assert res.status_code == 503
+        assert "GENERATOR_BASE_URL" in res.json()["detail"]
+        assert secret not in res.text
+        assert client.get("/cards", params={"deck_id": did}).json() == []
+    finally:
+        _clear_generator_env(monkeypatch)
+
+
+@pytest.mark.parametrize(
+    "raw_body",
+    [
+        b"[" * 5000 + b"]" * 5000,
+        _chat_completion_bytes("[" * 5000 + "]" * 5000),
+    ],
+)
+def test_deeply_nested_json_raises_upstream_502(client, raw_body):
+    assert len(raw_body) <= MAX_RESPONSE_BYTES
+    opener, _ = _make_opener(raw_body)
+    generator = OpenAICompatibleGenerator(
+        api_key="sk-recursion-secret",
+        model="gpt-4o-mini",
+        opener=opener,
+    )
+    with pytest.raises(GeneratorUpstreamError) as exc_info:
+        generator.generate("Python backend API troubleshooting", max_cards=2)
+    assert exc_info.value.status_code == 502
+
+    did = _create_deck(client)
+    opener_api, _ = _make_opener(raw_body)
+    app.dependency_overrides[get_generator] = lambda: OpenAICompatibleGenerator(
+        api_key="sk-recursion-secret",
+        model="gpt-4o-mini",
+        opener=opener_api,
+    )
+    res = client.post(
+        "/cards/generate",
+        json={"deck_id": did, "text": "Python backend API troubleshooting"},
+    )
+    assert res.status_code == 502
+    assert "sk-recursion-secret" not in res.text
     assert client.get("/cards", params={"deck_id": did}).json() == []
