@@ -40,6 +40,8 @@ MAX_ACCEPTED_ANSWER_CHARS = 5000
 CLOZE_BLANK_RE = re.compile(r"_{4,}")
 Kind = Literal["vocabulary", "interview_phrase", "behavioral", "sentence", "cloze", "es_en"]
 SourceStatus = Literal["draft", "approved", "discarded"]
+ErrorStatus = SourceStatus
+TemplateCategory = Literal["star", "networking"]
 
 
 def normalize_source_url(raw: str) -> tuple[str, str]:
@@ -87,11 +89,7 @@ class DeckOut(DeckInput):
     id: int
 
 
-class CardPayloadBase(BaseModel):
-    deck_id: int = Field(gt=0)
-    front: Text
-    back: Text
-    kind: Kind = "vocabulary"
+class CardExtrasMixin(BaseModel):
     accepted_answers: list[str] = Field(default_factory=list, max_length=MAX_ACCEPTED_ANSWERS)
     explanation: Explanation | None = None
 
@@ -120,6 +118,13 @@ class CardPayloadBase(BaseModel):
         if isinstance(value, str):
             return value.strip() or None
         return value
+
+
+class CardPayloadBase(CardExtrasMixin):
+    deck_id: int = Field(gt=0)
+    front: Text
+    back: Text
+    kind: Kind = "vocabulary"
 
     @model_validator(mode="after")
     def validate_cloze_front(self) -> Self:
@@ -150,6 +155,7 @@ class CardOut(BaseModel):
     accepted_answers: list[str] = Field(default_factory=list)
     explanation: str | None = None
     id: int
+    error_id: int | None = None
     repetitions: int
     interval_days: int
     ease_factor: float
@@ -228,4 +234,77 @@ class SourceApproveInput(CardPayloadBase):
 
 class SourceApproveOut(BaseModel):
     source: SourceOut
+    card: CardOut
+
+
+class StudyCardPrompt(BaseModel):
+    card_id: int
+    deck_id: int
+    front: str
+    kind: Kind
+    source_label: str | None = None
+    due_date: date
+    repetitions: int
+    interval_days: int
+    ease_factor: float
+
+
+class StudyCardReveal(BaseModel):
+    card_id: int
+    deck_id: int
+    back: str
+    accepted_answers: list[str] = Field(default_factory=list)
+    explanation: str | None = None
+
+    @field_validator("accepted_answers", mode="before")
+    @classmethod
+    def default_null_accepted_answers(cls, value: object) -> object:
+        return [] if value is None else value
+
+
+class StudyGradeInput(BaseModel):
+    quality: int = Field(strict=True, ge=0, le=5)
+
+
+class StudyTemplateOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    category: TemplateCategory
+    title: str
+    kind: Kind
+    front: str
+    back: str
+    follow_up_questions: list[str]
+    explanation: str | None = None
+
+
+class TemplateCardInput(BaseModel):
+    deck_id: int = Field(gt=0)
+
+
+class ErrorLogInput(BaseModel):
+    attempted: Text
+    corrected: Text
+    rationale: Text
+
+
+class ErrorLogOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    attempted: str
+    corrected: str
+    rationale: str
+    status: ErrorStatus
+    card_id: int | None = None
+
+
+class ErrorApproveInput(CardExtrasMixin):
+    deck_id: int = Field(gt=0)
+    front: Text | None = None
+    back: Text | None = None
+    kind: Kind = "interview_phrase"
+
+
+class ErrorApproveOut(BaseModel):
+    error: ErrorLogOut
     card: CardOut

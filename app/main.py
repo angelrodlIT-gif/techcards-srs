@@ -5,16 +5,22 @@ from typing import Annotated
 from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.db import get_db
 from app.generator import CardGenerator, get_generator
-from app.models import Card, Deck, Review, Source
+from app.models import Card, Deck, ErrorLog, Review, Source
 from app.schemas import (
+    CLOZE_BLANK_RE,
     CardInput,
     CardOut,
     DeckInput,
     DeckOut,
+    ErrorApproveInput,
+    ErrorApproveOut,
+    ErrorLogInput,
+    ErrorLogOut,
+    ErrorStatus,
     GenerateInput,
     ReviewInput,
     ReviewOut,
@@ -23,8 +29,14 @@ from app.schemas import (
     SourceInput,
     SourceOut,
     SourceStatus,
+    StudyCardPrompt,
+    StudyCardReveal,
+    StudyGradeInput,
+    StudyTemplateOut,
+    TemplateCardInput,
 )
 from app.sm2 import Schedule, schedule_review
+from app.templates import STUDY_TEMPLATES, TEMPLATES_BY_ID
 
 
 def utc_now() -> datetime:
@@ -107,6 +119,7 @@ def due_cards(
     today = normalize_utc(clock()).date()
     return db.scalars(
         select(Card)
+        .options(selectinload(Card.error_log))
         .where(Card.deck_id == deck_id, Card.due_date <= today)
         .order_by(Card.due_date, Card.id)
         .offset(offset)
@@ -151,7 +164,7 @@ def list_cards(
     offset: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=100),
 ):
-    query = select(Card).order_by(Card.id)
+    query = select(Card).options(selectinload(Card.error_log)).order_by(Card.id)
     if deck_id is not None:
         require(db, Deck, deck_id)
         query = query.where(Card.deck_id == deck_id)
@@ -179,17 +192,18 @@ def delete_card(card_id: int, db: DB):
     return Response(status_code=204)
 
 
-@app.post("/reviews", response_model=ReviewOut, status_code=201)
-def create_review(payload: ReviewInput, db: DB, clock: Clock):
+def record_review(
+    db: Session, card_id: int, quality: int, clock: Callable[[], datetime]
+) -> ReviewOut:
     # PostgreSQL serializes reviews for the same card; SQLite is for sequential unit tests.
     try:
-        card = db.scalar(select(Card).where(Card.id == payload.card_id).with_for_update())
+        card = db.scalar(select(Card).where(Card.id == card_id).with_for_update())
         if card is None:
             raise HTTPException(404, "Card not found")
         now = normalize_utc(clock())
         result = schedule_review(
             Schedule(card.repetitions, card.interval_days, card.ease_factor),
-            payload.quality,
+            quality,
             now.date(),
         )
         card.repetitions = result.schedule.repetitions
@@ -198,7 +212,7 @@ def create_review(payload: ReviewInput, db: DB, clock: Clock):
         card.due_date = result.due_date
         review = Review(
             card_id=card.id,
-            quality=payload.quality,
+            quality=quality,
             reviewed_at=now,
             interval_days=card.interval_days,
             ease_factor=card.ease_factor,
@@ -213,6 +227,91 @@ def create_review(payload: ReviewInput, db: DB, clock: Clock):
         db.rollback()
         raise
     return review_out
+
+
+@app.post("/reviews", response_model=ReviewOut, status_code=201)
+def create_review(payload: ReviewInput, db: DB, clock: Clock):
+    return record_review(db, payload.card_id, payload.quality, clock)
+
+
+@app.get(
+    "/study/next",
+    response_model=StudyCardPrompt,
+    responses={204: {"description": "No card due today"}},
+)
+def study_next(db: DB, clock: Clock, deck_id: int = Query(gt=0)):
+    require(db, Deck, deck_id)
+    today = normalize_utc(clock()).date()
+    card = db.scalar(
+        select(Card)
+        .where(Card.deck_id == deck_id, Card.due_date <= today)
+        .order_by(Card.due_date, Card.id)
+        .limit(1)
+    )
+    if card is None:
+        return Response(status_code=204)
+    return StudyCardPrompt(
+        card_id=card.id,
+        deck_id=card.deck_id,
+        front=card.front,
+        kind=card.kind,
+        source_label=card.source_label,
+        due_date=card.due_date,
+        repetitions=card.repetitions,
+        interval_days=card.interval_days,
+        ease_factor=card.ease_factor,
+    )
+
+
+@app.post("/study/{card_id}/reveal", response_model=StudyCardReveal)
+def study_reveal(card_id: int, db: DB):
+    card = require(db, Card, card_id)
+    return StudyCardReveal(
+        card_id=card.id,
+        deck_id=card.deck_id,
+        back=card.back,
+        accepted_answers=card.accepted_answers,
+        explanation=card.explanation,
+    )
+
+
+@app.post("/study/{card_id}/grade", response_model=ReviewOut, status_code=201)
+def study_grade(card_id: int, payload: StudyGradeInput, db: DB, clock: Clock):
+    return record_review(db, card_id, payload.quality, clock)
+
+
+def require_template(template_id: str):
+    template = TEMPLATES_BY_ID.get(template_id)
+    if template is None:
+        raise HTTPException(404, "Template not found")
+    return template
+
+
+@app.get("/templates", response_model=list[StudyTemplateOut])
+def list_templates():
+    return STUDY_TEMPLATES
+
+
+@app.get("/templates/{template_id}", response_model=StudyTemplateOut)
+def get_template(template_id: str):
+    return require_template(template_id)
+
+
+@app.post("/templates/{template_id}/cards", response_model=CardOut, status_code=201)
+def create_card_from_template(template_id: str, payload: TemplateCardInput, db: DB, clock: Clock):
+    template = require_template(template_id)
+    require(db, Deck, payload.deck_id)
+    today = normalize_utc(clock()).date()
+    card = Card(
+        deck_id=payload.deck_id,
+        front=template.front,
+        back=template.back,
+        kind=template.kind,
+        source_label=f"template:{template.id}",
+        explanation=template.explanation,
+        due_date=today,
+    )
+    return save(db, card)
 
 
 def ensure_unique_source_url(
@@ -238,13 +337,17 @@ def save_source(db: Session, source: Source) -> Source:
         raise
 
 
+def lock_draft(db: Session, model, identifier: int, action: str, label: str):
+    row = db.scalar(select(model).where(model.id == identifier).with_for_update())
+    if row is None:
+        raise HTTPException(404, f"{model.__name__} not found")
+    if row.status != "draft":
+        raise HTTPException(409, f"Cannot {action} {label} in '{row.status}' status")
+    return row
+
+
 def lock_draft_source(db: Session, source_id: int, action: str) -> Source:
-    source = db.scalar(select(Source).where(Source.id == source_id).with_for_update())
-    if source is None:
-        raise HTTPException(404, "Source not found")
-    if source.status != "draft":
-        raise HTTPException(409, f"Cannot {action} source in '{source.status}' status")
-    return source
+    return lock_draft(db, Source, source_id, action, "source")
 
 
 @app.post("/sources", response_model=SourceOut, status_code=201)
@@ -334,6 +437,98 @@ def approve_source(source_id: int, payload: SourceApproveInput, db: DB, clock: C
         db.flush()
         result = SourceApproveOut(
             source=SourceOut.model_validate(source),
+            card=CardOut.model_validate(card),
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return result
+
+
+@app.post("/errors", response_model=ErrorLogOut, status_code=201)
+def create_error(payload: ErrorLogInput, db: DB):
+    return save(db, ErrorLog(**payload.model_dump(), status="draft"))
+
+
+@app.get("/errors", response_model=list[ErrorLogOut])
+def list_errors(
+    db: DB,
+    status: ErrorStatus | None = None,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=100),
+):
+    query = select(ErrorLog).order_by(ErrorLog.id)
+    if status is not None:
+        query = query.where(ErrorLog.status == status)
+    return db.scalars(query.offset(offset).limit(limit)).all()
+
+
+@app.get("/errors/{error_id}", response_model=ErrorLogOut)
+def get_error(error_id: int, db: DB):
+    return require(db, ErrorLog, error_id)
+
+
+@app.put("/errors/{error_id}", response_model=ErrorLogOut)
+def update_error(error_id: int, payload: ErrorLogInput, db: DB):
+    try:
+        err = lock_draft(db, ErrorLog, error_id, "edit", "error")
+        err.attempted = payload.attempted
+        err.corrected = payload.corrected
+        err.rationale = payload.rationale
+        return save(db, err)
+    except Exception:
+        db.rollback()
+        raise
+
+
+@app.delete("/errors/{error_id}", status_code=204)
+def delete_error(error_id: int, db: DB):
+    db.delete(require(db, ErrorLog, error_id))
+    db.commit()
+    return Response(status_code=204)
+
+
+@app.post("/errors/{error_id}/discard", response_model=ErrorLogOut)
+def discard_error(error_id: int, db: DB):
+    try:
+        err = lock_draft(db, ErrorLog, error_id, "discard", "error")
+        err.status = "discarded"
+        return save(db, err)
+    except Exception:
+        db.rollback()
+        raise
+
+
+@app.post("/errors/{error_id}/approve", response_model=ErrorApproveOut, status_code=201)
+def approve_error(error_id: int, payload: ErrorApproveInput, db: DB, clock: Clock):
+    try:
+        err = lock_draft(db, ErrorLog, error_id, "approve", "error")
+        require(db, Deck, payload.deck_id)
+        front = payload.front if payload.front is not None else f"Correct: {err.attempted}"
+        back = payload.back if payload.back is not None else err.corrected
+        explanation = (
+            payload.explanation if "explanation" in payload.model_fields_set else err.rationale
+        )
+        if payload.kind == "cloze" and CLOZE_BLANK_RE.findall(front) != ["____"]:
+            raise HTTPException(422, "cloze card front must contain exactly one '____' blank")
+        today = normalize_utc(clock()).date()
+        card = Card(
+            deck_id=payload.deck_id,
+            front=front,
+            back=back,
+            kind=payload.kind,
+            source_label=f"error:{err.id}",
+            accepted_answers=payload.accepted_answers,
+            explanation=explanation,
+            due_date=today,
+        )
+        err.status = "approved"
+        err.card = card
+        db.add(card)
+        db.flush()
+        result = ErrorApproveOut(
+            error=ErrorLogOut.model_validate(err),
             card=CardOut.model_validate(card),
         )
         db.commit()
