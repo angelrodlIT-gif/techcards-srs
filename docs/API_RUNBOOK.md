@@ -167,6 +167,13 @@ Key generator behaviors (`app/generator.py` and `app/schemas.py`):
   returns only the `interview_phrase` prompt).
 - Pasted source `text` is not stored in the database, though matched terms appear
   in generated cards. You can also create single cards manually via `POST /cards`.
+- **Evaluate before adding to review:** To inspect editable drafts and
+  categorical quality/grounding checks without writing to `cards`, call
+  `POST /cards/generate/preview` (`200 OK`, zero rows persisted), edit the draft
+  fields as needed, then submit one reviewed draft plus `source_text` to
+  `POST /cards/generate/approve` (`201 Created` when supported; `422` with
+  rejection reasons and zero rows saved when unsupported). See
+  [Generated card evaluation](CARD_EVALUATION.md).
 
 ### 3. List cards due today (`GET /decks/{deck_id}/due`)
 
@@ -351,3 +358,7 @@ accounts, no authorization checks, no rate limiting, and no TLS**:
 - **Manual source-to-card curation:** See [Source curation](SOURCES.md) for
   `/sources` draft/edit/approve/discard workflows, URL normalization and `409`
   duplicate handling, privacy warnings, and non-cascading source deletion.
+- **Generated card evaluation:** See
+  [Generated card evaluation](CARD_EVALUATION.md) for
+  `POST /cards/generate/preview`, `POST /cards/generate/approve`, the four
+  categorical checks, reviewed fixtures, and offline limitations.

@@ -9,6 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.db import get_db
+from app.evaluation import evaluate_generated_card
 from app.generator import CardGenerator, get_generator
 from app.models import Card, Deck, ErrorLog, Review, Source
 from app.schemas import (
@@ -21,7 +22,11 @@ from app.schemas import (
     ErrorLogInput,
     ErrorLogOut,
     ErrorStatus,
+    GeneratedCardApproveInput,
+    GeneratedCardApproveOut,
+    GeneratedCardDraftOut,
     GenerateInput,
+    GeneratePreviewInput,
     ReviewInput,
     ReviewOut,
     SourceApproveInput,
@@ -127,7 +132,50 @@ def due_cards(
     ).all()
 
 
-# Register this static path before /cards/{card_id}.
+# Register these static paths before /cards/{card_id}.
+@app.post("/cards/generate/preview", response_model=list[GeneratedCardDraftOut])
+def preview_generated_cards(payload: GeneratePreviewInput, db: DB, generator: Generator):
+    require(db, Deck, payload.deck_id)
+    generated = generator.generate(payload.text, payload.max_cards)[: payload.max_cards]
+    drafts: list[GeneratedCardDraftOut] = []
+    for c in generated:
+        front, back = c.front.strip(), c.back.strip()
+        drafts.append(
+            GeneratedCardDraftOut(
+                deck_id=payload.deck_id,
+                front=front,
+                back=back,
+                kind=c.kind,
+                source_label=payload.source_label,
+                evaluation=evaluate_generated_card(
+                    front=front,
+                    back=back,
+                    kind=c.kind,
+                    source_text=payload.text,
+                ),
+            )
+        )
+    return drafts
+
+
+@app.post("/cards/generate/approve", response_model=GeneratedCardApproveOut, status_code=201)
+def approve_generated_card(payload: GeneratedCardApproveInput, db: DB, clock: Clock):
+    require(db, Deck, payload.deck_id)
+    evaluation = evaluate_generated_card(
+        front=payload.front,
+        back=payload.back,
+        kind=payload.kind,
+        source_text=payload.source_text,
+        accepted_answers=payload.accepted_answers,
+        explanation=payload.explanation,
+    )
+    if not evaluation.ready_for_review:
+        raise HTTPException(422, "; ".join(evaluation.rejection_reasons))
+    today = normalize_utc(clock()).date()
+    card = save(db, Card(**payload.model_dump(exclude={"source_text"}), due_date=today))
+    return GeneratedCardApproveOut(card=CardOut.model_validate(card), evaluation=evaluation)
+
+
 @app.post("/cards/generate", response_model=list[CardOut], status_code=201)
 def generate_cards(payload: GenerateInput, db: DB, generator: Generator, clock: Clock):
     require(db, Deck, payload.deck_id)
