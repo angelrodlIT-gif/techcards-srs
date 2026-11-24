@@ -325,6 +325,8 @@ def approve_source(source_id: int, payload: SourceApproveInput, db: DB, clock: C
             back=payload.back,
             kind=payload.kind,
             source_label=source.label,
+            accepted_answers=payload.accepted_answers,
+            explanation=payload.explanation,
             due_date=today,
         )
         source.status = "approved"

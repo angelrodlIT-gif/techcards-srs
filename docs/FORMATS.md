@@ -1,0 +1,37 @@
+# Card Practice Formats
+
+Cards support six `kind` values across `POST /cards`, `PUT /cards/{id}`, and
+`POST /sources/{id}/approve` (default remains `vocabulary`):
+
+- Existing kinds: `vocabulary`, `interview_phrase`, `behavioral`.
+- `sentence`: contextual sentence mining (`front` is the sentence/prompt; `back`
+  is the target word, phrase, or meaning).
+- `cloze`: unambiguous cloze (`front` must contain **exactly one** `____`
+  four-underscore blank; `0` blanks, `2+` blanks, or runs of 5+ underscores
+  return `422`; `back` is the primary completion).
+- `es_en`: ES→EN production (`front` is the Spanish prompt; `back` is the
+  primary English production).
+
+## Alternatives and explanations
+
+Both optional fields work on every card `kind`:
+
+- `accepted_answers`: list of valid alternative answers/translations (default
+  `[]`, max 20 items, each 1–5,000 chars after trimming, blanks dropped, NUL
+  bytes rejected with `422`). Uniqueness is exact and case-sensitive (no
+  case-folding, no auto-merge on `PUT`). `back` is the primary answer and does
+  not need to be duplicated.
+- `explanation`: optional answer note (trimmed; blank/whitespace normalizes to
+  `null`; max 5,000 chars; NUL bytes rejected with `422`).
+
+## Boundaries and migration safety
+
+- **No auto-grading:** `POST /reviews` stays integer `quality` (`0`–`5`) with
+  identical SM-2 scheduling across all kinds. `accepted_answers` and
+  `explanation` are stored for learner self-review, not scored by the API.
+- **Generator unchanged:** `POST /cards/generate` (`MockGenerator`) continues to
+  emit only `vocabulary`, `interview_phrase`, and `behavioral`.
+- **Safe migration (`0004`):** adds nullable `accepted_answers` (JSON) and
+  `explanation` (Text) to `cards` without rewriting existing rows or schedules.
+  Pre-migration rows with SQL `NULL` serialize as `accepted_answers: []` and
+  `explanation: null`. `PUT /cards/{id}` preserves scheduling fields.
