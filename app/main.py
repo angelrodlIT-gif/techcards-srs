@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Response
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
@@ -11,7 +12,6 @@ from app.db import get_db
 from app.generator import CardGenerator, get_generator
 from app.models import Card, Deck, ErrorLog, Review, Source
 from app.schemas import (
-    CLOZE_BLANK_RE,
     CardInput,
     CardOut,
     DeckInput,
@@ -510,19 +510,20 @@ def approve_error(error_id: int, payload: ErrorApproveInput, db: DB, clock: Cloc
         explanation = (
             payload.explanation if "explanation" in payload.model_fields_set else err.rationale
         )
-        if payload.kind == "cloze" and CLOZE_BLANK_RE.findall(front) != ["____"]:
-            raise HTTPException(422, "cloze card front must contain exactly one '____' blank")
+        try:
+            card_input = CardInput(
+                deck_id=payload.deck_id,
+                front=front,
+                back=back,
+                kind=payload.kind,
+                source_label=f"error:{err.id}",
+                accepted_answers=payload.accepted_answers,
+                explanation=explanation,
+            )
+        except ValidationError as exc:
+            raise HTTPException(422, "; ".join(e["msg"] for e in exc.errors())) from exc
         today = normalize_utc(clock()).date()
-        card = Card(
-            deck_id=payload.deck_id,
-            front=front,
-            back=back,
-            kind=payload.kind,
-            source_label=f"error:{err.id}",
-            accepted_answers=payload.accepted_answers,
-            explanation=explanation,
-            due_date=today,
-        )
+        card = Card(**card_input.model_dump(), due_date=today)
         err.status = "approved"
         err.card = card
         db.add(card)

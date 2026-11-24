@@ -288,6 +288,53 @@ def test_errors_crud_lifecycle_validation_and_links(client, set_clock):
     assert client.get(f"/errors/{e4['id']}").json()["card_id"] is None
 
 
+def test_error_approve_derived_front_length_boundaries(client):
+    did = create_deck(client, name="Boundary Deck")
+
+    # 4,992-char and 5,000-char attempted -> derived "Correct: ..." exceeds 5,000 chars -> 422.
+    for length in (4992, 5000):
+        err = client.post(
+            "/errors",
+            json={"attempted": "a" * length, "corrected": "Fixed", "rationale": "Why"},
+        ).json()
+        assert client.post(f"/errors/{err['id']}/approve", json={"deck_id": did}).status_code == 422
+        assert client.get(f"/errors/{err['id']}").json()["status"] == "draft"
+    assert client.get("/cards").json() == []
+
+    # Valid short override on a 5,000-char error still succeeds and remains PUT-editable.
+    overridden = client.post(
+        f"/errors/{err['id']}/approve",
+        json={"deck_id": did, "front": "Short override prompt"},
+    )
+    assert overridden.status_code == 201
+    c_ov = overridden.json()["card"]
+    assert c_ov["front"] == "Short override prompt" and c_ov["error_id"] == err["id"]
+    assert (
+        client.put(
+            f"/cards/{c_ov['id']}",
+            json={"deck_id": did, "front": c_ov["front"], "back": "Updated back"},
+        ).status_code
+        == 200
+    )
+
+    # 4,991-char attempted -> derived front is exactly 5,000 chars -> 201 and PUT-editable.
+    fit_err = client.post(
+        "/errors",
+        json={"attempted": "b" * 4991, "corrected": "Fixed", "rationale": "Why"},
+    ).json()
+    fitted = client.post(f"/errors/{fit_err['id']}/approve", json={"deck_id": did})
+    assert fitted.status_code == 201
+    c_fit = fitted.json()["card"]
+    assert len(c_fit["front"]) == 5000 and c_fit["error_id"] == fit_err["id"]
+    assert (
+        client.put(
+            f"/cards/{c_fit['id']}",
+            json={"deck_id": did, "front": c_fit["front"], "back": "Unrelated edit"},
+        ).status_code
+        == 200
+    )
+
+
 def test_error_logs_migration_round_trip(tmp_path, monkeypatch):
     repo_root = Path(__file__).resolve().parents[1]
     db_url = f"sqlite:///{tmp_path / 'errors_migration.db'}"
