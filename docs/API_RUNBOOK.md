@@ -351,3 +351,7 @@ accounts, no authorization checks, no rate limiting, and no TLS**:
 - **Manual source-to-card curation:** See [Source curation](SOURCES.md) for
   `/sources` draft/edit/approve/discard workflows, URL normalization and `409`
   duplicate handling, privacy warnings, and non-cascading source deletion.
+- **Recall-safe study loop, templates, error log, and local study page (`/ui`):**
+  See [Study loop, templates, and error log](STUDY_LOOP.md) (including
+  `http://127.0.0.1:8000/ui` and `POST /errors/{id}/approve` `422` length-override
+  handling).

@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TechCards SRS — Local Study</title>
+  <style>
+    :root { color-scheme: light dark; font-family: system-ui, -apple-system, sans-serif; line-height: 1.5; }
+    body { max-width: 48rem; margin: 1.5rem auto; padding: 0 1rem 3rem; }
+    header { display: flex; justify-content: space-between; align-items: baseline; border-bottom: 1px solid #8884; padding-bottom: 0.5rem; }
+    h1, h2 { margin: 0; font-size: 1.05rem; }
+    h1 { font-size: 1.35rem; }
+    section, details { margin-top: 1.1rem; padding: 0.9rem; border: 1px solid #8884; border-radius: 6px; }
+    summary { cursor: pointer; font-weight: 600; }
+    .row { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-top: 0.5rem; }
+    .field { display: flex; flex-direction: column; gap: 0.25rem; margin-top: 0.5rem; }
+    input, select, textarea, button { font: inherit; padding: 0.35rem 0.6rem; border-radius: 4px; border: 1px solid #8886; }
+    textarea { width: 100%; box-sizing: border-box; min-height: 3rem; }
+    button { cursor: pointer; }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
+    .box { white-space: pre-wrap; overflow-wrap: anywhere; padding: 0.7rem; border-radius: 4px; background: #8881; margin: 0.5rem 0; }
+    .meta { font-size: 0.85rem; opacity: 0.8; }
+    .status { margin: 0.5rem 0 0; font-size: 0.9rem; }
+    .status.error { color: #c62828; }
+    .status.ok { color: #2e7d32; }
+    .item { border-top: 1px solid #8883; padding-top: 0.7rem; margin-top: 0.7rem; overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+  <header>
+    <div><h1>TechCards SRS</h1><span class="meta">Local loopback study loop</span></div>
+    <a href="/docs">API docs</a>
+  </header>
+
+  <main>
+    <section aria-labelledby="deck-heading">
+      <h2 id="deck-heading">Deck</h2>
+      <div class="row">
+        <label for="deck-select">Deck</label>
+        <select id="deck-select" aria-label="Select deck"><option value="">-- Choose a deck --</option></select>
+        <label for="deck-id">ID</label>
+        <input id="deck-id" type="number" min="1" step="1" placeholder="Deck ID" style="width:6rem;">
+        <button id="load-next-btn" type="button">Load next card</button>
+        <button id="refresh-decks-btn" type="button">Refresh decks</button>
+      </div>
+      <p id="study-status" class="status" role="status" aria-live="polite"></p>
+    </section>
+
+    <section id="study-card" hidden aria-labelledby="card-heading">
+      <h2 id="card-heading">Current card</h2>
+      <p id="card-meta" class="meta"></p>
+      <div id="card-front" class="box"></div>
+      <div class="row"><button id="reveal-btn" type="button">Reveal answer</button></div>
+
+      <div id="answer-panel" hidden>
+        <strong class="meta">Answer</strong>
+        <div id="card-back" class="box"></div>
+        <div id="accepted-wrap" hidden><strong class="meta">Accepted answers</strong><ul id="card-accepted"></ul></div>
+        <div id="explanation-wrap" hidden><strong class="meta">Explanation</strong><p id="card-explanation" class="box"></p></div>
+      </div>
+
+      <div id="grade-controls" class="row" role="group" aria-label="Grade recall quality 0 to 5">
+        <button type="button" data-quality="0" aria-label="Grade 0: Complete blackout">0 Blackout</button>
+        <button type="button" data-quality="1" aria-label="Grade 1: Incorrect">1 Wrong</button>
+        <button type="button" data-quality="2" aria-label="Grade 2: Incorrect, felt familiar">2 Familiar</button>
+        <button type="button" data-quality="3" aria-label="Grade 3: Correct with difficulty">3 Hard</button>
+        <button type="button" data-quality="4" aria-label="Grade 4: Correct with hesitation">4 Good</button>
+        <button type="button" data-quality="5" aria-label="Grade 5: Easy, confident recall">5 Easy</button>
+      </div>
+    </section>
+
+    <details id="templates-section">
+      <summary>Templates (optional)</summary>
+      <div class="row">
+        <label for="template-select">Template</label>
+        <select id="template-select" aria-label="Select template"><option value="">-- Choose a template --</option></select>
+        <button id="load-templates-btn" type="button">Reload templates</button>
+      </div>
+      <p id="templates-status" class="status" role="status" aria-live="polite"></p>
+      <div id="template-detail" hidden class="item">
+        <strong id="tpl-title"></strong> <span id="tpl-meta" class="meta"></span>
+        <div id="tpl-front" class="box"></div>
+        <div id="tpl-back" class="box"></div>
+        <div id="tpl-followups-wrap" hidden><strong class="meta">Follow-up questions</strong><ul id="tpl-followups"></ul></div>
+        <p id="tpl-explanation" class="meta" hidden></p>
+        <button id="create-from-template-btn" type="button">Create card in selected deck</button>
+      </div>
+    </details>
+
+    <details id="errors-section">
+      <summary>Error log (optional)</summary>
+      <form id="error-form" class="field">
+        <label for="err-attempted">Attempted wording</label>
+        <textarea id="err-attempted" required placeholder="Original wording to improve"></textarea>
+        <label for="err-corrected">Corrected wording</label>
+        <textarea id="err-corrected" required placeholder="Improved wording"></textarea>
+        <label for="err-rationale">Rationale</label>
+        <textarea id="err-rationale" required placeholder="Why the correction is better"></textarea>
+        <div class="row"><button type="submit">Log draft error</button></div>
+      </form>
+      <div class="row">
+        <label for="error-filter">Status</label>
+        <select id="error-filter" aria-label="Filter errors by status">
+          <option value="draft">Draft</option><option value="">All</option>
+          <option value="approved">Approved</option><option value="discarded">Discarded</option>
+        </select>
+        <button id="load-errors-btn" type="button">Refresh errors</button>
+      </div>
+      <p id="errors-status" class="status" role="status" aria-live="polite"></p>
+      <div id="errors-list"></div>
+    </details>
+  </main>
+
+  <script src="/static/study.js" defer></script>
+</body>
+</html>
