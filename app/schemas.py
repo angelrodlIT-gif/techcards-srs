@@ -1,5 +1,5 @@
 import re
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from ipaddress import IPv6Address
 from typing import Annotated, Literal, Self
 from urllib.parse import urlsplit, urlunsplit
@@ -42,6 +42,11 @@ Kind = Literal["vocabulary", "interview_phrase", "behavioral", "sentence", "cloz
 SourceStatus = Literal["draft", "approved", "discarded"]
 ErrorStatus = SourceStatus
 TemplateCategory = Literal["star", "networking"]
+InterviewRole = Literal["cloud_support", "junior_aws", "python_backend"]
+InterviewStatus = Literal["active", "completed"]
+InterviewTurnType = Literal["technical", "follow_up", "behavioral"]
+HumanReviewStatus = Literal["pending", "accepted", "edited", "dismissed"]
+HumanReviewDecision = Literal["accepted", "edited", "dismissed"]
 
 
 def normalize_source_url(raw: str) -> tuple[str, str]:
@@ -308,3 +313,62 @@ class ErrorApproveInput(CardExtrasMixin):
 class ErrorApproveOut(BaseModel):
     error: ErrorLogOut
     card: CardOut
+
+
+class InterviewSessionCreate(BaseModel):
+    role: InterviewRole
+    source_id: int | None = Field(default=None, gt=0)
+
+
+class InterviewAnswerInput(BaseModel):
+    answer: Text
+
+
+class InterviewTurnReviewInput(BaseModel):
+    human_review_status: HumanReviewDecision
+    corrected_phrasing: Text | None = None
+    human_notes: Explanation | None = None
+
+    @field_validator("human_notes", mode="before")
+    @classmethod
+    def normalize_human_notes(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
+
+
+class InterviewTurnOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    session_id: int
+    turn_index: int
+    turn_type: InterviewTurnType
+    prompt: str
+    answer: str | None = None
+    english_clarity: str | None = None
+    technical_accuracy: str | None = None
+    star_structure: str | None = None
+    corrected_phrasing: str | None = None
+    uncertainty_note: str | None = None
+    human_review_status: HumanReviewStatus
+    human_notes: str | None = None
+
+
+class InterviewSessionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    role: InterviewRole
+    source_id: int | None = None
+    status: InterviewStatus
+    created_at: datetime
+    completed_at: datetime | None = None
+    turns: list[InterviewTurnOut] = Field(default_factory=list)
+
+    @field_validator("created_at", "completed_at", mode="after")
+    @classmethod
+    def ensure_utc_timestamp(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)

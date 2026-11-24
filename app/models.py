@@ -96,3 +96,53 @@ class ErrorLog(Base):
         ForeignKey("cards.id", ondelete="SET NULL"), nullable=True, default=None
     )
     card: Mapped[Card | None] = relationship("Card", back_populates="error_log")
+
+
+class InterviewSession(Base):
+    __tablename__ = "interview_sessions"
+    __table_args__ = (
+        CheckConstraint("role IN ('cloud_support', 'junior_aws', 'python_backend')"),
+        CheckConstraint("status IN ('active', 'completed')"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    role: Mapped[str] = mapped_column(String(30))
+    source_id: Mapped[int | None] = mapped_column(
+        ForeignKey("sources.id", ondelete="SET NULL"), nullable=True, default=None
+    )
+    status: Mapped[str] = mapped_column(String(20), default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
+    turns: Mapped[list["InterviewTurn"]] = relationship(
+        "InterviewTurn",
+        back_populates="session",
+        cascade="all, delete-orphan",
+        order_by="InterviewTurn.turn_index",
+    )
+
+
+class InterviewTurn(Base):
+    __tablename__ = "interview_turns"
+    __table_args__ = (
+        CheckConstraint("turn_index >= 1"),
+        CheckConstraint("turn_type IN ('technical', 'follow_up', 'behavioral')"),
+        CheckConstraint("human_review_status IN ('pending', 'accepted', 'edited', 'dismissed')"),
+        Index("uq_interview_turns_session_turn", "session_id", "turn_index", unique=True),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    session_id: Mapped[int] = mapped_column(
+        ForeignKey("interview_sessions.id", ondelete="CASCADE"), index=True
+    )
+    turn_index: Mapped[int]
+    turn_type: Mapped[str] = mapped_column(String(20))
+    prompt: Mapped[str] = mapped_column(Text)
+    answer: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
+    english_clarity: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
+    technical_accuracy: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
+    star_structure: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
+    corrected_phrasing: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
+    uncertainty_note: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
+    human_review_status: Mapped[str] = mapped_column(String(20), default="pending")
+    human_notes: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
+    session: Mapped[InterviewSession] = relationship("InterviewSession", back_populates="turns")

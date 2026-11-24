@@ -311,6 +311,27 @@ Observed in a disposable PostgreSQL 16 session: starting from `(decks=1, cards=6
 reviews=3)` where card `1` had 1 review and card `2` had 2 reviews,
 `DELETE /cards/1` left `(1, 5, 2)` and `DELETE /decks/1` left `(0, 0, 0)`.
 
+## Mock interview sessions (`/interviews`)
+
+Practice text-mode mock interviews for `cloud_support`, `junior_aws`, or
+`python_backend` roles with an optional non-discarded `source_id`:
+
+- **Endpoints:** `POST /interviews` (`201`, seeds 3 ordered turns: `technical`,
+  `follow_up`, `behavioral`), `GET /interviews` (optional `role`, `status`,
+  `offset`, `limit`), `GET /interviews/{session_id}`,
+  `POST /interviews/{session_id}/turns/{turn_id}/answer` (sequential answers),
+  `POST /interviews/{session_id}/turns/{turn_id}/review` (`accepted`, `edited`,
+  or `dismissed`, optional `corrected_phrasing` and `human_notes`),
+  `POST /interviews/{session_id}/complete` (`200` once all turns are answered),
+  and `DELETE /interviews/{session_id}` (`204`, cascades to `interview_turns`).
+- **Rubric and human review:** Every answered turn separates `english_clarity`,
+  `technical_accuracy`, `star_structure`, `corrected_phrasing`, and
+  `uncertainty_note`, starting with `human_review_status: "pending"`.
+- **Uncertainty and non-claims policy:** Feedback is an offline text-mode
+  heuristic requiring human review; it makes no hiring or CEFR predictions and
+  never fabricates experience or metrics. See [Mock interviews](INTERVIEWS.md)
+  for full details.
+
 ## Unauthenticated loopback limits
 
 `techcards-srs` is a local single-operator API with **no authentication, no user
@@ -351,3 +372,6 @@ accounts, no authorization checks, no rate limiting, and no TLS**:
 - **Manual source-to-card curation:** See [Source curation](SOURCES.md) for
   `/sources` draft/edit/approve/discard workflows, URL normalization and `409`
   duplicate handling, privacy warnings, and non-cascading source deletion.
+- **Role-specific mock interviews:** See [Mock interviews](INTERVIEWS.md) for
+  `/interviews` role tracks, rubric separation, human review, uncertainty/no-CEFR
+  policy, and cascade deletion.
