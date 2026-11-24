@@ -240,10 +240,10 @@
       const approveBtn = el("button", { type: "button", textContent: "Approve into deck" });
       const discardBtn = el("button", { type: "button", textContent: "Discard" });
       const runDraftAction = async (path, body, onOk) => {
-        approveBtn.disabled = discardBtn.disabled = true;
+        override.disabled = approveBtn.disabled = discardBtn.disabled = true;
         const res = await post(path, body);
         if (!res.ok) {
-          approveBtn.disabled = discardBtn.disabled = false;
+          override.disabled = approveBtn.disabled = discardBtn.disabled = false;
           const hint = res.status === 422 ? " Enter a shorter front override and retry." : "";
           setStatus(itemStatus, `${res.error}${hint}`, "error");
           if (res.status === 422) override.focus();
@@ -267,16 +267,22 @@
 
   async function createError(event) {
     event.preventDefault();
-    const btn = $("error-form").querySelector("button[type=submit]");
-    btn.disabled = true;
-    const res = await post("/errors", {
+    const form = $("error-form");
+    const controls = [...form.querySelectorAll("textarea, button[type=submit]")];
+    if (controls.some((c) => c.disabled)) return;
+    const payload = {
       attempted: $("err-attempted").value,
       corrected: $("err-corrected").value,
       rationale: $("err-rationale").value,
-    });
-    btn.disabled = false;
-    if (!res.ok) return setStatus($("errors-status"), res.error, "error");
-    $("error-form").reset();
+    };
+    controls.forEach((c) => { c.disabled = true; });
+    const res = await post("/errors", payload);
+    if (!res.ok) {
+      controls.forEach((c) => { c.disabled = false; });
+      return setStatus($("errors-status"), res.error, "error");
+    }
+    form.reset();
+    controls.forEach((c) => { c.disabled = false; });
     await loadErrors(`Logged draft error #${res.data.id}.`);
   }
 
