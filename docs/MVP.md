@@ -32,6 +32,8 @@ API publicly. The public repository is a portfolio artifact, not a deployed serv
 - `sources`: id, label, optional url/normalized_url, optional excerpt, and
   status (`draft`/`approved`/`discarded`). Partial unique index on non-null
   `normalized_url`; see [Source curation](SOURCES.md).
+- `error_logs`: id, attempted, corrected, rationale, status (`draft`/`approved`/`discarded`),
+  and nullable `card_id` (`ON DELETE SET NULL`); see [Study loop](STUDY_LOOP.md).
 - Foreign keys cascade deck → cards → reviews on deletion. Deleting a source
   removes only the `sources` row and leaves approved cards intact. There is no user table yet.
 
@@ -89,6 +91,13 @@ Interactive schemas and examples are available at `/docs` and `/openapi.json`.
 | GET / PUT / DELETE | /sources/{id} | Read / edit draft / delete source (cards stay intact) |
 | POST | /sources/{id}/approve | Approve draft into a scheduled card with `source_label` |
 | POST | /sources/{id}/discard | Discard draft without creating a card |
+| GET | /study/next | Next due card prompt (recall-safe, hides answer) or 204 |
+| POST | /study/{id}/reveal | Reveal hidden answer fields for a card |
+| POST | /study/{id}/grade | Grade card (0–5) using the same SM-2 path as `/reviews` |
+| GET | /templates, /templates/{id} | Read-only STAR & networking prompt catalog |
+| POST | /templates/{id}/cards | Explicitly create one card from a template |
+| POST / GET / PUT / DELETE | /errors, /errors/{id} | Manual error log CRUD (draft edits only) |
+| POST | /errors/{id}/approve, /discard | Approve error into linked card / discard draft |
 
 Lists accept `offset` (default 0) and `limit` (1–100, default 100).
 Missing resources return 404; invalid input returns 422; creation returns 201;
