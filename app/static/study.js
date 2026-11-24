@@ -5,7 +5,7 @@
   const state = {
     card: null,
     loadSeq: 0,
-    grading: false,
+    pendingGradeCards: new Set(),
     templatesLoaded: false,
     templateSeq: 0,
     activeTemplateId: null,
@@ -118,7 +118,7 @@
     ].filter(Boolean).join(" · ");
     $("card-front").textContent = c.front;
     $("reveal-btn").disabled = false;
-    setGradeDisabled(false);
+    setGradeDisabled(state.pendingGradeCards.has(c.card_id));
     $("study-card").hidden = false;
     setStatus(status, note, note ? "ok" : "");
   }
@@ -148,11 +148,20 @@
   }
 
   async function gradeCard(quality) {
-    if (!state.card || state.grading) return;
-    state.grading = true;
+    if (!state.card || state.pendingGradeCards.has(state.card.card_id)) return;
+    const cardId = state.card.card_id;
+    const seq = state.loadSeq;
+    state.pendingGradeCards.add(cardId);
     setGradeDisabled(true);
-    const res = await post(`/study/${encodeURIComponent(state.card.card_id)}/grade`, { quality });
-    state.grading = false;
+    const res = await post(`/study/${encodeURIComponent(cardId)}/grade`, { quality });
+    state.pendingGradeCards.delete(cardId);
+    if (seq !== state.loadSeq || !state.card || state.card.card_id !== cardId) {
+      if (state.card && state.card.card_id === cardId) {
+        if (!res.ok || !res.data) setGradeDisabled(false);
+        else setStatus($("study-status"), `Card #${cardId} already graded (${quality}) — click Load next card.`, "ok");
+      }
+      return;
+    }
     if (!res.ok || !res.data) {
       setGradeDisabled(false);
       return setStatus($("study-status"), res.error, "error");
