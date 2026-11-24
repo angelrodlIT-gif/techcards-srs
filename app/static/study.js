@@ -10,6 +10,10 @@
     templateSeq: 0,
     activeTemplateId: null,
     errorsLoaded: false,
+    errorSeq: 0,
+    pendingErrors: new Set(),
+    errorOverrides: new Map(),
+    errorRowStatus: new Map(),
   };
 
   function el(tag, props = {}, ...children) {
@@ -212,12 +216,29 @@
   }
 
   async function loadErrors(note = "") {
+    const seq = ++state.errorSeq;
     const filter = $("error-filter").value;
     const res = await api(filter ? `/errors?status=${encodeURIComponent(filter)}` : "/errors");
+    if (seq !== state.errorSeq) return;
     if (!res.ok || !Array.isArray(res.data)) return setStatus($("errors-status"), res.error, "error");
     state.errorsLoaded = true;
     renderErrors(res.data);
     setStatus($("errors-status"), note || `${res.data.length} error entr${res.data.length === 1 ? "y" : "ies"}.`, note ? "ok" : "");
+  }
+
+  function syncErrorRow(errId, focusOverride = false) {
+    const row = [...$("errors-list").children].find((node) => node.dataset.errorId === String(errId));
+    const rowStatus = state.errorRowStatus.get(errId);
+    if (!row) {
+      if (rowStatus) setStatus($("errors-status"), `Error #${errId}: ${rowStatus.text}`, rowStatus.kind);
+      return;
+    }
+    const pending = state.pendingErrors.has(errId);
+    const override = row.querySelector("input");
+    for (const ctrl of row.querySelectorAll("input, button")) ctrl.disabled = pending;
+    const statusEl = row.querySelector("p.status");
+    if (statusEl) setStatus(statusEl, rowStatus ? rowStatus.text : "", rowStatus ? rowStatus.kind : "");
+    if (focusOverride && override && !pending) override.focus();
   }
 
   function renderErrors(items) {
@@ -229,32 +250,52 @@
         el("div", {}, el("strong", { textContent: "Corrected: " }), err.corrected),
         el("div", {}, el("strong", { textContent: "Rationale: " }), err.rationale),
       );
-      if (err.status !== "draft") return wrap;
+      if (err.status !== "draft") {
+        state.errorOverrides.delete(err.id);
+        state.errorRowStatus.delete(err.id);
+        return wrap;
+      }
+      wrap.dataset.errorId = String(err.id);
+      const pending = state.pendingErrors.has(err.id);
+      const savedStatus = state.errorRowStatus.get(err.id);
       const itemStatus = el("p", { className: "status", role: "status" });
+      if (savedStatus) setStatus(itemStatus, savedStatus.text, savedStatus.kind);
       const override = el("input", {
         type: "text",
+        value: state.errorOverrides.get(err.id) ?? "",
+        disabled: pending,
         placeholder: "Optional front override (required if >5000 chars)",
         ariaLabel: `Front override for error ${err.id}`,
       });
       override.style.flex = "1";
-      const approveBtn = el("button", { type: "button", textContent: "Approve into deck" });
-      const discardBtn = el("button", { type: "button", textContent: "Discard" });
+      override.addEventListener("input", () => state.errorOverrides.set(err.id, override.value));
+      const approveBtn = el("button", { type: "button", textContent: "Approve into deck", disabled: pending });
+      const discardBtn = el("button", { type: "button", textContent: "Discard", disabled: pending });
       const runDraftAction = async (path, body, onOk) => {
-        override.disabled = approveBtn.disabled = discardBtn.disabled = true;
+        if (state.pendingErrors.has(err.id)) return;
+        state.pendingErrors.add(err.id);
+        state.errorRowStatus.delete(err.id);
+        syncErrorRow(err.id);
         const res = await post(path, body);
+        state.pendingErrors.delete(err.id);
         if (!res.ok) {
-          override.disabled = approveBtn.disabled = discardBtn.disabled = false;
           const hint = res.status === 422 ? " Enter a shorter front override and retry." : "";
-          setStatus(itemStatus, `${res.error}${hint}`, "error");
-          if (res.status === 422) override.focus();
+          state.errorRowStatus.set(err.id, { text: `${res.error}${hint}`, kind: "error" });
+          syncErrorRow(err.id, res.status === 422);
           return;
         }
+        state.errorOverrides.delete(err.id);
+        state.errorRowStatus.delete(err.id);
         await loadErrors(onOk(res.data));
       };
       approveBtn.addEventListener("click", () => {
         const deckId = deckIdValue();
-        if (deckId === null) return setStatus(itemStatus, "Select a valid Deck ID above first.", "error");
-        const payload = override.value.trim() ? { deck_id: deckId, front: override.value.trim() } : { deck_id: deckId };
+        if (deckId === null) {
+          state.errorRowStatus.set(err.id, { text: "Select a valid Deck ID above first.", kind: "error" });
+          return syncErrorRow(err.id);
+        }
+        const customFront = (state.errorOverrides.get(err.id) ?? override.value).trim();
+        const payload = customFront ? { deck_id: deckId, front: customFront } : { deck_id: deckId };
         runDraftAction(`/errors/${encodeURIComponent(err.id)}/approve`, payload, (d) => `Approved error #${err.id} into card #${d.card.id}.`);
       });
       discardBtn.addEventListener("click", () =>
