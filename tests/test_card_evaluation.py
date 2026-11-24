@@ -218,3 +218,123 @@ def test_approve_rejects_unsupported_cases_without_persisting(client, case):
     assert resp.status_code == 422
     assert client.get("/cards", params={"deck_id": did}).json() == []
     assert client.get(f"/decks/{did}/due").json() == []
+
+
+def test_ungrounded_percentage_metric_rejected_unit_and_approve(client):
+    src = "I reduced PostgreSQL query latency."
+    front = "How did you improve PostgreSQL performance?"
+    back = "I reduced PostgreSQL query latency by 70%."
+
+    ev = evaluate_generated_card(front=front, back=back, kind="interview_phrase", source_text=src)
+    assert ev.status == "rejected"
+    assert ev.ready_for_review is False
+    assert ev.checks.technical_accuracy == "fail"
+
+    did = create_deck(client)
+    resp = client.post(
+        "/cards/generate/approve",
+        json={
+            "deck_id": did,
+            "front": front,
+            "back": back,
+            "kind": "interview_phrase",
+            "source_text": src,
+        },
+    )
+    assert resp.status_code == 422
+    assert client.get("/cards", params={"deck_id": did}).json() == []
+
+
+def test_accepted_answers_and_explanation_are_evaluated_unit_and_approve(client):
+    src = "Amazon VPC security groups are stateful firewalls for EC2 instances."
+    front = "How do AWS VPC security groups work?"
+    back = "Security groups are stateful firewalls."
+
+    contradiction = evaluate_generated_card(
+        front=front,
+        back=back,
+        kind="sentence",
+        source_text=src,
+        accepted_answers=["Security groups are stateless firewalls."],
+    )
+    assert contradiction.status == "rejected"
+    assert contradiction.checks.technical_accuracy == "fail"
+
+    ungrounded_alt = evaluate_generated_card(
+        front=front,
+        back=back,
+        kind="sentence",
+        source_text=src,
+        accepted_answers=["Helm charts package Kubernetes templates."],
+    )
+    assert ungrounded_alt.status == "rejected"
+    assert ungrounded_alt.checks.source_grounding == "fail"
+
+    invalid_alt = evaluate_generated_card(
+        front=front,
+        back=back,
+        kind="sentence",
+        source_text=src,
+        accepted_answers=["12345 !!!"],
+    )
+    assert invalid_alt.status == "rejected"
+    assert invalid_alt.checks.english_usefulness == "fail"
+
+    unresolved_expl = evaluate_generated_card(
+        front=front,
+        back=back,
+        kind="sentence",
+        source_text=src,
+        explanation="TODO verify return traffic behavior.",
+    )
+    assert unresolved_expl.status == "rejected"
+    assert unresolved_expl.checks.ambiguity == "fail"
+
+    did = create_deck(client)
+    for extra in (
+        {"accepted_answers": ["Security groups are stateless firewalls."]},
+        {"accepted_answers": ["Helm charts package Kubernetes templates."]},
+        {"explanation": "TODO verify return traffic behavior."},
+    ):
+        resp = client.post(
+            "/cards/generate/approve",
+            json={
+                "deck_id": did,
+                "front": front,
+                "back": back,
+                "kind": "sentence",
+                "source_text": src,
+                **extra,
+            },
+        )
+        assert resp.status_code == 422
+    assert client.get("/cards", params={"deck_id": did}).json() == []
+
+
+def test_single_word_cloze_completion_is_accepted_unit_and_approve(client):
+    src = "PostgreSQL supports transactions."
+    front = "PostgreSQL supports ____."
+    back = "transactions"
+
+    ev = evaluate_generated_card(front=front, back=back, kind="cloze", source_text=src)
+    assert ev.status == "draft"
+    assert ev.ready_for_review is True
+    assert ev.checks.english_usefulness == "pass"
+    assert ev.checks.source_grounding == "pass"
+
+    did = create_deck(client)
+    resp = client.post(
+        "/cards/generate/approve",
+        json={
+            "deck_id": did,
+            "front": front,
+            "back": back,
+            "kind": "cloze",
+            "source_text": src,
+        },
+    )
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["evaluation"]["ready_for_review"] is True
+    assert body["card"]["back"] == "transactions"
+    assert len(client.get("/cards", params={"deck_id": did}).json()) == 1

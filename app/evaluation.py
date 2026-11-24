@@ -32,9 +32,9 @@ FIRST_PERSON_CLAIM_RE = re.compile(
     re.IGNORECASE,
 )
 METRIC_RE = re.compile(
-    r"(?:\$\s?\d[\d,.]*|\b\d+(?:\.\d+)?\s?(?:%|percent|x|ms|seconds?|minutes?|hours?|days?|"
+    r"(?:\$\s?\d[\d,.]*|\b\d+(?:\.\d+)?\s?(?:%|(?:percent|x|ms|seconds?|minutes?|hours?|days?|"
     r"years?|engineers?|servers?|accounts?|clusters?|nodes?|microservices?|services?|"
-    r"tickets?|incidents?)\b)",
+    r"tickets?|incidents?)\b))",
     re.IGNORECASE,
 )
 FALLBACK_TOPIC = "the technical responsibilities in this text"
@@ -133,6 +133,14 @@ def _norm_space(text: str) -> str:
     return " ".join(text.strip().lower().split())
 
 
+def _is_practice_text(text: str) -> bool:
+    return (
+        bool(PLACEHOLDER_RE.search(text))
+        or bool(SCAFFOLD_HINT_RE.search(text))
+        or text.strip().lower().startswith("practice:")
+    )
+
+
 def evaluate_generated_card(
     *,
     front: str,
@@ -145,7 +153,9 @@ def evaluate_generated_card(
     reasons: list[str] = []
     uncertainty: list[str] = []
 
+    cleaned_answers = [a.strip() for a in accepted_answers if a.strip()]
     front_words, back_words = _words(front), _words(back)
+    min_back_words = 1 if kind == "cloze" else 2
     english_status: CheckStatus = "pass"
     if any("\x00" in part for part in (front, back, explanation or "", *accepted_answers)):
         english_status = "fail"
@@ -153,7 +163,10 @@ def evaluate_generated_card(
     if any(len(part.strip()) > 5000 for part in (front, back, explanation or "")):
         english_status = "fail"
         reasons.append("Card fields must be at most 5,000 characters.")
-    for side, raw, words in (("front", front, front_words), ("back", back, back_words)):
+    for side, raw, words, min_words in (
+        ("front", front, front_words, 2),
+        ("back", back, back_words, min_back_words),
+    ):
         alpha = ALPHA_WORD_RE.findall(_strip_urls(raw))
         if URL_RE.search(raw) and not alpha:
             english_status = "fail"
@@ -161,52 +174,54 @@ def evaluate_generated_card(
         elif not alpha:
             english_status = "fail"
             reasons.append(f"{side} contains no meaningful English words.")
-        elif len(words) < 2:
+        elif len(words) < min_words:
             english_status = "fail"
             reasons.append(f"{side} is a single-token fragment; use a clear English phrase.")
+    if any(not ALPHA_WORD_RE.findall(_strip_urls(ans)) for ans in cleaned_answers):
+        english_status = "fail"
+        reasons.append("accepted_answers contains an entry without meaningful English words.")
 
     tech_status: CheckStatus = "pass"
-    combined_tech = "\n".join(part for part in (front, back, explanation or "") if part)
+    answer_parts = tuple(part for part in (back, explanation or "", *cleaned_answers) if part)
+    combined_tech = "\n".join(part for part in (front, *answer_parts) if part)
     for pattern, message in TECHNICAL_CONTRADICTIONS:
         if pattern.search(combined_tech):
             tech_status = "fail"
             reasons.append(message)
 
     source_norm = _norm_space(source_text)
-    ungrounded_metrics = [m for m in METRIC_RE.findall(back) if _norm_space(m) not in source_norm]
+    combined_answer_text = "\n".join(answer_parts)
+    ungrounded_metrics = [
+        m for m in METRIC_RE.findall(combined_answer_text) if _norm_space(m) not in source_norm
+    ]
     has_placeholder = bool(PLACEHOLDER_RE.search(front) or PLACEHOLDER_RE.search(back))
-    is_practice = (
-        has_placeholder
-        or bool(SCAFFOLD_HINT_RE.search(back))
-        or back.strip().lower().startswith("practice:")
-    )
-    if FIRST_PERSON_CLAIM_RE.search(back):
-        if ungrounded_metrics:
-            tech_status = "fail"
-            reasons.append(
-                "Back contains fabricated first-person metrics not grounded in source_text."
-            )
-        elif not is_practice and not FIRST_PERSON_PRONOUN_RE.search(source_text):
-            tech_status = "fail"
-            reasons.append(
-                "Back makes a first-person achievement claim not supported by source_text."
-            )
+    is_practice = has_placeholder or _is_practice_text(back)
+    if ungrounded_metrics:
+        tech_status = "fail"
+        reasons.append("Card contains ungrounded metrics not present in source_text.")
+    if any(
+        FIRST_PERSON_CLAIM_RE.search(part) and not _is_practice_text(part) for part in answer_parts
+    ) and not FIRST_PERSON_PRONOUN_RE.search(source_text):
+        tech_status = "fail"
+        reasons.append("Card makes a first-person achievement claim not supported by source_text.")
 
     ambiguity_status: CheckStatus = "pass"
     if _norm_space(front) == _norm_space(back):
         ambiguity_status = "fail"
         reasons.append("Front and back are identical.")
-    if len(front_words) < 2 or len(back_words) < 2:
+    if any(_norm_space(ans) == _norm_space(front) for ans in cleaned_answers):
         ambiguity_status = "fail"
-        reasons.append("Front and back must each contain at least two words to avoid ambiguity.")
-    if UNRESOLVED_RE.search(front) or UNRESOLVED_RE.search(back):
+        reasons.append("An accepted answer is identical to front.")
+    if len(front_words) < 2 or len(back_words) < min_back_words:
+        ambiguity_status = "fail"
+        reasons.append("Front and back must meet minimum word counts to avoid ambiguity.")
+    if any(UNRESOLVED_RE.search(part) for part in (front, *answer_parts)):
         ambiguity_status = "fail"
         reasons.append("Card contains unresolved placeholder markers (TODO, TBD, or ???).")
     if kind == "cloze" and CLOZE_BLANK_RE.findall(front) != ["____"]:
         ambiguity_status = "fail"
         reasons.append("Cloze card front must contain exactly one '____' blank.")
 
-    cleaned_answers = [a.strip() for a in accepted_answers if a.strip()]
     if ambiguity_status == "pass" and (
         has_placeholder or (kind in ("cloze", "es_en") and not cleaned_answers)
     ):
@@ -220,7 +235,7 @@ def evaluate_generated_card(
         if term in source_lower_words or _stem(term) in source_tokens:
             allowed_answer_tokens |= _content_tokens(definition)
     front_tokens, back_tokens = _content_tokens(front), _content_tokens(back)
-    if FALLBACK_TOPIC in front.lower() or FALLBACK_TOPIC in back.lower():
+    if any(FALLBACK_TOPIC in part.lower() for part in (front, back, *cleaned_answers)):
         grounding_status = "fail"
         reasons.append("Card uses the generic fallback placeholder instead of source content.")
     elif not (source_tokens & (front_tokens | back_tokens)):
@@ -233,6 +248,9 @@ def evaluate_generated_card(
     ):
         grounding_status = "fail"
         reasons.append("Answer (back) is not grounded in source_text.")
+    elif any(not (_content_tokens(ans) & allowed_answer_tokens) for ans in cleaned_answers):
+        grounding_status = "fail"
+        reasons.append("An accepted answer is not grounded in source_text.")
 
     if has_placeholder:
         uncertainty.append(
