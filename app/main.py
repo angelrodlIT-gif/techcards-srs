@@ -1,8 +1,11 @@
 from collections.abc import Callable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Response
+from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -53,10 +56,23 @@ def normalize_utc(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+
 app = FastAPI(title="TechCards SRS", version="0.1.0")
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 DB = Annotated[Session, Depends(get_db)]
 Generator = Annotated[CardGenerator, Depends(get_generator)]
 Clock = Annotated[Callable[[], datetime], Depends(get_clock)]
+
+
+@app.get("/", include_in_schema=False)
+def root_redirect():
+    return RedirectResponse(url="/ui", status_code=302)
+
+
+@app.get("/ui", include_in_schema=False)
+def study_ui():
+    return FileResponse(STATIC_DIR / "study.html", media_type="text/html; charset=utf-8")
 
 
 def require(db: Session, model, identifier: int):
