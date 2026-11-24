@@ -5,7 +5,8 @@
   const state = {
     card: null,
     loadSeq: 0,
-    pendingGradeCards: new Set(),
+    deckSeq: 0,
+    grading: false,
     templatesLoaded: false,
     templateSeq: 0,
     activeTemplateId: null,
@@ -60,6 +61,9 @@
   const fillList = (ul, items) => ul.replaceChildren(...items.map((text) => el("li", { textContent: text })));
   const setGradeDisabled = (disabled) =>
     $("grade-controls").querySelectorAll("button[data-quality]").forEach((btn) => { btn.disabled = disabled; });
+  const setStudyNavDisabled = (disabled) => {
+    for (const id of ["deck-select", "deck-id", "load-next-btn", "refresh-decks-btn"]) $(id).disabled = disabled;
+  };
 
   function clearAnswer() {
     $("answer-panel").hidden = $("accepted-wrap").hidden = $("explanation-wrap").hidden = true;
@@ -68,7 +72,10 @@
   }
 
   async function loadDecks() {
+    if (state.grading) return;
+    const seq = ++state.deckSeq;
     const res = await api("/decks");
+    if (seq !== state.deckSeq || state.grading) return;
     if (!res.ok || !Array.isArray(res.data)) return setStatus($("study-status"), res.error, "error");
     const select = $("deck-select");
     const current = $("deck-id").value.trim();
@@ -85,6 +92,7 @@
   }
 
   async function loadNextCard(note = "") {
+    if (state.grading) return;
     const status = $("study-status");
     const deckId = deckIdValue();
     if (deckId === null) {
@@ -103,7 +111,7 @@
     setStatus(status, note ? `${note} Loading next card...` : "Loading next card...");
 
     const res = await api(`/study/next?deck_id=${encodeURIComponent(deckId)}`);
-    if (seq !== state.loadSeq) return;
+    if (seq !== state.loadSeq || state.grading) return;
     if (res.status === 204) {
       return setStatus(status, note ? `${note} No due cards left.` : "No due cards left in this deck.", "ok");
     }
@@ -118,18 +126,18 @@
     ].filter(Boolean).join(" · ");
     $("card-front").textContent = c.front;
     $("reveal-btn").disabled = false;
-    setGradeDisabled(state.pendingGradeCards.has(c.card_id));
+    setGradeDisabled(false);
     $("study-card").hidden = false;
     setStatus(status, note, note ? "ok" : "");
   }
 
   async function revealCard() {
-    if (!state.card) return;
+    if (!state.card || state.grading) return;
     const cardId = state.card.card_id;
     const seq = state.loadSeq;
     $("reveal-btn").disabled = true;
     const res = await post(`/study/${encodeURIComponent(cardId)}/reveal`);
-    if (seq !== state.loadSeq || !state.card || state.card.card_id !== cardId) return;
+    if (seq !== state.loadSeq || state.grading || !state.card || state.card.card_id !== cardId) return;
     if (!res.ok || !res.data) {
       $("reveal-btn").disabled = false;
       return setStatus($("study-status"), res.error, "error");
@@ -148,24 +156,22 @@
   }
 
   async function gradeCard(quality) {
-    if (!state.card || state.pendingGradeCards.has(state.card.card_id)) return;
-    const cardId = state.card.card_id;
-    const seq = state.loadSeq;
-    state.pendingGradeCards.add(cardId);
+    if (!state.card || state.grading) return;
+    const { card_id: cardId, deck_id: deckId } = state.card;
+    state.grading = true;
+    state.loadSeq++;
+    setStudyNavDisabled(true);
     setGradeDisabled(true);
+    $("reveal-btn").disabled = true;
     const res = await post(`/study/${encodeURIComponent(cardId)}/grade`, { quality });
-    state.pendingGradeCards.delete(cardId);
-    if (seq !== state.loadSeq || !state.card || state.card.card_id !== cardId) {
-      if (state.card && state.card.card_id === cardId) {
-        if (!res.ok || !res.data) setGradeDisabled(false);
-        else setStatus($("study-status"), `Card #${cardId} already graded (${quality}) — click Load next card.`, "ok");
-      }
-      return;
-    }
+    state.grading = false;
+    setStudyNavDisabled(false);
     if (!res.ok || !res.data) {
       setGradeDisabled(false);
+      $("reveal-btn").disabled = !$("answer-panel").hidden;
       return setStatus($("study-status"), res.error, "error");
     }
+    $("deck-id").value = String(deckId);
     await loadNextCard(`Graded ${quality} — next due ${res.data.due_date} (${res.data.interval_days}d).`);
   }
 
@@ -337,11 +343,12 @@
   }
 
   $("deck-select").addEventListener("change", (e) => {
+    if (state.grading) return;
     $("deck-id").value = e.target.value;
     if (e.target.value) loadNextCard();
     else { state.loadSeq++; state.card = null; clearAnswer(); $("study-card").hidden = true; setStatus($("study-status"), ""); }
   });
-  $("deck-id").addEventListener("keydown", (e) => { if (e.key === "Enter") loadNextCard(); });
+  $("deck-id").addEventListener("keydown", (e) => { if (e.key === "Enter" && !state.grading) loadNextCard(); });
   $("load-next-btn").addEventListener("click", () => loadNextCard());
   $("refresh-decks-btn").addEventListener("click", () => loadDecks());
   $("reveal-btn").addEventListener("click", () => revealCard());
