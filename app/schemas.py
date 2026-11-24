@@ -1,6 +1,7 @@
+import re
 from datetime import date, datetime
 from ipaddress import IPv6Address
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Self
 from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import (
@@ -10,6 +11,7 @@ from pydantic import (
     Field,
     StringConstraints,
     field_validator,
+    model_validator,
 )
 
 
@@ -32,7 +34,11 @@ SourceUrl = Annotated[str, StringConstraints(min_length=1, max_length=2048), NoN
 MAX_SOURCE_URL_CHARS = 2048
 MAX_SOURCE_URL_UTF8_BYTES = 2048
 Excerpt = Annotated[str, StringConstraints(min_length=1, max_length=20000), NoNul]
-Kind = Literal["vocabulary", "interview_phrase", "behavioral"]
+Explanation = Annotated[str, StringConstraints(min_length=1, max_length=5000), NoNul]
+MAX_ACCEPTED_ANSWERS = 20
+MAX_ACCEPTED_ANSWER_CHARS = 5000
+CLOZE_BLANK_RE = re.compile(r"_{4,}")
+Kind = Literal["vocabulary", "interview_phrase", "behavioral", "sentence", "cloze", "es_en"]
 SourceStatus = Literal["draft", "approved", "discarded"]
 
 
@@ -81,11 +87,48 @@ class DeckOut(DeckInput):
     id: int
 
 
-class CardInput(BaseModel):
+class CardPayloadBase(BaseModel):
     deck_id: int = Field(gt=0)
     front: Text
     back: Text
     kind: Kind = "vocabulary"
+    accepted_answers: list[str] = Field(default_factory=list, max_length=MAX_ACCEPTED_ANSWERS)
+    explanation: Explanation | None = None
+
+    @field_validator("accepted_answers", mode="after")
+    @classmethod
+    def normalize_accepted_answers(cls, value: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            reject_nul(item)
+            stripped = item.strip()
+            if not stripped:
+                continue
+            if len(stripped) > MAX_ACCEPTED_ANSWER_CHARS:
+                raise ValueError(
+                    f"accepted answer must be at most {MAX_ACCEPTED_ANSWER_CHARS} characters"
+                )
+            if stripped not in seen:
+                seen.add(stripped)
+                cleaned.append(stripped)
+        return cleaned
+
+    @field_validator("explanation", mode="before")
+    @classmethod
+    def normalize_explanation(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
+
+    @model_validator(mode="after")
+    def validate_cloze_front(self) -> Self:
+        if self.kind == "cloze" and CLOZE_BLANK_RE.findall(self.front) != ["____"]:
+            raise ValueError("cloze card front must contain exactly one '____' blank")
+        return self
+
+
+class CardInput(CardPayloadBase):
     source_label: SourceLabel | None = None
 
     @field_validator("source_label", mode="before")
@@ -104,11 +147,18 @@ class CardOut(BaseModel):
     back: str
     kind: Kind
     source_label: str | None
+    accepted_answers: list[str] = Field(default_factory=list)
+    explanation: str | None = None
     id: int
     repetitions: int
     interval_days: int
     ease_factor: float
     due_date: date
+
+    @field_validator("accepted_answers", mode="before")
+    @classmethod
+    def default_null_accepted_answers(cls, value: object) -> object:
+        return [] if value is None else value
 
 
 class GenerateInput(BaseModel):
@@ -172,11 +222,8 @@ class SourceOut(BaseModel):
     status: SourceStatus
 
 
-class SourceApproveInput(BaseModel):
-    deck_id: int = Field(gt=0)
-    front: Text
-    back: Text
-    kind: Kind = "vocabulary"
+class SourceApproveInput(CardPayloadBase):
+    pass
 
 
 class SourceApproveOut(BaseModel):

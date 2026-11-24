@@ -1,6 +1,6 @@
 from datetime import UTC, date, datetime
 
-from sqlalchemy import CheckConstraint, Date, DateTime, ForeignKey, Index, String, Text, text
+from sqlalchemy import JSON, CheckConstraint, Date, DateTime, ForeignKey, Index, String, Text, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -27,6 +27,8 @@ class Card(Base):
     back: Mapped[str] = mapped_column(Text)
     kind: Mapped[str] = mapped_column(String(30), default="vocabulary")
     source_label: Mapped[str | None] = mapped_column(String(255), nullable=True, default=None)
+    accepted_answers: Mapped[list[str] | None] = mapped_column(JSON, nullable=True, default=list)
+    explanation: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
     repetitions: Mapped[int] = mapped_column(default=0)
     interval_days: Mapped[int] = mapped_column(default=0)
     ease_factor: Mapped[float] = mapped_column(default=2.5)
