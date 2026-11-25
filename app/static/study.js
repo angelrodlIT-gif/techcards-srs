@@ -10,6 +10,7 @@
     templatesLoaded: false,
     templateSeq: 0,
     activeTemplateId: null,
+    templateWrites: new Map(),
     errorsLoaded: false,
     errorSeq: 0,
     pendingErrors: new Set(),
@@ -33,15 +34,22 @@
     node.className = kind ? `status ${kind}` : "status";
   }
 
-  // The API emits integer IDs. Recover their decimal tokens before a rounded
-  // Number can enter UI state; older engines may only use safe integers.
-  function readId(key, value, context) {
-    if ((key === "id" || key.endsWith("_id")) && typeof value === "number") {
-      if (context?.source && /^[1-9]\d*$/.test(context.source)) return context.source;
-      if (Number.isSafeInteger(value) && value > 0) return String(value);
-      throw new RangeError("Actualiza el navegador para leer este ID con precisión.");
-    }
-    return value;
+  // Match whole JSON strings (including escapes), so ID-like text inside
+  // card content is never rewritten. Only object properties with a complete
+  // decimal integer value are candidates. JSON.parse validates the result.
+  function parseApiJson(raw) {
+    const stringWithInteger = /("(?:[^"\\]|\\.)*")(?:(\s*:\s*)([1-9]\d*)(?=\s*[,}]))?/g;
+    const exact = raw.replace(stringWithInteger, (token, quoted, colon, digits) => {
+      if (!digits) return token;
+      const key = JSON.parse(quoted);
+      return key === "id" || key.endsWith("_id") ? quoted + colon + '"' + digits + '"' : token;
+    });
+    return JSON.parse(exact, (key, value) => {
+      if (typeof value === "number" && (key === "id" || key.endsWith("_id"))) {
+        throw new RangeError("La API devolvió un ID con formato inesperado.");
+      }
+      return value;
+    });
   }
 
   async function api(path, options = {}) {
@@ -52,7 +60,7 @@
       let data = null;
       if (raw) {
         try {
-          data = JSON.parse(raw, readId);
+          data = parseApiJson(raw);
         } catch (err) {
           if (res.ok) return { ok: false, status: res.status, error: err instanceof RangeError ? err.message : "La API devolvió una respuesta no válida." };
           data = { detail: raw };
@@ -101,6 +109,7 @@
       select.value = current;
     } else if (!current && res.data.length > 0) {
       select.value = $("deck-id").value = String(res.data[0].id);
+      syncTemplateAction();
       await loadNextCard();
     } else if (res.data.length === 0) {
       setStatus($("study-status"), "Aún no hay mazos. Crea uno en la documentación de la API y pulsa «Actualizar mazos».");
@@ -240,24 +249,37 @@
     $("tpl-followups-wrap").hidden = fups.length === 0;
     $("tpl-explanation").textContent = t.explanation || "";
     $("tpl-explanation").hidden = !t.explanation;
-    $("create-from-template-btn").disabled = false;
     $("template-detail").hidden = false;
-    setStatus($("templates-status"), "");
+    syncTemplateAction();
+  }
+
+  function syncTemplateAction() {
+    if (!state.activeTemplateId) return;
+    const deckId = deckIdValue();
+    const write = state.templateWrites.get(JSON.stringify([state.activeTemplateId, deckId]));
+    $("create-from-template-btn").disabled = !deckId || Boolean(write);
+    setStatus($("templates-status"), write?.message || "", write?.kind || "");
   }
 
   async function createCardFromTemplate() {
-    const btn = $("create-from-template-btn");
     const templateId = state.activeTemplateId;
-    const seq = state.templateSeq;
     const deckId = deckIdValue();
-    if (!templateId) return;
-    if (deckId === null) return setStatus($("templates-status"), "Selecciona un mazo o escribe un ID válido arriba.", "error");
-    btn.disabled = true;
+    const key = JSON.stringify([templateId, deckId]);
+    if (!templateId || !deckId || state.templateWrites.has(key)) return;
+    state.templateWrites.set(key, { message: "Creando tarjeta…" });
+    syncTemplateAction();
     const res = await post(`/templates/${encodeURIComponent(templateId)}/cards`, { deck_id: deckId });
-    if (seq !== state.templateSeq || state.activeTemplateId !== templateId) return;
-    btn.disabled = false;
-    if (!res.ok || !res.data) return setStatus($("templates-status"), res.error, "error");
-    setStatus($("templates-status"), `Tarjeta #${res.data.id} creada en el mazo #${deckId}.`, "ok");
+    if (res.ok && res.data?.id) {
+      state.templateWrites.set(key, { message: `Tarjeta #${res.data.id} creada en el mazo #${deckId}.`, kind: "ok" });
+    } else if (res.status >= 400 && res.status < 500) {
+      state.templateWrites.delete(key);
+    } else {
+      state.templateWrites.set(key, { message: `No se pudo confirmar la creación. Comprueba las tarjetas del mazo #${deckId}.`, kind: "error" });
+    }
+    if (state.activeTemplateId === templateId && deckIdValue() === deckId) {
+      syncTemplateAction();
+      if (!state.templateWrites.has(key)) setStatus($("templates-status"), res.error, "error");
+    }
   }
 
   async function loadErrors(note = "") {
@@ -377,10 +399,12 @@
     if (state.grading) return;
     state.deckSeq++;
     $("deck-id").value = e.target.value;
+    syncTemplateAction();
     if (e.target.value) loadNextCard();
     else { state.loadSeq++; state.card = null; clearAnswer(); $("study-card").hidden = true; setStatus($("study-status"), ""); }
   });
   $("deck-id").addEventListener("input", () => {
+    syncTemplateAction();
     state.loadSeq++;
     state.deckSeq++;
     state.card = null;
