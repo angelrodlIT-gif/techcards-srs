@@ -1,6 +1,6 @@
 # Card Practice Formats
 
-Cards support six `kind` values across `POST /cards`, `PUT /cards/{id}`, and
+Cards support seven `kind` values across `POST /cards`, `PUT /cards/{id}`, and
 `POST /sources/{id}/approve` (default remains `vocabulary`):
 
 - Existing kinds: `vocabulary`, `interview_phrase`, `behavioral`.
@@ -11,6 +11,9 @@ Cards support six `kind` values across `POST /cards`, `PUT /cards/{id}`, and
   return `422`; `back` is the primary completion).
 - `es_en`: ES→EN production (`front` is the Spanish prompt; `back` is the
   primary English production).
+- `listening`: technical English comprehension. Use `front` for a prompt that
+  keeps the transcript hidden and `back` for the English transcript (1–1,000
+  characters after trimming). See [Listening cards](STUDY_LOOP.md#listening-cards).
 
 ## Alternatives and explanations
 

@@ -10,6 +10,9 @@ class Settings(BaseSettings):
         "postgresql+psycopg://techcards:local-development-only@localhost:5435/techcards"
     )
     generator_provider: Literal["mock"] = "mock"
+    polly_enabled: bool = False
+    polly_region: str = ""
+    polly_voice_id: str = ""
 
 
 @lru_cache
