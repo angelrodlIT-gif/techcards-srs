@@ -760,3 +760,92 @@ def test_postgres_concurrent_interview_delete_and_create_races(client, db_engine
             re_read = client.get(f"/interviews/{r_create.json()['id']}")
             assert re_read.status_code == 200
             assert re_read.json()["source_id"] is None
+
+
+def test_atomic_conditional_update_rejects_concurrent_duplicate_answer_and_complete(
+    client, db_engine
+):
+    session = client.post("/interviews", json={"role": "cloud_support"}).json()
+    sid = session["id"]
+    t1, t2, t3 = session["turns"]
+
+    # Simulate a concurrent writer answering turn 1 after the initial read and before the UPDATE.
+    class RacingEvaluator:
+        def evaluate(self, role, turn_index, turn_type, prompt, answer):
+            with Session(db_engine) as peer:
+                peer_turn = peer.get(InterviewTurn, t1["id"])
+                assert peer_turn is not None
+                peer_turn.answer = "First writer answer"
+                peer_turn.english_clarity = "First writer clarity"
+                peer_turn.technical_accuracy = "First writer accuracy"
+                peer_turn.star_structure = "First writer STAR"
+                peer_turn.corrected_phrasing = "First writer phrasing"
+                peer_turn.uncertainty_note = "First writer note"
+                peer_turn.human_review_status = "pending"
+                peer.commit()
+            return TurnFeedback(
+                english_clarity="Second writer clarity",
+                technical_accuracy="Second writer accuracy",
+                star_structure="Second writer STAR",
+                corrected_phrasing="Second writer phrasing",
+                uncertainty_note="Second writer note",
+            )
+
+    app.dependency_overrides[get_interview_evaluator] = RacingEvaluator
+    try:
+        resp = client.post(
+            f"/interviews/{sid}/turns/{t1['id']}/answer",
+            json={"answer": "Second writer answer"},
+        )
+    finally:
+        app.dependency_overrides.pop(get_interview_evaluator, None)
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "Turn already answered"
+
+    # First writer's answer and feedback must remain intact.
+    with Session(db_engine) as db:
+        stored_t1 = db.get(InterviewTurn, t1["id"])
+        assert stored_t1 is not None
+        assert stored_t1.answer == "First writer answer"
+        assert stored_t1.english_clarity == "First writer clarity"
+
+    # Answer remaining turns normally.
+    for turn in (t2, t3):
+        assert (
+            client.post(
+                f"/interviews/{sid}/turns/{turn['id']}/answer",
+                json={"answer": "Detailed answer with logs and verification."},
+            ).status_code
+            == 200
+        )
+
+    # Simulate a concurrent writer completing the session after the initial read.
+    first_completed_at = datetime(2026, 7, 3, 9, 0, 0, tzinfo=UTC)
+    second_completed_at = datetime(2026, 7, 3, 9, 5, 0, tzinfo=UTC)
+
+    def racing_clock():
+        with Session(db_engine) as peer:
+            peer_session = peer.get(InterviewSession, sid)
+            assert peer_session is not None
+            peer_session.status = "completed"
+            peer_session.completed_at = first_completed_at
+            peer.commit()
+        return second_completed_at
+
+    prev_clock = app.dependency_overrides.get(main_module.get_clock)
+    app.dependency_overrides[main_module.get_clock] = lambda: racing_clock
+    try:
+        comp_resp = client.post(f"/interviews/{sid}/complete")
+    finally:
+        if prev_clock is None:
+            app.dependency_overrides.pop(main_module.get_clock, None)
+        else:
+            app.dependency_overrides[main_module.get_clock] = prev_clock
+
+    assert comp_resp.status_code == 409
+    assert comp_resp.json()["detail"] == "Interview session is already completed"
+
+    re_read = client.get(f"/interviews/{sid}").json()
+    assert re_read["status"] == "completed"
+    assert re_read["completed_at"].startswith("2026-07-03T09:00:00")

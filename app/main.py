@@ -4,9 +4,10 @@ from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import exists, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased, joinedload, selectinload
+from sqlalchemy.orm.attributes import set_committed_value
 
 from app.db import get_db
 from app.generator import CardGenerator, get_generator
@@ -682,14 +683,61 @@ def answer_interview_turn(
             prompt=turn.prompt,
             answer=payload.answer,
         )
-        turn.answer = payload.answer
-        turn.english_clarity = feedback.english_clarity
-        turn.technical_accuracy = feedback.technical_accuracy
-        turn.star_structure = feedback.star_structure
-        turn.corrected_phrasing = feedback.corrected_phrasing
-        turn.uncertainty_note = feedback.uncertainty_note
-        turn.human_review_status = "pending"
-        db.flush()
+        prior_turn = aliased(InterviewTurn)
+        active_session = exists(
+            select(1).where(
+                InterviewSession.id == session_id,
+                InterviewSession.status == "active",
+            )
+        )
+        prior_unanswered = exists(
+            select(1).where(
+                prior_turn.session_id == session_id,
+                prior_turn.turn_index < turn.turn_index,
+                prior_turn.answer.is_(None),
+            )
+        )
+        updated = db.execute(
+            update(InterviewTurn)
+            .where(
+                InterviewTurn.id == turn.id,
+                InterviewTurn.session_id == session_id,
+                InterviewTurn.answer.is_(None),
+                active_session,
+                ~prior_unanswered,
+            )
+            .values(
+                answer=payload.answer,
+                english_clarity=feedback.english_clarity,
+                technical_accuracy=feedback.technical_accuracy,
+                star_structure=feedback.star_structure,
+                corrected_phrasing=feedback.corrected_phrasing,
+                uncertainty_note=feedback.uncertainty_note,
+                human_review_status="pending",
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if updated.rowcount != 1:
+            db.rollback()
+            current_session = db.get(InterviewSession, session_id)
+            if current_session is None:
+                raise HTTPException(404, "InterviewSession not found")
+            if current_session.status != "active":
+                raise HTTPException(
+                    409, f"Cannot answer turn in '{current_session.status}' session"
+                )
+            current_turn = db.scalar(
+                select(InterviewTurn).where(
+                    InterviewTurn.id == turn_id,
+                    InterviewTurn.session_id == session_id,
+                )
+            )
+            if current_turn is None:
+                raise HTTPException(404, "InterviewTurn not found")
+            if current_turn.answer is not None:
+                raise HTTPException(409, "Turn already answered")
+            raise HTTPException(409, "Previous turn must be answered first")
+        db.refresh(turn)
         result = InterviewTurnOut.model_validate(turn)
         db.commit()
     except Exception:
@@ -742,20 +790,50 @@ def review_interview_turn(
 def complete_interview(session_id: int, db: DB, clock: Clock):
     try:
         session = db.scalar(
-            select(InterviewSession)
-            .options(selectinload(InterviewSession.turns))
-            .where(InterviewSession.id == session_id)
-            .with_for_update()
+            select(InterviewSession).where(InterviewSession.id == session_id).with_for_update()
         )
         if session is None:
             raise HTTPException(404, "InterviewSession not found")
         if session.status != "active":
             raise HTTPException(409, "Interview session is already completed")
-        if not session.turns or any(turn.answer is None for turn in session.turns):
+        turns = list(
+            db.scalars(
+                select(InterviewTurn)
+                .where(InterviewTurn.session_id == session_id)
+                .order_by(InterviewTurn.turn_index)
+            ).all()
+        )
+        if not turns or any(turn.answer is None for turn in turns):
             raise HTTPException(409, "All turns must be answered before completing the session")
-        session.status = "completed"
-        session.completed_at = normalize_utc(clock())
-        db.flush()
+        completed_at = normalize_utc(clock())
+        has_turns = exists(select(1).where(InterviewTurn.session_id == session_id))
+        unanswered_turn = exists(
+            select(1).where(
+                InterviewTurn.session_id == session_id,
+                InterviewTurn.answer.is_(None),
+            )
+        )
+        updated = db.execute(
+            update(InterviewSession)
+            .where(
+                InterviewSession.id == session_id,
+                InterviewSession.status == "active",
+                has_turns,
+                ~unanswered_turn,
+            )
+            .values(status="completed", completed_at=completed_at)
+            .execution_options(synchronize_session=False)
+        )
+        if updated.rowcount != 1:
+            db.rollback()
+            current_session = db.get(InterviewSession, session_id)
+            if current_session is None:
+                raise HTTPException(404, "InterviewSession not found")
+            if current_session.status != "active":
+                raise HTTPException(409, "Interview session is already completed")
+            raise HTTPException(409, "All turns must be answered before completing the session")
+        db.refresh(session)
+        set_committed_value(session, "turns", turns)
         result = InterviewSessionOut.model_validate(session)
         db.commit()
     except Exception:
