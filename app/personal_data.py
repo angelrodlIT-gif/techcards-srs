@@ -79,12 +79,14 @@ def export_personal_data(db: DB, response: Response):
     return {"format_version": 1, "data": tables}
 
 
-def delete_errors(db: Session, condition) -> int:
+def delete_errors(db: Session, condition, *, delete_cards: bool = True) -> int:
     # Approvals lock the error row and create a fresh card in one transaction.
     # RETURNING sees the final link if a concurrent approval committed first.
     card_ids = (
         db.execute(delete(ErrorLog).where(condition).returning(ErrorLog.card_id)).scalars().all()
     )
+    if not delete_cards:
+        return len(card_ids)
     linked_ids = [card_id for card_id in card_ids if card_id is not None]
     for offset in range(0, len(linked_ids), 500):
         db.execute(delete(Card).where(Card.id.in_(linked_ids[offset : offset + 500])))

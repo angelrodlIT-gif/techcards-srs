@@ -58,9 +58,9 @@ Source approvals after migration 0006 record the source ID. Older approvals,
 generated cards from pasted text, and manually assigned labels can lack a
 stored link. Inspect the export and delete their card IDs explicitly when
 needed. Source labels may be shared or edited, so deletion does not infer links
-from matching text. The existing `DELETE /sources/{id}` and
-`DELETE /errors/{id}` routes preserve cards. Use the personal-data routes for
-the linked deletion above.
+from matching text. The standard source and error deletion routes preserve
+cards by default. The error route also accepts `?delete_card=true` for
+linked deletion.
 
 Deletion changes the active database. Previously saved backups and JSON files
 keep their original contents and must be managed separately.

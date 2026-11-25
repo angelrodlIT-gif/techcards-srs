@@ -354,3 +354,5 @@ accounts, no authorization checks, no rate limiting, and no TLS**:
 - **Manual source-to-card curation:** See [Source curation](SOURCES.md) for
   `/sources` draft/edit/approve/discard workflows, URL normalization and `409`
   duplicate handling, privacy warnings, and non-cascading source deletion.
+- **Interview remediation loop & consent/retention:** See [Study Loop, Templates, and Error Log](STUDY_LOOP.md)
+  for `POST /errors/suggest` (requires explicit strict `consent: true`, offline heuristics only, creates a `draft` without auto-creating cards), `POST /errors/{id}/approve` (defaults STAR suggestions to `behavioral`), `GET /study/next?deck_id=<id>&remediation_only=true&kind=<kind>`, `GET /errors/export` (portable JSON snapshot preserving original answers and linked cards), and `DELETE /errors/{id}` (default preserves linked card; `?delete_card=true` atomically hard-deletes both error and linked card). Submitted interview text stays strictly in local loopback PostgreSQL until deleted—never submit confidential, client, or NDA text.

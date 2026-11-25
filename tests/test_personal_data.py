@@ -46,7 +46,7 @@ def test_export_and_selective_deletion(client, set_clock):
         source_label=source["label"],
     )
     review = create(client, "/reviews", card_id=card["id"], quality=4)
-    error = create(client, "/errors", **ERROR)
+    error = create(client, "/errors/suggest", answer=ERROR["attempted"], consent=True)["error"]
     derived = create(client, f"/errors/{error['id']}/approve", deck_id=deck["id"])["card"]
     derived_review = create(client, "/reviews", card_id=derived["id"], quality=5)
 
@@ -60,6 +60,7 @@ def test_export_and_selective_deletion(client, set_clock):
     assert datetime.fromisoformat(data["reviews"][0]["reviewed_at"]) == NOW
     assert data["error_logs"][0]["card_id"] == derived["id"]
     assert data["error_logs"][0]["attempted"] == ERROR["attempted"]
+    assert datetime.fromisoformat(data["error_logs"][0]["created_at"]) == NOW
 
     assert client.delete(f"/personal-data/sources/{source['id']}").status_code == 204
     assert client.get(f"/cards/{card['id']}").status_code == 404
