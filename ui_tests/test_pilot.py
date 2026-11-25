@@ -171,3 +171,31 @@ def test_large_successful_write_in_legacy_browser_cannot_be_repeated(page):
     page.locator("#template-select").select_option("tpl")
     expect(create).to_be_disabled()
     assert requests == [{"deck_id": "1"}]
+
+
+def test_destinations_follow_picker_manual_id_and_invalid_input(page):
+    template = {"id": "tpl", "category": "grammar", "title": "Example"}
+    error = {"id": 8, "status": "draft", "attempted": "a", "corrected": "b", "rationale": "c"}
+    page.route("**/decks", lambda r: r.fulfill(json=[{"id": BIG, "name": "Redes"}]))
+    page.route("**/study/next?*", lambda r: r.fulfill(status=204))
+    page.route("**/templates", lambda r: r.fulfill(json=[template]))
+    page.route("**/templates/tpl", lambda r: r.fulfill(json=template))
+    page.route("**/errors?*", lambda r: r.fulfill(json=[error]))
+    page.goto(f"{ORIGIN}/ui")
+    page.locator("#templates-section summary").click()
+    page.locator("#template-select").select_option("tpl")
+    page.locator("#errors-section summary").click()
+    create = page.locator("#create-from-template-btn")
+    approve = page.get_by_role("button", name="Aprobar y crear tarjeta")
+    for button in (create, approve):
+        expect(button).to_have_accessible_description(f"Destino: Redes (#{BIG})")
+    page.locator("#deck-id").fill(str(BIG + 2))
+    for button in (create, approve):
+        expect(button).to_have_accessible_description(f"Destino: mazo #{BIG + 2}")
+    page.locator("#deck-id").fill("-")
+    for button in (create, approve):
+        expect(button).to_be_disabled()
+    page.locator("#deck-select").select_option(str(BIG))
+    for button in (create, approve):
+        expect(button).to_be_enabled()
+        expect(button).to_have_accessible_description(f"Destino: Redes (#{BIG})")

@@ -6,6 +6,7 @@
     card: null,
     loadSeq: 0,
     deckSeq: 0,
+    decks: new Map(),
     grading: false,
     templatesLoaded: false,
     templateSeq: 0,
@@ -13,7 +14,7 @@
     templateWrites: new Map(),
     errorsLoaded: false,
     errorSeq: 0,
-    pendingErrors: new Set(),
+    pendingErrors: new Map(),
     errorOverrides: new Map(),
     errorRowStatus: new Map(),
   };
@@ -89,6 +90,23 @@
     for (const id of ["deck-select", "deck-id", "load-next-btn", "refresh-decks-btn"]) $(id).disabled = disabled;
   };
 
+  function destinationLabel(deckId) {
+    if (!deckId) return "Destino: selecciona un mazo o escribe un ID válido.";
+    const deck = state.decks.get(deckId);
+    return deck ? `Destino: ${deck.name} (#${deckId})` : `Destino: mazo #${deckId}`;
+  }
+
+  function syncDestinations() {
+    const deckId = deckIdValue();
+    $("template-destination").textContent = destinationLabel(deckId);
+    for (const row of $("errors-list").querySelectorAll("[data-error-id]")) {
+      const id = row.dataset.errorId;
+      row.querySelector(".deck-destination").textContent = destinationLabel(state.pendingErrors.get(id) || deckId);
+      row.querySelector(".approve-error").disabled = !deckId || state.pendingErrors.has(id);
+    }
+    syncTemplateAction();
+  }
+
   function clearAnswer() {
     $("answer-panel").hidden = $("accepted-wrap").hidden = $("explanation-wrap").hidden = true;
     $("card-back").textContent = $("card-explanation").textContent = "";
@@ -101,6 +119,7 @@
     const res = await api("/decks");
     if (seq !== state.deckSeq || state.grading) return;
     if (!res.ok || !Array.isArray(res.data)) return setStatus($("study-status"), res.error, "error");
+    state.decks = new Map(res.data.map((deck) => [deck.id, deck]));
     const select = $("deck-select");
     const current = $("deck-id").value.trim();
     select.replaceChildren(new Option("Elige un mazo", ""));
@@ -109,11 +128,12 @@
       select.value = current;
     } else if (!current && res.data.length > 0) {
       select.value = $("deck-id").value = String(res.data[0].id);
-      syncTemplateAction();
+      syncDestinations();
       await loadNextCard();
     } else if (res.data.length === 0) {
       setStatus($("study-status"), "Aún no hay mazos. Crea uno en la documentación de la API y pulsa «Actualizar mazos».");
     }
+    syncDestinations();
   }
 
   async function loadNextCard(note = "", focusFrom = null) {
@@ -304,6 +324,7 @@
     const pending = state.pendingErrors.has(errId);
     const override = row.querySelector("input");
     for (const ctrl of row.querySelectorAll("input, button")) ctrl.disabled = pending;
+    row.querySelector(".approve-error").disabled = pending || !deckIdValue();
     const statusEl = row.querySelector("p.status");
     if (statusEl) setStatus(statusEl, rowStatus ? rowStatus.text : "", rowStatus ? rowStatus.kind : "");
     if (focusOverride && override && !pending) override.focus();
@@ -337,11 +358,11 @@
       });
       override.style.flex = "1";
       override.addEventListener("input", () => state.errorOverrides.set(err.id, override.value));
-      const approveBtn = el("button", { type: "button", textContent: "Aprobar y crear tarjeta", disabled: pending });
+      const approveBtn = el("button", { type: "button", className: "approve-error", textContent: "Aprobar y crear tarjeta", disabled: pending });
       const discardBtn = el("button", { type: "button", textContent: "Descartar", disabled: pending });
       const runDraftAction = async (path, body, onOk) => {
         if (state.pendingErrors.has(err.id)) return;
-        state.pendingErrors.add(err.id);
+        state.pendingErrors.set(err.id, body?.deck_id || null);
         state.errorRowStatus.delete(err.id);
         syncErrorRow(err.id);
         const res = await post(path, body);
@@ -369,9 +390,12 @@
       discardBtn.addEventListener("click", () =>
         runDraftAction(`/errors/${encodeURIComponent(err.id)}/discard`, undefined, () => `Error #${err.id} descartado.`),
       );
-      wrap.append(el("div", { className: "row" }, override, approveBtn, discardBtn), itemStatus);
+      const destination = el("p", { className: "meta deck-destination", id: `error-destination-${err.id}` });
+      approveBtn.setAttribute("aria-describedby", destination.id);
+      wrap.append(destination, el("div", { className: "row" }, override, approveBtn, discardBtn), itemStatus);
       return wrap;
     }));
+    syncDestinations();
   }
 
   async function createError(event) {
@@ -399,12 +423,12 @@
     if (state.grading) return;
     state.deckSeq++;
     $("deck-id").value = e.target.value;
-    syncTemplateAction();
+    syncDestinations();
     if (e.target.value) loadNextCard();
     else { state.loadSeq++; state.card = null; clearAnswer(); $("study-card").hidden = true; setStatus($("study-status"), ""); }
   });
   $("deck-id").addEventListener("input", () => {
-    syncTemplateAction();
+    syncDestinations();
     state.loadSeq++;
     state.deckSeq++;
     state.card = null;
