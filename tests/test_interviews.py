@@ -1,14 +1,18 @@
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 from alembic import command
 from alembic.config import Config
+from fastapi.testclient import TestClient
 from pydantic import ValidationError
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import create_engine, event, inspect
 from sqlalchemy import text as sa_text
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import Session
 
+import app.main as main_module
 from app.config import get_settings
 from app.interview import (
     NON_BEHAVIORAL_STAR_NOTE,
@@ -18,7 +22,7 @@ from app.interview import (
     get_interview_evaluator,
 )
 from app.main import app
-from app.models import InterviewTurn
+from app.models import InterviewSession, InterviewTurn, Source
 
 
 def create_source(client, label="AWS Support JD", status="draft"):
@@ -558,3 +562,152 @@ def test_interviews_migration_round_trip(tmp_path, monkeypatch):
         engine.dispose()
         monkeypatch.undo()
         get_settings.cache_clear()
+
+
+def test_create_interview_locks_source_and_handles_concurrent_source_delete(
+    client, db_engine, monkeypatch
+):
+    source_id = create_source(client, label="Concurrent JD", status="draft")
+
+    pg_dialect = postgresql.dialect()
+    scalar_queries: list[str] = []
+    real_scalar = Session.scalar
+
+    def record_scalar(self, statement, *args, **kwargs):
+        scalar_queries.append(str(statement.compile(dialect=pg_dialect)).upper())
+        return real_scalar(self, statement, *args, **kwargs)
+
+    monkeypatch.setattr(Session, "scalar", record_scalar)
+    created = client.post("/interviews", json={"role": "cloud_support", "source_id": source_id})
+    assert created.status_code == 201
+    assert any("FROM SOURCES" in sql and "FOR UPDATE" in sql for sql in scalar_queries)
+    monkeypatch.undo()
+
+    # On SQLite (where FOR UPDATE is a no-op), simulate a peer deleting the source between
+    # the source lookup and the session insert: FK IntegrityError must map cleanly to 404.
+    if db_engine.dialect.name == "sqlite":
+        raced_source_id = create_source(client, label="Raced JD", status="draft")
+        real_get_role_track = main_module.get_role_track
+
+        def delete_source_before_insert(role):
+            with Session(db_engine) as peer:
+                peer_source = peer.get(Source, raced_source_id)
+                assert peer_source is not None
+                peer.delete(peer_source)
+                peer.commit()
+            return real_get_role_track(role)
+
+        monkeypatch.setattr(main_module, "get_role_track", delete_source_before_insert)
+        resp = client.post(
+            "/interviews", json={"role": "cloud_support", "source_id": raced_source_id}
+        )
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "Source not found"
+
+        with Session(db_engine) as db:
+            assert (
+                db.query(InterviewSession)
+                .filter(InterviewSession.source_id == raced_source_id)
+                .count()
+                == 0
+            )
+
+
+def test_delete_interview_locks_session_before_deleting_turns(client, db_engine, monkeypatch):
+    session = client.post("/interviews", json={"role": "cloud_support"}).json()
+    sid = session["id"]
+    t1 = session["turns"][0]
+    assert (
+        client.post(
+            f"/interviews/{sid}/turns/{t1['id']}/answer",
+            json={"answer": "Check ALB target health and security groups."},
+        ).status_code
+        == 200
+    )
+
+    pg_dialect = postgresql.dialect()
+    events: list[str] = []
+    real_scalar = Session.scalar
+
+    def record_scalar(self, statement, *args, **kwargs):
+        sql = str(statement.compile(dialect=pg_dialect)).upper()
+        if "FROM INTERVIEW_SESSIONS" in sql and "FOR UPDATE" in sql:
+            events.append("lock_session")
+        return real_scalar(self, statement, *args, **kwargs)
+
+    def on_sql(_conn, _cursor, statement, _params, _context, _executemany):
+        sql = statement.upper()
+        if "DELETE FROM INTERVIEW_TURNS" in sql:
+            events.append("delete_turns")
+        elif "DELETE FROM INTERVIEW_SESSIONS" in sql:
+            events.append("delete_session")
+
+    monkeypatch.setattr(Session, "scalar", record_scalar)
+    event.listen(db_engine, "before_cursor_execute", on_sql)
+    try:
+        resp = client.delete(f"/interviews/{sid}")
+    finally:
+        event.remove(db_engine, "before_cursor_execute", on_sql)
+
+    assert resp.status_code == 204
+    assert events
+    assert events[0] == "lock_session"
+    assert "delete_session" in events
+    with Session(db_engine) as db:
+        assert db.get(InterviewSession, sid) is None
+        assert db.query(InterviewTurn).filter(InterviewTurn.session_id == sid).count() == 0
+
+
+def test_postgres_concurrent_interview_delete_and_create_races(client, db_engine):
+    if db_engine.dialect.name != "postgresql":
+        pytest.skip("PostgreSQL row-level locking test")
+
+    # Concurrent answer + delete must serialize cleanly without deadlocking (no 500).
+    for _ in range(5):
+        session = client.post("/interviews", json={"role": "cloud_support"}).json()
+        sid = session["id"]
+        t1 = session["turns"][0]
+
+        def answer_req(session_id=sid, turn_id=t1["id"]):
+            with TestClient(app, raise_server_exceptions=False) as tc:
+                return tc.post(
+                    f"/interviews/{session_id}/turns/{turn_id}/answer",
+                    json={"answer": "Check logs and health checks."},
+                )
+
+        def delete_req(session_id=sid):
+            with TestClient(app, raise_server_exceptions=False) as tc:
+                return tc.delete(f"/interviews/{session_id}")
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f_ans = pool.submit(answer_req)
+            f_del = pool.submit(delete_req)
+            r_ans, r_del = f_ans.result(timeout=10), f_del.result(timeout=10)
+
+        assert r_del.status_code == 204
+        assert r_ans.status_code in (200, 404)
+        assert client.get(f"/interviews/{sid}").status_code == 404
+
+    # Concurrent create_interview + delete_source must serialize cleanly (201 or 404, never 500).
+    for _ in range(5):
+        source_id = create_source(client, label="PG Race JD", status="draft")
+
+        def create_req(src_id=source_id):
+            with TestClient(app, raise_server_exceptions=False) as tc:
+                return tc.post("/interviews", json={"role": "junior_aws", "source_id": src_id})
+
+        def delete_source_req(src_id=source_id):
+            with TestClient(app, raise_server_exceptions=False) as tc:
+                return tc.delete(f"/sources/{src_id}")
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f_create = pool.submit(create_req)
+            f_del_src = pool.submit(delete_source_req)
+            r_create, r_del_src = f_create.result(timeout=10), f_del_src.result(timeout=10)
+
+        assert r_del_src.status_code == 204
+        assert r_create.status_code in (201, 404)
+        if r_create.status_code == 201:
+            re_read = client.get(f"/interviews/{r_create.json()['id']}")
+            assert re_read.status_code == 200
+            assert re_read.json()["source_id"] is None

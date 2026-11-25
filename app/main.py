@@ -558,7 +558,11 @@ def create_interview(payload: InterviewSessionCreate, db: DB, clock: Clock):
     try:
         source_label: str | None = None
         if payload.source_id is not None:
-            source = require(db, Source, payload.source_id)
+            source = db.scalar(
+                select(Source).where(Source.id == payload.source_id).with_for_update()
+            )
+            if source is None:
+                raise HTTPException(404, "Source not found")
             if source.status == "discarded":
                 raise HTTPException(409, "Cannot use a discarded source for an interview session")
             source_label = source.label
@@ -586,6 +590,11 @@ def create_interview(payload: InterviewSessionCreate, db: DB, clock: Clock):
         db.flush()
         result = InterviewSessionOut.model_validate(session)
         db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        if payload.source_id is not None and db.get(Source, payload.source_id) is None:
+            raise HTTPException(404, "Source not found") from exc
+        raise
     except Exception:
         db.rollback()
         raise
@@ -746,6 +755,15 @@ def complete_interview(session_id: int, db: DB, clock: Clock):
 
 @app.delete("/interviews/{session_id}", status_code=204)
 def delete_interview(session_id: int, db: DB):
-    db.delete(require(db, InterviewSession, session_id))
-    db.commit()
+    try:
+        session = db.scalar(
+            select(InterviewSession).where(InterviewSession.id == session_id).with_for_update()
+        )
+        if session is None:
+            raise HTTPException(404, "InterviewSession not found")
+        db.delete(session)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     return Response(status_code=204)
