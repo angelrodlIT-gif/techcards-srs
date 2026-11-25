@@ -292,3 +292,73 @@ def test_uncertain_template_write_stays_locked_for_its_destination(page):
     expect(create).to_be_enabled()
     page.locator("#deck-id").fill("1")
     expect(create).to_be_disabled()
+
+
+@pytest.mark.parametrize("outcome", ["lost", "unreadable", "confirmed"])
+def test_grade_refreshes_without_repeating_the_same_due_review(page, outcome):
+    posts = []
+    card = prompt()
+
+    def grade(route):
+        posts.append(route.request.post_data_json)
+        if outcome == "lost":
+            route.abort()
+        elif outcome == "unreadable":
+            route.fulfill(status=201, body="{")
+        else:
+            route.fulfill(status=201, json={"due_date": "2026-11-26", "interval_days": 1})
+
+    page.route("**/decks?*", lambda r: r.fulfill(json=[{"id": BIG, "name": "First"}]))
+    page.route("**/study/next?*", lambda r: r.fulfill(json=card))
+    page.route("**/reveal", lambda r: r.fulfill(json={"back": "Answer"}))
+    page.route("**/grade", grade)
+    page.goto(f"{ORIGIN}/ui")
+    page.locator("#reveal-btn").click()
+    with page.expect_request("**/study/next?*", timeout=3000):
+        page.locator('[data-quality="4"]').click()
+    expect(page.locator("#study-status")).to_contain_text("Este repaso está bloqueado")
+    expect(page.locator("#study-card")).to_be_hidden()
+    if outcome != "confirmed":
+        expect(page.locator("#study-status")).to_contain_text("No se pudo confirmar")
+    page.locator("#load-next-btn").click()
+    expect(page.locator("#study-card")).to_be_hidden()
+    # The same card is eligible again for its next scheduled occurrence.
+    card["due_date"] = "2026-11-26"
+    page.locator("#load-next-btn").click()
+    page.locator("#reveal-btn").click()
+    expect(page.locator('[data-quality="4"]')).to_be_enabled()
+    assert posts == [{"quality": 4}]
+
+
+@pytest.mark.parametrize("outcome", ["lost", "unreadable", "confirmed"])
+def test_draft_refreshes_and_locks_only_the_same_contents(page, outcome):
+    posts = []
+    draft = {"attempted": "a", "corrected": "b", "rationale": "c"}
+
+    def create(route):
+        posts.append(route.request.post_data_json)
+        if outcome == "lost":
+            route.abort()
+        elif outcome == "unreadable":
+            route.fulfill(status=201, body="{")
+        else:
+            route.fulfill(status=201, json={"id": BIG})
+
+    page.route("**/decks?*", lambda r: r.fulfill(json=[]))
+    page.route("**/errors?*", lambda r: r.fulfill(json=[]))
+    page.route("**/errors", create)
+    page.goto(f"{ORIGIN}/ui")
+    page.locator("#errors-section summary").click()
+    expect(page.locator("#errors-status")).to_contain_text("Errores encontrados")
+    for field, value in draft.items():
+        page.locator(f"#err-{field}").fill(value)
+    submit = page.get_by_role("button", name="Guardar borrador")
+    with page.expect_request("**/errors?*", timeout=3000):
+        submit.click()
+    for field, value in draft.items():
+        page.locator(f"#err-{field}").fill(value + " ")
+    expect(submit).to_be_disabled()
+    page.locator("#error-form").evaluate("(form) => form.requestSubmit()")
+    page.locator("#err-rationale").fill("Different reason")
+    expect(submit).to_be_enabled()
+    assert posts == [draft]
