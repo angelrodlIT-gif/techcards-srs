@@ -136,3 +136,38 @@ def test_edit_deck_during_reveal(page):
         inflight[0].fulfill(json={"back": "Old answer"})
     expect(page.locator("#card-back")).to_be_empty()
     expect(page.locator("#study-card")).to_be_hidden()
+
+
+def test_large_successful_write_in_legacy_browser_cannot_be_repeated(page):
+    # Older engines call revivers with only the key and already-rounded value.
+    page.add_init_script("""{
+      const parse = JSON.parse;
+      JSON.parse = (raw, reviver) => parse(raw, reviver && function(key, value) {
+        return reviver.call(this, key, value);
+      });
+    }""")
+    requests = []
+    title = 'Practice "id": 9007199254740993, including a literal backslash: \\'
+    template = {"id": "tpl", "category": "grammar", "title": title}
+
+    def created(route):
+        requests.append(route.request.post_data_json)
+        route.fulfill(status=201, json={"id": BIG, "front": title})
+
+    page.route("**/decks", lambda r: r.fulfill(json=[{"id": 1, "name": "First"}]))
+    page.route("**/study/next?*", lambda r: r.fulfill(status=204))
+    page.route("**/templates", lambda r: r.fulfill(json=[template]))
+    page.route("**/templates/tpl", lambda r: r.fulfill(json=template))
+    page.route("**/templates/tpl/cards", created)
+    page.goto(f"{ORIGIN}/ui")
+    page.locator("#templates-section summary").click()
+    page.locator("#template-select").select_option("tpl")
+    expect(page.locator("#tpl-title")).to_have_text(title)
+    create = page.locator("#create-from-template-btn")
+    create.click()
+    expect(page.locator("#templates-status")).to_contain_text(f"Tarjeta #{BIG} creada")
+    expect(create).to_be_disabled()
+    page.locator("#template-select").select_option("")
+    page.locator("#template-select").select_option("tpl")
+    expect(create).to_be_disabled()
+    assert requests == [{"deck_id": "1"}]
