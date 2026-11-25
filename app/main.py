@@ -1,5 +1,5 @@
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Response
@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session, contains_eager, joinedload, selectinload
 
 from app.db import get_db
 from app.generator import CardGenerator, get_generator
+from app.learning import LearningSummary, summarize_learning
 from app.models import Card, Deck, ErrorLog, Review, Source
 from app.remediation import STAR_PREFIX, build_remediation_draft
 from app.schemas import (
@@ -240,6 +241,13 @@ def record_review(
 @app.post("/reviews", response_model=ReviewOut, status_code=201)
 def create_review(payload: ReviewInput, db: DB, clock: Clock):
     return record_review(db, payload.card_id, payload.quality, clock)
+
+
+@app.get("/analytics/learning", response_model=LearningSummary)
+def learning_summary(db: DB, start: date | None = None, end: date | None = None):
+    if start is not None and end is not None and start > end:
+        raise HTTPException(422, "start must be on or before end")
+    return summarize_learning(db, start, end)
 
 
 @app.get(

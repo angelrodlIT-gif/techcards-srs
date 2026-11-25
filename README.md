@@ -128,7 +128,8 @@ PostgreSQL credentials; restore the original settings or intentionally reset dis
 `/health` checks the API process only, not database connectivity.
 
 AWS (ECS or Lambda, RDS, S3, Polly, CloudWatch), Terraform, GitHub Actions deployment,
-FSRS and data/retention analytics are documented future phases, not implemented features.
+The [learning summary](docs/LEARNING_EVENTS.md) reports observed review and
+error-correction counts. FSRS and longitudinal retention analysis remain future phases.
 No adoption, retention or business impact metrics have been measured.
 
 MIT licensed. SM-2 scheduling follows the [original algorithm](https://super-memory.org/english/ol/sm2.htm),

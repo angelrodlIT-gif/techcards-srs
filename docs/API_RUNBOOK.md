@@ -228,6 +228,13 @@ curl -i http://127.0.0.1:8000/decks/1/due
   `GET /cards/{card_id}` first. See
   [Review transactions and retry semantics](MVP.md#review-transactions-and-retry-semantics).
 
+### Learning summary
+
+`GET /analytics/learning` returns aggregate counts and data-quality flags from
+stored reviews and error logs. `start` and `end` are optional inclusive
+`America/Cancun` calendar dates. See [Learning Event Semantics](LEARNING_EVENTS.md)
+for the denominators, timing limits, and baseline procedure.
+
 ### Common error responses
 
 - `404 Not Found`: nonexistent deck or card ID — e.g. `{"detail":"Card not found"}`
