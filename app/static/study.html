@@ -41,7 +41,7 @@
         <label for="deck-select">Deck</label>
         <select id="deck-select" aria-label="Select deck"><option value="">-- Choose a deck --</option></select>
         <label for="deck-id">ID</label>
-        <input id="deck-id" type="number" min="1" step="1" placeholder="Deck ID" style="width:6rem;">
+        <input id="deck-id" type="text" inputmode="numeric" pattern="[1-9][0-9]*" placeholder="Deck ID" style="width:6rem;">
         <button id="load-next-btn" type="button">Load next card</button>
         <button id="refresh-decks-btn" type="button">Refresh decks</button>
       </div>

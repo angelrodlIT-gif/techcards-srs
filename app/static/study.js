@@ -33,6 +33,17 @@
     node.className = kind ? `status ${kind}` : "status";
   }
 
+  // The API emits integer IDs. Recover their decimal tokens before a rounded
+  // Number can enter UI state; older engines may only use safe integers.
+  function readId(key, value, context) {
+    if ((key === "id" || key.endsWith("_id")) && typeof value === "number") {
+      if (context?.source && /^[1-9]\d*$/.test(context.source)) return context.source;
+      if (Number.isSafeInteger(value) && value > 0) return String(value);
+      throw new RangeError("Cannot read this ID exactly. Update your browser.");
+    }
+    return value;
+  }
+
   async function api(path, options = {}) {
     try {
       const headers = options.body ? { "Content-Type": "application/json" } : {};
@@ -40,7 +51,12 @@
       const raw = res.status === 204 ? "" : await res.text();
       let data = null;
       if (raw) {
-        try { data = JSON.parse(raw); } catch { data = { detail: raw }; }
+        try {
+          data = JSON.parse(raw, readId);
+        } catch (err) {
+          if (res.ok) return { ok: false, status: res.status, error: err instanceof RangeError ? err.message : "Invalid API response." };
+          data = { detail: raw };
+        }
       }
       const d = data?.detail;
       const error = res.ok
@@ -57,7 +73,7 @@
   const post = (path, body) =>
     api(path, body === undefined ? { method: "POST" } : { method: "POST", body: JSON.stringify(body) });
 
-  const deckIdValue = () => (/^[1-9]\d*$/.test($("deck-id").value.trim()) ? Number($("deck-id").value.trim()) : null);
+  const deckIdValue = () => (/^[1-9]\d*$/.test($("deck-id").value.trim()) ? $("deck-id").value.trim() : null);
   const fillList = (ul, items) => ul.replaceChildren(...items.map((text) => el("li", { textContent: text })));
   const setGradeDisabled = (disabled) =>
     $("grade-controls").querySelectorAll("button[data-quality]").forEach((btn) => { btn.disabled = disabled; });
