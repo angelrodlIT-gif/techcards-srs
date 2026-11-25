@@ -74,7 +74,7 @@ shell state):
    container, volume, or network already exists before claiming ownership or
    running startup/cleanup.
 2. Starts the disposable source PostgreSQL 16 database, runs `alembic upgrade
-   head`, and seeds disposable `decks`, `cards`, and `reviews`.
+   head`, and seeds disposable decks, cards, reviews, error logs, and sources.
 3. Creates a private `0700` temporary directory (`umask 077`, `mktemp -d`) and
    an exclusive `0600` regular dump file (`mktemp`), refusing non-regular targets
    (such as FIFOs or symlinks), and writes a `pg_dump --format=custom` backup.
@@ -87,6 +87,8 @@ shell state):
    - Exact source/target counts (`decks=2`, `cards=4`, `reviews=5`).
    - Foreign-key relationships (3-table inner join `reviews -> cards -> decks`
      matches `5`; `0` orphan cards; `0` orphan reviews; per-deck counts match).
+   - Personal JSON export equality before backup and after restore, including
+     source and error-log links and unknown creation times.
    - Sequence and FK/check-constraint integrity via a rolled-back probe insert.
    - Alembic parity (`alembic current` at `0001 (head)` and `alembic check`
      reporting no schema drift).
@@ -98,11 +100,12 @@ shell state):
 A passing run prints:
 
 - `Source summary (decks|cards|reviews|joined_reviews|orphan_cards|orphan_reviews): 2|4|5|5|0|0`
-- `Dump created (43 TOC entries).`
+- `Dump created` with a non-empty TOC.
 - `Target summary (decks|cards|reviews|joined_reviews|orphan_cards|orphan_reviews): 2|4|5|5|0|0`
 - Per-deck breakdown: `1|Cloud Interviews|2|3` and `2|Python Backend|2|2`
 - `Sequence and FK/check-constraint probe passed (rolled back).`
-- `Restored Alembic revision: 0001 (head)` and `No new upgrade operations detected.`
+- `Personal JSON exports match before backup and after restore.`
+- `Restored Alembic revision: 0006 (head)` and `No new upgrade operations detected.`
 - `==> Disposable backup/restore verification PASSED.` followed by cleanup lines
   for both owned disposable stacks.
 

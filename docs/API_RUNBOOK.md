@@ -10,6 +10,9 @@ current codebase (`app/main.py`, `app/models.py`, `app/schemas.py`, `app/sm2.py`
 `app/generator.py`, `compose.yaml`) and a disposable PostgreSQL 16 + FastAPI
 Compose stack.
 
+For portable exports, linked deletion, and retention, see
+[Personal data controls](PERSONAL_DATA.md).
+
 ## Repeatable clean-install checklist
 
 Use this checklist to bring up a fresh local stack (Linux, macOS, or Windows

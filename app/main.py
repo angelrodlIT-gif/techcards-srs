@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session, selectinload
 from app.db import get_db
 from app.generator import CardGenerator, get_generator
 from app.models import Card, Deck, ErrorLog, Review, Source
+from app.personal_data import router as personal_data_router
 from app.schemas import (
     CardInput,
     CardOut,
@@ -54,6 +55,7 @@ def normalize_utc(value: datetime) -> datetime:
 
 
 app = FastAPI(title="TechCards SRS", version="0.1.0")
+app.include_router(personal_data_router)
 DB = Annotated[Session, Depends(get_db)]
 Generator = Annotated[CardGenerator, Depends(get_generator)]
 Clock = Annotated[Callable[[], datetime], Depends(get_clock)]
@@ -428,6 +430,7 @@ def approve_source(source_id: int, payload: SourceApproveInput, db: DB, clock: C
             back=payload.back,
             kind=payload.kind,
             source_label=source.label,
+            source_id=source.id,
             accepted_answers=payload.accepted_answers,
             explanation=payload.explanation,
             due_date=today,
@@ -447,8 +450,10 @@ def approve_source(source_id: int, payload: SourceApproveInput, db: DB, clock: C
 
 
 @app.post("/errors", response_model=ErrorLogOut, status_code=201)
-def create_error(payload: ErrorLogInput, db: DB):
-    return save(db, ErrorLog(**payload.model_dump(), status="draft"))
+def create_error(payload: ErrorLogInput, db: DB, clock: Clock):
+    return save(
+        db, ErrorLog(**payload.model_dump(), status="draft", created_at=normalize_utc(clock()))
+    )
 
 
 @app.get("/errors", response_model=list[ErrorLogOut])

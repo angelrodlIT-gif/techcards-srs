@@ -168,17 +168,24 @@ echo "==> Building and running Alembic migrations on disposable source..."
 compose_src build migrate >/dev/null
 compose_src run --rm migrate
 
-echo "==> Seeding disposable decks, cards, and reviews..."
+echo "==> Seeding disposable personal data..."
 compose_src exec -T db psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<'SQL'
 INSERT INTO decks (name, description) VALUES
   ('Cloud Interviews', 'Disposable AWS & Linux vocabulary'),
   ('Python Backend', 'Disposable FastAPI & PostgreSQL practice');
+
+INSERT INTO sources (label, excerpt, status) VALUES ('Disposable source', 'Example excerpt', 'approved');
 
 INSERT INTO cards (deck_id, front, back, kind, repetitions, interval_days, ease_factor, due_date) VALUES
   (1, 'rule out', 'eliminate a possible root cause during troubleshooting', 'vocabulary', 2, 6, 2.6, DATE '2026-11-28'),
   (1, 'walk through an outage', 'explain incident timeline, impact, and mitigation', 'interview_phrase', 1, 1, 2.5, DATE '2026-11-23'),
   (2, 'idempotent endpoint', 'safe to retry without duplicating side effects', 'vocabulary', 3, 15, 2.6, DATE '2026-12-07'),
   (2, 'SELECT ... FOR UPDATE', 'row-level lock that serializes concurrent updates', 'vocabulary', 0, 0, 2.5, DATE '2026-11-22');
+
+UPDATE cards SET source_id = 1, source_label = 'Disposable source' WHERE id = 1;
+INSERT INTO error_logs (attempted, corrected, rationale, status, card_id, created_at) VALUES
+  ('Example error', 'Example correction', 'Example rationale', 'approved', 2, TIMESTAMPTZ '2026-11-20T14:00:00Z'),
+  ('Legacy example', 'Legacy correction', 'Unknown creation time', 'draft', NULL, NULL);
 
 INSERT INTO reviews (card_id, quality, reviewed_at, interval_days, ease_factor, repetitions, due_date) VALUES
   (1, 4, TIMESTAMPTZ '2026-11-20T14:00:00Z', 1, 2.5, 1, DATE '2026-11-21'),
@@ -202,6 +209,23 @@ GROUP BY d.id, d.name ORDER BY d.id;"
 SRC_SUMMARY="$(compose_src exec -T db psql -At -F '|' -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "$SUMMARY_SQL")"
 SRC_BREAKDOWN="$(compose_src exec -T db psql -At -F '|' -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "$BREAKDOWN_SQL")"
 echo "Source summary (decks|cards|reviews|joined_reviews|orphan_cards|orphan_reviews): ${SRC_SUMMARY}"
+
+capture_personal_export() {
+  "$1" run --rm --no-deps -T migrate python -c '
+import json
+from fastapi import Response
+from fastapi.encoders import jsonable_encoder
+from sqlalchemy.orm import Session
+from app.db import get_engine
+from app.personal_data import export_personal_data
+
+with Session(get_engine()) as session:
+    export = export_personal_data(session, Response())
+print(json.dumps(jsonable_encoder(export), sort_keys=True))
+'
+}
+
+capture_personal_export compose_src > "${DUMP_DIR}/source.json"
 
 echo "==> Dumping disposable source with pg_dump --format=custom..."
 DUMP_FILE="$(mktemp "${DUMP_DIR}/disposable-${RUN_ID}-XXXXXX")"
@@ -242,6 +266,14 @@ fi
 echo "Per-deck breakdown (id|name|cards|reviews):"
 echo "$DST_BREAKDOWN"
 
+compose_dst build migrate >/dev/null
+capture_personal_export compose_dst > "${DUMP_DIR}/restored.json"
+if ! cmp -s "${DUMP_DIR}/source.json" "${DUMP_DIR}/restored.json"; then
+  echo "ERROR: Personal data exports differ after restore." >&2
+  exit 1
+fi
+echo "Personal JSON exports match before backup and after restore."
+
 compose_dst exec -T db psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<'SQL' >/dev/null
 BEGIN;
 WITH new_deck AS (INSERT INTO decks (name, description) VALUES ('Probe Deck', 'Rolled back') RETURNING id),
@@ -255,7 +287,6 @@ ROLLBACK;
 SQL
 echo "Sequence and FK/check-constraint probe passed (rolled back)."
 
-compose_dst build migrate >/dev/null
 ALEMBIC_CURRENT="$(compose_dst run --rm migrate alembic current | tr -d '\r')"
 echo "Restored Alembic revision: ${ALEMBIC_CURRENT}"
 if [[ "$ALEMBIC_CURRENT" != *"(head)"* ]]; then

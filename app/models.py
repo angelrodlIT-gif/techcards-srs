@@ -27,6 +27,9 @@ class Card(Base):
     back: Mapped[str] = mapped_column(Text)
     kind: Mapped[str] = mapped_column(String(30), default="vocabulary")
     source_label: Mapped[str | None] = mapped_column(String(255), nullable=True, default=None)
+    source_id: Mapped[int | None] = mapped_column(
+        ForeignKey("sources.id", name="fk_cards_source_id", ondelete="SET NULL"), index=True
+    )
     accepted_answers: Mapped[list[str] | None] = mapped_column(JSON, nullable=True, default=list)
     explanation: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
     repetitions: Mapped[int] = mapped_column(default=0)
@@ -91,6 +94,7 @@ class ErrorLog(Base):
     attempted: Mapped[str] = mapped_column(Text)
     corrected: Mapped[str] = mapped_column(Text)
     rationale: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(String(20), default="draft")
     card_id: Mapped[int | None] = mapped_column(
         ForeignKey("cards.id", ondelete="SET NULL"), nullable=True, default=None
