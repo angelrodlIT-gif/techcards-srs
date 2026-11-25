@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="en">
+<html lang="es">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>TechCards SRS — Local Study</title>
+  <title>TechCards SRS — Estudio local</title>
   <style>
     :root { color-scheme: light; background: #fff; color: #000; font-family: system-ui, Ubuntu, sans-serif; line-height: 1.5; }
     body { max-width: 48rem; margin: 1.5rem auto; padding: 0 1rem 3rem; }
@@ -26,87 +26,96 @@
     .status.error { color: #c62828; }
     .status.ok { color: #2e7d32; }
     .item { border-top: 1px solid #dfdfdf; padding-top: 0.7rem; margin-top: 0.7rem; overflow-wrap: anywhere; }
+    :focus-visible { outline: 3px solid #195a9a; outline-offset: 2px; }
+    header { gap: 1rem; }
+    @media (max-width: 34rem) {
+      #deck-heading + .row { display: grid; align-items: stretch; }
+      #deck-id, #deck-select { width: 100%; min-width: 0; }
+      #grade-controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      button, input, select { min-height: 44px; }
+    }
   </style>
 </head>
 <body>
   <header>
-    <div><h1>TechCards SRS</h1><span class="meta">Local loopback study loop</span></div>
-    <a href="/docs">API docs</a>
+    <div><h1>TechCards SRS</h1><span class="meta">Repaso local</span></div>
+    <a href="/docs">Documentación de la API</a>
   </header>
 
   <main>
     <section aria-labelledby="deck-heading">
-      <h2 id="deck-heading">Deck</h2>
+      <h2 id="deck-heading">Mazo</h2>
       <div class="row">
-        <label for="deck-select">Deck</label>
-        <select id="deck-select" aria-label="Select deck"><option value="">-- Choose a deck --</option></select>
-        <label for="deck-id">ID</label>
-        <input id="deck-id" type="text" inputmode="numeric" pattern="[1-9][0-9]*" placeholder="Deck ID" style="width:6rem;">
-        <button id="load-next-btn" type="button">Load next card</button>
-        <button id="refresh-decks-btn" type="button">Refresh decks</button>
+        <label for="deck-select">Mazo</label>
+        <select id="deck-select" aria-label="Seleccionar mazo"><option value="">Elige un mazo</option></select>
+        <label for="deck-id">ID del mazo</label>
+        <input id="deck-id" type="text" inputmode="numeric" pattern="[1-9][0-9]*" placeholder="ID del mazo" size="19">
+        <button id="load-next-btn" type="button">Cargar siguiente tarjeta</button>
+        <button id="refresh-decks-btn" type="button">Actualizar mazos</button>
       </div>
       <p id="study-status" class="status" role="status" aria-live="polite"></p>
     </section>
 
     <section id="study-card" hidden aria-labelledby="card-heading">
-      <h2 id="card-heading">Current card</h2>
+      <h2 id="card-heading" tabindex="-1">Tarjeta actual</h2>
       <p id="card-meta" class="meta"></p>
       <div id="card-front" class="box"></div>
-      <div class="row"><button id="reveal-btn" type="button">Reveal answer</button></div>
+      <div class="row"><button id="reveal-btn" aria-keyshortcuts="R" type="button">Mostrar respuesta</button></div>
 
       <div id="answer-panel" hidden>
-        <strong class="meta">Answer</strong>
-        <div id="card-back" class="box"></div>
-        <div id="accepted-wrap" hidden><strong class="meta">Accepted answers</strong><ul id="card-accepted"></ul></div>
-        <div id="explanation-wrap" hidden><strong class="meta">Explanation</strong><p id="card-explanation" class="box"></p></div>
+        <strong class="meta">Respuesta</strong>
+        <div id="card-back" class="box" tabindex="-1" role="group" aria-label="Respuesta"></div>
+        <div id="accepted-wrap" hidden><strong class="meta">Respuestas aceptadas</strong><ul id="card-accepted"></ul></div>
+        <div id="explanation-wrap" hidden><strong class="meta">Explicación</strong><p id="card-explanation" class="box"></p></div>
       </div>
 
-      <div id="grade-controls" class="row" role="group" aria-label="Grade recall quality 0 to 5">
-        <button type="button" data-quality="0" aria-label="Grade 0: Complete blackout">0 Blackout</button>
-        <button type="button" data-quality="1" aria-label="Grade 1: Incorrect">1 Wrong</button>
-        <button type="button" data-quality="2" aria-label="Grade 2: Incorrect, felt familiar">2 Familiar</button>
-        <button type="button" data-quality="3" aria-label="Grade 3: Correct with difficulty">3 Hard</button>
-        <button type="button" data-quality="4" aria-label="Grade 4: Correct with hesitation">4 Good</button>
-        <button type="button" data-quality="5" aria-label="Grade 5: Easy, confident recall">5 Easy</button>
+      <p class="meta">Con el foco en la tarjeta, pulsa R para mostrar la respuesta y del 0 al 5 para calificar.</p>
+      <div id="grade-controls" class="row" role="group" aria-label="Califica tu recuerdo del 0 al 5">
+        <button type="button" data-quality="0" aria-keyshortcuts="0" aria-label="0: No recordé nada">0 · En blanco</button>
+        <button type="button" data-quality="1" aria-keyshortcuts="1" aria-label="1: Respuesta incorrecta">1 · Incorrecta</button>
+        <button type="button" data-quality="2" aria-keyshortcuts="2" aria-label="2: Incorrecta, pero me resultó familiar">2 · Familiar</button>
+        <button type="button" data-quality="3" aria-keyshortcuts="3" aria-label="3: Correcta con dificultad">3 · Difícil</button>
+        <button type="button" data-quality="4" aria-keyshortcuts="4" aria-label="4: Correcta con alguna duda">4 · Bien</button>
+        <button type="button" data-quality="5" aria-keyshortcuts="5" aria-label="5: Correcta sin esfuerzo">5 · Fácil</button>
       </div>
     </section>
 
     <details id="templates-section">
-      <summary>Templates (optional)</summary>
+      <summary>Plantillas</summary>
       <div class="row">
-        <label for="template-select">Template</label>
-        <select id="template-select" aria-label="Select template"><option value="">-- Choose a template --</option></select>
-        <button id="load-templates-btn" type="button">Reload templates</button>
+        <label for="template-select">Plantilla</label>
+        <select id="template-select" aria-label="Seleccionar plantilla"><option value="">Elige una plantilla</option></select>
+        <button id="load-templates-btn" type="button">Actualizar plantillas</button>
       </div>
       <p id="templates-status" class="status" role="status" aria-live="polite"></p>
       <div id="template-detail" hidden class="item">
         <strong id="tpl-title"></strong> <span id="tpl-meta" class="meta"></span>
         <div id="tpl-front" class="box"></div>
         <div id="tpl-back" class="box"></div>
-        <div id="tpl-followups-wrap" hidden><strong class="meta">Follow-up questions</strong><ul id="tpl-followups"></ul></div>
+        <div id="tpl-followups-wrap" hidden><strong class="meta">Preguntas de seguimiento</strong><ul id="tpl-followups"></ul></div>
         <p id="tpl-explanation" class="meta" hidden></p>
-        <button id="create-from-template-btn" type="button">Create card in selected deck</button>
+        <button id="create-from-template-btn" type="button">Crear tarjeta en el mazo seleccionado</button>
       </div>
     </details>
 
     <details id="errors-section">
-      <summary>Error log (optional)</summary>
+      <summary>Registro de errores</summary>
       <form id="error-form" class="field">
-        <label for="err-attempted">Attempted wording</label>
-        <textarea id="err-attempted" required placeholder="Original wording to improve"></textarea>
-        <label for="err-corrected">Corrected wording</label>
-        <textarea id="err-corrected" required placeholder="Improved wording"></textarea>
-        <label for="err-rationale">Rationale</label>
-        <textarea id="err-rationale" required placeholder="Why the correction is better"></textarea>
-        <div class="row"><button type="submit">Log draft error</button></div>
+        <label for="err-attempted">Texto original</label>
+        <textarea id="err-attempted" required placeholder="Escribe el texto que quieres mejorar"></textarea>
+        <label for="err-corrected">Texto corregido</label>
+        <textarea id="err-corrected" required placeholder="Escribe la corrección"></textarea>
+        <label for="err-rationale">Motivo</label>
+        <textarea id="err-rationale" required placeholder="Explica el motivo del cambio"></textarea>
+        <div class="row"><button type="submit">Guardar borrador</button></div>
       </form>
       <div class="row">
-        <label for="error-filter">Status</label>
-        <select id="error-filter" aria-label="Filter errors by status">
-          <option value="draft">Draft</option><option value="">All</option>
-          <option value="approved">Approved</option><option value="discarded">Discarded</option>
+        <label for="error-filter">Estado</label>
+        <select id="error-filter" aria-label="Filtrar errores por estado">
+          <option value="draft">Borradores</option><option value="">Todos</option>
+          <option value="approved">Aprobados</option><option value="discarded">Descartados</option>
         </select>
-        <button id="load-errors-btn" type="button">Refresh errors</button>
+        <button id="load-errors-btn" type="button">Actualizar errores</button>
       </div>
       <p id="errors-status" class="status" role="status" aria-live="polite"></p>
       <div id="errors-list"></div>

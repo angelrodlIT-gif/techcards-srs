@@ -39,7 +39,7 @@
     if ((key === "id" || key.endsWith("_id")) && typeof value === "number") {
       if (context?.source && /^[1-9]\d*$/.test(context.source)) return context.source;
       if (Number.isSafeInteger(value) && value > 0) return String(value);
-      throw new RangeError("Cannot read this ID exactly. Update your browser.");
+      throw new RangeError("Actualiza el navegador para leer este ID con precisión.");
     }
     return value;
   }
@@ -54,7 +54,7 @@
         try {
           data = JSON.parse(raw, readId);
         } catch (err) {
-          if (res.ok) return { ok: false, status: res.status, error: err instanceof RangeError ? err.message : "Invalid API response." };
+          if (res.ok) return { ok: false, status: res.status, error: err instanceof RangeError ? err.message : "La API devolvió una respuesta no válida." };
           data = { detail: raw };
         }
       }
@@ -66,7 +66,7 @@
           : Array.isArray(d) ? d.map((x) => x.msg || String(x)).join("; ") : `HTTP ${res.status}`;
       return { ok: res.ok, status: res.status, data, error };
     } catch {
-      return { ok: false, status: 0, data: null, error: "Network error reaching local API." };
+      return { ok: false, status: 0, data: null, error: "No se pudo conectar con la API local. Comprueba la conexión y vuelve a intentarlo." };
     }
   }
 
@@ -95,7 +95,7 @@
     if (!res.ok || !Array.isArray(res.data)) return setStatus($("study-status"), res.error, "error");
     const select = $("deck-select");
     const current = $("deck-id").value.trim();
-    select.replaceChildren(new Option("-- Choose a deck --", ""));
+    select.replaceChildren(new Option("Elige un mazo", ""));
     for (const d of res.data) select.append(new Option(`#${d.id} — ${d.name}`, String(d.id)));
     if (current && res.data.some((d) => String(d.id) === current)) {
       select.value = current;
@@ -103,11 +103,11 @@
       select.value = $("deck-id").value = String(res.data[0].id);
       await loadNextCard();
     } else if (res.data.length === 0) {
-      setStatus($("study-status"), "No decks found yet. Create a deck via /docs, then refresh.");
+      setStatus($("study-status"), "Aún no hay mazos. Crea uno en la documentación de la API y pulsa «Actualizar mazos».");
     }
   }
 
-  async function loadNextCard(note = "") {
+  async function loadNextCard(note = "", focusFrom = null) {
     if (state.grading) return;
     const status = $("study-status");
     const deckId = deckIdValue();
@@ -116,7 +116,7 @@
       state.card = null;
       clearAnswer();
       $("study-card").hidden = true;
-      return setStatus(status, "Enter or select a valid positive Deck ID.", "error");
+      return setStatus(status, "Selecciona un mazo o escribe un ID entero mayor que cero.", "error");
     }
     const select = $("deck-select");
     select.value = [...select.options].some((o) => o.value === String(deckId)) ? String(deckId) : "";
@@ -124,38 +124,43 @@
     state.card = null;
     clearAnswer();
     $("study-card").hidden = true;
-    setStatus(status, note ? `${note} Loading next card...` : "Loading next card...");
+    setStatus(status, note ? `${note} Cargando tarjeta…` : "Cargando tarjeta…");
 
     const res = await api(`/study/next?deck_id=${encodeURIComponent(deckId)}`);
     if (seq !== state.loadSeq || state.grading) return;
+    const restoreFocus = focusFrom && document.activeElement === focusFrom;
+    if (restoreFocus) $("load-next-btn").focus();
     if (res.status === 204) {
-      return setStatus(status, note ? `${note} No due cards left.` : "No due cards left in this deck.", "ok");
+      return setStatus(status, note ? `${note} Terminaste las tarjetas pendientes.` : "Estás al día con este mazo. Puedes elegir otro o añadir una tarjeta desde Plantillas.", "ok");
     }
-    if (res.status === 404) return setStatus(status, `Deck #${deckId} not found.`, "error");
+    if (res.status === 404) return setStatus(status, `No se encontró el mazo #${deckId}.`, "error");
     if (!res.ok || !res.data) return setStatus(status, res.error, "error");
 
     const c = res.data;
     state.card = c;
     $("card-meta").textContent = [
-      `Card #${c.card_id}`, c.kind, c.source_label ? `source: ${c.source_label}` : null,
-      `due: ${c.due_date}`, `reps: ${c.repetitions}`, `interval: ${c.interval_days}d`, `ease: ${c.ease_factor}`,
+      `Tarjeta #${c.card_id}`, c.kind, c.source_label ? `fuente: ${c.source_label}` : null,
+      `fecha de repaso: ${c.due_date}`, `repasos: ${c.repetitions}`, `intervalo: ${c.interval_days}d`, `facilidad: ${c.ease_factor}`,
     ].filter(Boolean).join(" · ");
     $("card-front").textContent = c.front;
     $("reveal-btn").disabled = false;
     setGradeDisabled(true);
     $("study-card").hidden = false;
+    if (restoreFocus) $("reveal-btn").focus();
     setStatus(status, note, note ? "ok" : "");
   }
 
   async function revealCard() {
-    if (!state.card || state.grading) return;
+    if (!state.card || state.grading || $("reveal-btn").disabled) return;
     const cardId = state.card.card_id;
     const seq = state.loadSeq;
+    $("card-heading").focus();
     $("reveal-btn").disabled = true;
     const res = await post(`/study/${encodeURIComponent(cardId)}/reveal`);
     if (seq !== state.loadSeq || state.grading || !state.card || state.card.card_id !== cardId) return;
     if (!res.ok || !res.data) {
       $("reveal-btn").disabled = false;
+      if (document.activeElement === $("card-heading")) $("reveal-btn").focus();
       return setStatus($("study-status"), res.error, "error");
     }
     $("card-back").textContent = res.data.back;
@@ -170,16 +175,20 @@
     }
     $("answer-panel").hidden = false;
     setGradeDisabled(false);
+    setStatus($("study-status"), "Respuesta disponible. Califica tu recuerdo del 0 al 5.");
+    if (document.activeElement === $("card-heading")) $("card-back").focus();
   }
 
   async function gradeCard(quality) {
     if (!state.card || state.grading || $("answer-panel").hidden) return;
     const { card_id: cardId, deck_id: deckId } = state.card;
+    $("card-heading").focus();
     state.grading = true;
     state.loadSeq++;
     setStudyNavDisabled(true);
     setGradeDisabled(true);
     $("reveal-btn").disabled = true;
+    setStatus($("study-status"), "Guardando calificación…");
     const res = await post(`/study/${encodeURIComponent(cardId)}/grade`, { quality });
     state.grading = false;
     setStudyNavDisabled(false);
@@ -188,8 +197,10 @@
       $("reveal-btn").disabled = !$("answer-panel").hidden;
       return setStatus($("study-status"), res.error, "error");
     }
+    const nextFocus = document.activeElement === $("card-heading") ? $("load-next-btn") : null;
+    nextFocus?.focus();
     $("deck-id").value = String(deckId);
-    await loadNextCard(`Graded ${quality} — next due ${res.data.due_date} (${res.data.interval_days}d).`);
+    await loadNextCard(`Calificación: ${quality}. Próximo repaso: ${res.data.due_date} (intervalo: ${res.data.interval_days} d).`, nextFocus);
   }
 
   async function loadTemplates() {
@@ -197,14 +208,15 @@
     state.activeTemplateId = null;
     $("template-detail").hidden = true;
     $("create-from-template-btn").disabled = true;
+    setStatus($("templates-status"), "Cargando plantillas…");
     const res = await api("/templates");
     if (seq !== state.templateSeq) return;
     if (!res.ok || !Array.isArray(res.data)) return setStatus($("templates-status"), res.error, "error");
     state.templatesLoaded = true;
     const select = $("template-select");
-    select.replaceChildren(new Option("-- Choose a template --", ""));
+    select.replaceChildren(new Option("Elige una plantilla", ""));
     for (const t of res.data) select.append(new Option(`[${t.category}] ${t.title}`, t.id));
-    setStatus($("templates-status"), `${res.data.length} templates available.`);
+    setStatus($("templates-status"), `Plantillas disponibles: ${res.data.length}.`);
   }
 
   async function viewTemplate(id) {
@@ -213,7 +225,7 @@
     $("template-detail").hidden = true;
     $("create-from-template-btn").disabled = true;
     if (!id) return setStatus($("templates-status"), "");
-    setStatus($("templates-status"), "Loading template...");
+    setStatus($("templates-status"), "Cargando plantilla…");
     const res = await api(`/templates/${encodeURIComponent(id)}`);
     if (seq !== state.templateSeq) return;
     if (!res.ok || !res.data) return setStatus($("templates-status"), res.error, "error");
@@ -239,24 +251,25 @@
     const seq = state.templateSeq;
     const deckId = deckIdValue();
     if (!templateId) return;
-    if (deckId === null) return setStatus($("templates-status"), "Select a valid Deck ID above first.", "error");
+    if (deckId === null) return setStatus($("templates-status"), "Selecciona un mazo o escribe un ID válido arriba.", "error");
     btn.disabled = true;
     const res = await post(`/templates/${encodeURIComponent(templateId)}/cards`, { deck_id: deckId });
     if (seq !== state.templateSeq || state.activeTemplateId !== templateId) return;
     btn.disabled = false;
     if (!res.ok || !res.data) return setStatus($("templates-status"), res.error, "error");
-    setStatus($("templates-status"), `Created card #${res.data.id} in deck #${deckId}.`, "ok");
+    setStatus($("templates-status"), `Tarjeta #${res.data.id} creada en el mazo #${deckId}.`, "ok");
   }
 
   async function loadErrors(note = "") {
     const seq = ++state.errorSeq;
     const filter = $("error-filter").value;
+    setStatus($("errors-status"), "Cargando errores…");
     const res = await api(filter ? `/errors?status=${encodeURIComponent(filter)}` : "/errors");
     if (seq !== state.errorSeq) return;
     if (!res.ok || !Array.isArray(res.data)) return setStatus($("errors-status"), res.error, "error");
     state.errorsLoaded = true;
     renderErrors(res.data);
-    setStatus($("errors-status"), note || `${res.data.length} error entr${res.data.length === 1 ? "y" : "ies"}.`, note ? "ok" : "");
+    setStatus($("errors-status"), note || `Errores encontrados: ${res.data.length}.`, note ? "ok" : "");
   }
 
   function syncErrorRow(errId, focusOverride = false) {
@@ -278,10 +291,10 @@
     $("errors-list").replaceChildren(...items.map((err) => {
       const wrap = el(
         "div", { className: "item" },
-        el("div", { className: "meta", textContent: `#${err.id} · ${err.status}${err.card_id ? ` · card #${err.card_id}` : ""}` }),
-        el("div", {}, el("strong", { textContent: "Attempted: " }), err.attempted),
-        el("div", {}, el("strong", { textContent: "Corrected: " }), err.corrected),
-        el("div", {}, el("strong", { textContent: "Rationale: " }), err.rationale),
+        el("div", { className: "meta", textContent: `#${err.id} · ${({ draft: "Borrador", approved: "Aprobado", discarded: "Descartado" })[err.status] ?? err.status}${err.card_id ? ` · tarjeta #${err.card_id}` : ""}` }),
+        el("div", {}, el("strong", { textContent: "Original: " }), err.attempted),
+        el("div", {}, el("strong", { textContent: "Corrección: " }), err.corrected),
+        el("div", {}, el("strong", { textContent: "Motivo: " }), err.rationale),
       );
       if (err.status !== "draft") {
         state.errorOverrides.delete(err.id);
@@ -297,13 +310,13 @@
         type: "text",
         value: state.errorOverrides.get(err.id) ?? "",
         disabled: pending,
-        placeholder: "Optional front override (required if >5000 chars)",
-        ariaLabel: `Front override for error ${err.id}`,
+        placeholder: "Anverso alternativo (obligatorio si supera los 5000 caracteres)",
+        ariaLabel: `Anverso alternativo para el error ${err.id}`,
       });
       override.style.flex = "1";
       override.addEventListener("input", () => state.errorOverrides.set(err.id, override.value));
-      const approveBtn = el("button", { type: "button", textContent: "Approve into deck", disabled: pending });
-      const discardBtn = el("button", { type: "button", textContent: "Discard", disabled: pending });
+      const approveBtn = el("button", { type: "button", textContent: "Aprobar y crear tarjeta", disabled: pending });
+      const discardBtn = el("button", { type: "button", textContent: "Descartar", disabled: pending });
       const runDraftAction = async (path, body, onOk) => {
         if (state.pendingErrors.has(err.id)) return;
         state.pendingErrors.add(err.id);
@@ -312,7 +325,7 @@
         const res = await post(path, body);
         state.pendingErrors.delete(err.id);
         if (!res.ok) {
-          const hint = res.status === 422 ? " Enter a shorter front override and retry." : "";
+          const hint = res.status === 422 ? " Prueba con un anverso más corto." : "";
           state.errorRowStatus.set(err.id, { text: `${res.error}${hint}`, kind: "error" });
           syncErrorRow(err.id, res.status === 422);
           return;
@@ -324,15 +337,15 @@
       approveBtn.addEventListener("click", () => {
         const deckId = deckIdValue();
         if (deckId === null) {
-          state.errorRowStatus.set(err.id, { text: "Select a valid Deck ID above first.", kind: "error" });
+          state.errorRowStatus.set(err.id, { text: "Selecciona un mazo o escribe un ID válido arriba.", kind: "error" });
           return syncErrorRow(err.id);
         }
         const customFront = (state.errorOverrides.get(err.id) ?? override.value).trim();
         const payload = customFront ? { deck_id: deckId, front: customFront } : { deck_id: deckId };
-        runDraftAction(`/errors/${encodeURIComponent(err.id)}/approve`, payload, (d) => `Approved error #${err.id} into card #${d.card.id}.`);
+        runDraftAction(`/errors/${encodeURIComponent(err.id)}/approve`, payload, (d) => `Error #${err.id} aprobado. Tarjeta #${d.card.id} creada en el mazo #${deckId}.`);
       });
       discardBtn.addEventListener("click", () =>
-        runDraftAction(`/errors/${encodeURIComponent(err.id)}/discard`, undefined, () => `Discarded error #${err.id}.`),
+        runDraftAction(`/errors/${encodeURIComponent(err.id)}/discard`, undefined, () => `Error #${err.id} descartado.`),
       );
       wrap.append(el("div", { className: "row" }, override, approveBtn, discardBtn), itemStatus);
       return wrap;
@@ -357,11 +370,12 @@
     }
     form.reset();
     controls.forEach((c) => { c.disabled = false; });
-    await loadErrors(`Logged draft error #${res.data.id}.`);
+    await loadErrors(`Borrador #${res.data.id} guardado.`);
   }
 
   $("deck-select").addEventListener("change", (e) => {
     if (state.grading) return;
+    state.deckSeq++;
     $("deck-id").value = e.target.value;
     if (e.target.value) loadNextCard();
     else { state.loadSeq++; state.card = null; clearAnswer(); $("study-card").hidden = true; setStatus($("study-status"), ""); }
@@ -375,10 +389,20 @@
     $("deck-select").value = $("deck-id").value;
     setStatus($("study-status"), "");
   });
-  $("deck-id").addEventListener("keydown", (e) => { if (e.key === "Enter" && !state.grading) loadNextCard(); });
-  $("load-next-btn").addEventListener("click", () => loadNextCard());
+  $("deck-id").addEventListener("keydown", (e) => { if (e.key === "Enter" && !state.grading) loadNextCard("", e.target); });
+  $("load-next-btn").addEventListener("click", (e) => loadNextCard("", e.currentTarget));
   $("refresh-decks-btn").addEventListener("click", () => loadDecks());
   $("reveal-btn").addEventListener("click", () => revealCard());
+  $("study-card").addEventListener("keydown", (e) => {
+    if (e.defaultPrevented || e.repeat || e.isComposing || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+    if (e.key.toLowerCase() === "r") {
+      e.preventDefault();
+      revealCard();
+    } else if (/^[0-5]$/.test(e.key) && !$("answer-panel").hidden) {
+      e.preventDefault();
+      gradeCard(Number(e.key));
+    }
+  });
   $("grade-controls").addEventListener("click", (e) => {
     const btn = e.target.closest("button[data-quality]");
     if (btn && !btn.disabled) gradeCard(Number(btn.dataset.quality));
