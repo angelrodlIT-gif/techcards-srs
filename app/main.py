@@ -6,11 +6,12 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session, contains_eager, joinedload, selectinload
 
 from app.db import get_db
 from app.generator import CardGenerator, get_generator
 from app.models import Card, Deck, ErrorLog, Review, Source
+from app.remediation import STAR_PREFIX, build_remediation_draft
 from app.schemas import (
     CardInput,
     CardOut,
@@ -18,10 +19,16 @@ from app.schemas import (
     DeckOut,
     ErrorApproveInput,
     ErrorApproveOut,
+    ErrorExportCardOut,
+    ErrorExportItemOut,
+    ErrorExportOut,
     ErrorLogInput,
     ErrorLogOut,
     ErrorStatus,
+    ErrorSuggestionInput,
+    ErrorSuggestionOut,
     GenerateInput,
+    Kind,
     ReviewInput,
     ReviewOut,
     SourceApproveInput,
@@ -33,6 +40,7 @@ from app.schemas import (
     StudyCardReveal,
     StudyGradeInput,
     StudyTemplateOut,
+    SuggestedCardOut,
     TemplateCardInput,
 )
 from app.sm2 import Schedule, schedule_review
@@ -239,15 +247,23 @@ def create_review(payload: ReviewInput, db: DB, clock: Clock):
     response_model=StudyCardPrompt,
     responses={204: {"description": "No card due today"}},
 )
-def study_next(db: DB, clock: Clock, deck_id: int = Query(gt=0)):
+def study_next(
+    db: DB,
+    clock: Clock,
+    deck_id: int = Query(gt=0),
+    kind: Kind | None = None,
+    remediation_only: bool = Query(False),
+):
     require(db, Deck, deck_id)
     today = normalize_utc(clock()).date()
-    card = db.scalar(
-        select(Card)
-        .where(Card.deck_id == deck_id, Card.due_date <= today)
-        .order_by(Card.due_date, Card.id)
-        .limit(1)
+    query = select(Card)
+    query = query.join(Card.error_log) if remediation_only else query.outerjoin(Card.error_log)
+    query = query.options(contains_eager(Card.error_log)).where(
+        Card.deck_id == deck_id, Card.due_date <= today
     )
+    if kind is not None:
+        query = query.where(Card.kind == kind)
+    card = db.scalar(query.order_by(Card.due_date, Card.id).limit(1))
     if card is None:
         return Response(status_code=204)
     return StudyCardPrompt(
@@ -256,6 +272,7 @@ def study_next(db: DB, clock: Clock, deck_id: int = Query(gt=0)):
         front=card.front,
         kind=card.kind,
         source_label=card.source_label,
+        error_id=card.error_id,
         due_date=card.due_date,
         repetitions=card.repetitions,
         interval_days=card.interval_days,
@@ -464,6 +481,66 @@ def list_errors(
     return db.scalars(query.offset(offset).limit(limit)).all()
 
 
+# Register static paths before /errors/{error_id}.
+@app.post("/errors/suggest", response_model=ErrorSuggestionOut, status_code=201)
+def suggest_error(payload: ErrorSuggestionInput, db: DB):
+    try:
+        draft = build_remediation_draft(
+            answer=payload.answer,
+            prompt=payload.prompt,
+            category=payload.category,
+            corrected=payload.corrected,
+            rationale=payload.rationale,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    err = save(
+        db,
+        ErrorLog(
+            attempted=draft.attempted,
+            corrected=draft.corrected,
+            rationale=draft.rationale,
+            status="draft",
+        ),
+    )
+    return ErrorSuggestionOut(
+        error=ErrorLogOut.model_validate(err),
+        suggested_card=SuggestedCardOut(
+            front=f"Correct: {draft.attempted}",
+            back=draft.corrected,
+            kind=draft.suggested_kind,
+            explanation=draft.rationale,
+        ),
+    )
+
+
+@app.get("/errors/export", response_model=ErrorExportOut)
+def export_errors(
+    db: DB,
+    clock: Clock,
+    status: ErrorStatus | None = None,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=1000),
+):
+    query = select(ErrorLog).options(joinedload(ErrorLog.card)).order_by(ErrorLog.id)
+    if status is not None:
+        query = query.where(ErrorLog.status == status)
+    rows = db.scalars(query.offset(offset).limit(limit)).all()
+    items = [
+        ErrorExportItemOut(
+            id=row.id,
+            attempted=row.attempted,
+            corrected=row.corrected,
+            rationale=row.rationale,
+            status=row.status,
+            card_id=row.card.id if row.card is not None else None,
+            card=ErrorExportCardOut.model_validate(row.card) if row.card is not None else None,
+        )
+        for row in rows
+    ]
+    return ErrorExportOut(exported_at=normalize_utc(clock()), count=len(items), items=items)
+
+
 @app.get("/errors/{error_id}", response_model=ErrorLogOut)
 def get_error(error_id: int, db: DB):
     return require(db, ErrorLog, error_id)
@@ -483,9 +560,22 @@ def update_error(error_id: int, payload: ErrorLogInput, db: DB):
 
 
 @app.delete("/errors/{error_id}", status_code=204)
-def delete_error(error_id: int, db: DB):
-    db.delete(require(db, ErrorLog, error_id))
-    db.commit()
+def delete_error(error_id: int, db: DB, delete_card: bool = Query(False)):
+    try:
+        err = db.scalar(select(ErrorLog).where(ErrorLog.id == error_id).with_for_update())
+        if err is None:
+            raise HTTPException(404, "ErrorLog not found")
+        card_id = err.card_id
+        db.delete(err)
+        if delete_card and card_id is not None:
+            db.flush()
+            card = db.scalar(select(Card).where(Card.id == card_id).with_for_update())
+            if card is not None:
+                db.delete(card)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     return Response(status_code=204)
 
 
@@ -507,6 +597,11 @@ def approve_error(error_id: int, payload: ErrorApproveInput, db: DB, clock: Cloc
         require(db, Deck, payload.deck_id)
         front = payload.front if payload.front is not None else f"Correct: {err.attempted}"
         back = payload.back if payload.back is not None else err.corrected
+        kind = (
+            payload.kind
+            if "kind" in payload.model_fields_set
+            else ("behavioral" if err.rationale.startswith(STAR_PREFIX) else payload.kind)
+        )
         explanation = (
             payload.explanation if "explanation" in payload.model_fields_set else err.rationale
         )
@@ -515,7 +610,7 @@ def approve_error(error_id: int, payload: ErrorApproveInput, db: DB, clock: Cloc
                 deck_id=payload.deck_id,
                 front=front,
                 back=back,
-                kind=payload.kind,
+                kind=kind,
                 source_label=f"error:{err.id}",
                 accepted_answers=payload.accepted_answers,
                 explanation=explanation,

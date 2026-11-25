@@ -379,3 +379,152 @@ def test_error_logs_migration_round_trip(tmp_path, monkeypatch):
         engine.dispose()
         monkeypatch.undo()
         get_settings.cache_clear()
+
+
+def test_error_suggest_validation_and_boundaries(client):
+    did = create_deck(client, name="Remediation Validation")
+
+    bad_payloads = [
+        {"answer": "I am agree"},
+        *({"answer": "I am agree", "consent": v} for v in (False, 1, "true", None)),
+        *(
+            {"answer": "Ok", "consent": True, k: "bad\x00v"}
+            for k in ("answer", "prompt", "corrected", "rationale")
+        ),
+        {"answer": "a" * 4992, "corrected": "Fixed", "consent": True},
+        {"prompt": "Q" * 100, "answer": "a" * 4900, "corrected": "Fixed", "consent": True},
+        {"answer": "a" * 4980, "category": "technical", "consent": True},
+        {"answer": "a" * 4950, "category": "star", "consent": True},
+        {"answer": "Short", "category": "star", "rationale": "r" * 4990, "consent": True},
+    ]
+    for bad in bad_payloads:
+        assert client.post("/errors/suggest", json=bad).status_code == 422
+    assert (
+        "consent"
+        in client.post("/errors/suggest", json={"answer": "Ok", "consent": False}).text.lower()
+    )
+
+    ok = client.post(
+        "/errors/suggest", json={"answer": "b" * 4991, "corrected": "Fixed", "consent": True}
+    )
+    assert ok.status_code == 201 and len(ok.json()["suggested_card"]["front"]) == 5000
+    assert client.get("/cards").json() == []
+    approved = client.post(f"/errors/{ok.json()['error']['id']}/approve", json={"deck_id": did})
+    assert approved.status_code == 201 and len(approved.json()["card"]["front"]) == 5000
+
+
+def test_remediation_loop_suggest_approve_study_export_and_delete(client, set_clock):
+    set_clock(datetime(2026, 7, 1, 10, 0, 0, tzinfo=UTC))
+    did = create_deck(client, name="Interview Prep")
+    plain = client.post(
+        "/cards", json={"deck_id": did, "front": "Plain", "back": "Back", "kind": "behavioral"}
+    ).json()
+
+    def suggest(**kw):
+        resp = client.post("/errors/suggest", json={"consent": True, **kw})
+        assert resp.status_code == 201
+        return resp.json()
+
+    def study_next(**params):
+        return client.get("/study/next", params={"deck_id": did, **params})
+
+    # 1. Technical suggestions: prompt + phrasing fixes, plus clean fallback.
+    tech = suggest(
+        prompt="Explain API latency",
+        answer="The service did not responded in monday and depends of cache.",
+    )
+    t_err, t_card = tech["error"], tech["suggested_card"]
+    assert t_err["status"] == "draft" and t_err["card_id"] is None
+    assert t_err["attempted"] == (
+        "Prompt: Explain API latency\n"
+        "Answer: The service did not responded in monday and depends of cache."
+    )
+    assert t_err["corrected"] == "The service did not respond on Monday and depends on cache."
+    assert t_err["rationale"].startswith("[Technical remediation] ")
+    assert t_card == {
+        "front": f"Correct: {t_err['attempted']}",
+        "back": t_err["corrected"],
+        "kind": "interview_phrase",
+        "explanation": t_err["rationale"],
+    }
+    tech_clean = suggest(answer="DNS resolves hostnames to IPs.")
+    assert tech_clean["error"]["corrected"] == (
+        "Refined technical explanation: DNS resolves hostnames to IPs."
+    )
+
+    # 2. STAR suggestions: missing markers, full markers, custom rationale prefixing.
+    star = suggest(
+        answer="I am agree we fixed the outage, though it didn't responded at first.",
+        category="star",
+    )
+    s_err, s_card = star["error"], star["suggested_card"]
+    assert s_card["kind"] == "behavioral" and "real experiences only" in s_err["corrected"].lower()
+    assert "I agree" in s_err["corrected"] and "didn't respond" in s_err["corrected"]
+    assert (
+        s_err["rationale"].startswith("[STAR remediation] ") and "Situation" in s_err["rationale"]
+    )
+    star_full = suggest(
+        answer="Situation: outage. Task: fix. Action: rollback. Result: restored.", category="star"
+    )
+    assert "All STAR elements" in star_full["error"]["rationale"]
+    star_custom = suggest(answer="Outage fix.", category="star", rationale="Add metrics.")
+    assert star_custom["error"]["rationale"] == "[STAR remediation] Add metrics."
+    assert len(client.get("/cards").json()) == 1  # suggest never creates cards
+
+    # 3. Approve STAR (defaults to behavioral), technical (interview_phrase), and explicit override.
+    s_app = client.post(f"/errors/{s_err['id']}/approve", json={"deck_id": did}).json()
+    t_app = client.post(f"/errors/{t_err['id']}/approve", json={"deck_id": did}).json()
+    ov = client.post(
+        f"/errors/{star_custom['error']['id']}/approve",
+        json={"deck_id": did, "kind": "interview_phrase"},
+    ).json()
+    assert (s_app["card"]["kind"], t_app["card"]["kind"], ov["card"]["kind"]) == (
+        "behavioral",
+        "interview_phrase",
+        "interview_phrase",
+    )
+
+    # 4. Practice across sessions using /study/next filters (kind & remediation_only).
+    p0 = study_next(kind="behavioral").json()
+    assert p0["card_id"] == plain["id"] and p0["error_id"] is None
+
+    s_p = study_next(remediation_only=True, kind="behavioral").json()
+    assert s_p["card_id"] == s_app["card"]["id"] and s_p["error_id"] == s_err["id"]
+    assert not ({"back", "accepted_answers", "explanation"} & s_p.keys())
+    assert client.post(f"/study/{s_p['card_id']}/reveal").json()["back"] == s_err["corrected"]
+    assert client.post(f"/study/{s_p['card_id']}/grade", json={"quality": 4}).status_code == 201
+    assert study_next(remediation_only=True, kind="behavioral").status_code == 204
+
+    t_p = study_next(remediation_only=True, kind="interview_phrase").json()
+    assert t_p["card_id"] == t_app["card"]["id"] and t_p["error_id"] == t_err["id"]
+    assert client.post(f"/study/{t_p['card_id']}/grade", json={"quality": 4}).status_code == 201
+
+    set_clock(datetime(2026, 7, 2, 10, 0, 0, tzinfo=UTC))
+    s2 = study_next(remediation_only=True, kind="behavioral").json()
+    assert s2["card_id"] == s_app["card"]["id"] and s2["repetitions"] == 1
+    g2 = client.post(f"/study/{s2['card_id']}/grade", json={"quality": 5}).json()
+    assert (g2["repetitions"], g2["interval_days"]) == (2, 6)
+
+    # 5. Export preserves original answers, linked card snapshots, filters, and pagination.
+    exp = client.get(
+        "/errors/export", params={"status": "approved", "offset": 0, "limit": 2}
+    ).json()
+    assert exp["exported_at"] == "2026-07-02T10:00:00Z" and exp["count"] == 2
+    assert [i["id"] for i in exp["items"]] == [t_err["id"], s_err["id"]]
+    assert exp["items"][0]["attempted"] == t_err["attempted"]
+    assert (exp["items"][1]["card"]["repetitions"], exp["items"][1]["card"]["interval_days"]) == (
+        2,
+        6,
+    )
+    draft_exp = client.get("/errors/export", params={"status": "draft"}).json()
+    assert draft_exp["count"] == 2 and all(i["card"] is None for i in draft_exp["items"])
+
+    # 6. Deletion: default keeps card (error_id=None); delete_card=true deletes both atomically.
+    assert client.delete(f"/errors/{t_err['id']}").status_code == 204
+    assert client.get(f"/cards/{t_app['card']['id']}").json()["error_id"] is None
+    assert client.delete(f"/errors/{s_err['id']}", params={"delete_card": True}).status_code == 204
+    assert client.get(f"/errors/{s_err['id']}").status_code == 404
+    assert client.get(f"/cards/{s_app['card']['id']}").status_code == 404
+    eid = tech_clean["error"]["id"]
+    assert client.delete(f"/errors/{eid}", params={"delete_card": True}).status_code == 204
+    assert client.delete("/errors/9999", params={"delete_card": True}).status_code == 404

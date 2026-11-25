@@ -9,6 +9,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictBool,
     StringConstraints,
     field_validator,
     model_validator,
@@ -41,6 +42,7 @@ CLOZE_BLANK_RE = re.compile(r"_{4,}")
 Kind = Literal["vocabulary", "interview_phrase", "behavioral", "sentence", "cloze", "es_en"]
 SourceStatus = Literal["draft", "approved", "discarded"]
 ErrorStatus = SourceStatus
+ErrorCategory = Literal["technical", "star"]
 TemplateCategory = Literal["star", "networking"]
 
 
@@ -243,6 +245,7 @@ class StudyCardPrompt(BaseModel):
     front: str
     kind: Kind
     source_label: str | None = None
+    error_id: int | None = None
     due_date: date
     repetitions: int
     interval_days: int
@@ -308,3 +311,54 @@ class ErrorApproveInput(CardExtrasMixin):
 class ErrorApproveOut(BaseModel):
     error: ErrorLogOut
     card: CardOut
+
+
+class ErrorSuggestionInput(BaseModel):
+    answer: Text
+    prompt: Text | None = None
+    category: ErrorCategory = "technical"
+    corrected: Text | None = None
+    rationale: Text | None = None
+    consent: StrictBool
+
+    @field_validator("consent")
+    @classmethod
+    def require_explicit_consent(cls, value: bool) -> bool:
+        if not value:
+            raise ValueError("explicit consent is required to store submitted interview text")
+        return value
+
+
+class SuggestedCardOut(BaseModel):
+    front: str
+    back: str
+    kind: Kind
+    explanation: str
+
+
+class ErrorSuggestionOut(BaseModel):
+    error: ErrorLogOut
+    suggested_card: SuggestedCardOut
+
+
+class ErrorExportCardOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    deck_id: int
+    front: str
+    back: str
+    kind: Kind
+    due_date: date
+    repetitions: int
+    interval_days: int
+    ease_factor: float
+
+
+class ErrorExportItemOut(ErrorLogOut):
+    card: ErrorExportCardOut | None = None
+
+
+class ErrorExportOut(BaseModel):
+    exported_at: datetime
+    count: int
+    items: list[ErrorExportItemOut]
