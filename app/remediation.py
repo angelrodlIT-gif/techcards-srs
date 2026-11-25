@@ -82,16 +82,17 @@ def build_remediation_draft(
             if corrected is not None
             else (cleaned if cleaned != answer else f"Refined technical explanation: {cleaned}")
         )
-        detail = (
-            f"Fixes: {'; '.join(fixes)}."
-            if fixes
-            else "No mechanical phrasing issue detected; refine technical clarity."
-        )
-        resolved_rationale = (
-            rationale
-            if rationale is not None
-            else f"{TECH_PREFIX} {detail} Offline heuristic requires human review."
-        )
+        if rationale is not None:
+            resolved_rationale = (
+                rationale if rationale.startswith(TECH_PREFIX) else f"{TECH_PREFIX} {rationale}"
+            )
+        else:
+            detail = (
+                f"Fixes: {'; '.join(fixes)}."
+                if fixes
+                else "No mechanical phrasing issue detected; refine technical clarity."
+            )
+            resolved_rationale = f"{TECH_PREFIX} {detail} Offline heuristic requires human review."
 
     if len(resolved_corrected) > MAX_TEXT_CHARS:
         raise ValueError(f"suggested corrected text must be at most {MAX_TEXT_CHARS} characters")

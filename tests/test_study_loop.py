@@ -528,3 +528,19 @@ def test_remediation_loop_suggest_approve_study_export_and_delete(client, set_cl
     eid = tech_clean["error"]["id"]
     assert client.delete(f"/errors/{eid}", params={"delete_card": True}).status_code == 204
     assert client.delete("/errors/9999", params={"delete_card": True}).status_code == 404
+
+    # 7. Technical suggestion with "[STAR remediation]" rationale approves as interview_phrase.
+    tech_star_note = suggest(
+        answer="TCP uses a three-way handshake.",
+        category="technical",
+        rationale="[STAR remediation] Custom note",
+    )
+    assert tech_star_note["suggested_card"]["kind"] == "interview_phrase"
+    assert tech_star_note["error"]["rationale"].startswith(
+        "[Technical remediation] [STAR remediation]"
+    )
+    tech_star_app = client.post(
+        f"/errors/{tech_star_note['error']['id']}/approve", json={"deck_id": did}
+    )
+    assert tech_star_app.status_code == 201
+    assert tech_star_app.json()["card"]["kind"] == "interview_phrase"
