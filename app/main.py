@@ -282,7 +282,7 @@ def study_reveal(card_id: int, db: DB):
     response_class=Response,
     responses={
         200: {"content": {"audio/mpeg": {"schema": {"type": "string", "format": "binary"}}}},
-        403: {"description": "Audio requires a loopback host"},
+        403: {"description": "Audio requires a direct loopback connection"},
         404: {"description": "Card not found"},
         409: {"description": "Card is ineligible for listening audio"},
         429: {"description": "Synthesis budget exhausted"},
@@ -292,8 +292,14 @@ def study_reveal(card_id: int, db: DB):
 def study_audio(
     card_id: int, db: DB, request: Request, polly_opt_in: Annotated[Literal["true"], Header()]
 ):
-    if request.url.hostname not in {"127.0.0.1", "::1", "localhost"}:
-        raise HTTPException(403, "Listening audio requires a loopback host")
+    if (
+        request.client is None
+        or request.client.host not in {"127.0.0.1", "::1"}
+        or request.url.hostname not in {"127.0.0.1", "::1", "localhost"}
+        or "forwarded" in request.headers
+        or "x-forwarded-for" in request.headers
+    ):
+        raise HTTPException(403, "Listening audio requires a direct loopback connection")
     card = require(db, Card, card_id)
     if card.kind != "listening" or not 1 <= len(card.back) <= MAX_LISTENING_CHARS:
         raise HTTPException(409, "Card is ineligible for listening audio")

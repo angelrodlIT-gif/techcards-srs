@@ -26,7 +26,9 @@ Audio is off by default. To enable it, set `POLLY_ENABLED=true`,
 `POLLY_REGION` to a Polly region such as `us-east-1`, and `POLLY_VOICE_ID`
 to a Standard US English voice such as `Joanna`. For AWS profile or role
 credentials, run the API on the host with
-`uv run uvicorn app.main:app --host 127.0.0.1 --workers 1`. Use the
+`uv run uvicorn app.main:app --host 127.0.0.1 --workers 1 --no-proxy-headers`.
+Connect directly on loopback and keep the audio endpoint off reverse proxies.
+Use the
 [AWS SDK credential chain](https://docs.aws.amazon.com/boto3/latest/guide/credentials.html)
 with `polly:SynthesizeSpeech` permission. The default Compose setup stays
 offline for audio. On a cache miss, Polly receives the transcript as plain

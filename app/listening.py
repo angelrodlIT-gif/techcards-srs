@@ -57,6 +57,7 @@ def synthesize(text: str, region: str, voice_id: str) -> bytes:
 class ListeningAudio:
     def __init__(self):
         self._lock = Lock()
+        self._synthesizing = False
         self._attempts: deque[float] = deque()
         self._cache: OrderedDict[tuple[str, str, bytes], tuple[float, bytes]] = OrderedDict()
 
@@ -66,31 +67,34 @@ class ListeningAudio:
         if not settings.polly_enabled or not region or not voice:
             raise AudioUnavailable
         key = (region, voice, sha256(text.encode()).digest())
-        # Serialize cache misses so concurrent requests cannot duplicate a paid synthesis.
-        if not self._lock.acquire(blocking=False):
-            raise AudioUnavailable
-        try:
+        with self._lock:
             now = monotonic()
             for expired in [key for key, (expiry, _) in self._cache.items() if expiry <= now]:
                 del self._cache[expired]
             if key in self._cache:
                 self._cache.move_to_end(key)
                 return self._cache[key][1]
+            if self._synthesizing:
+                raise AudioUnavailable
             while self._attempts and self._attempts[0] <= now - 3600:
                 self._attempts.popleft()
             if len(self._attempts) >= SYNTHESIS_ATTEMPTS_PER_HOUR:
                 raise SynthesisLimitReached
             self._attempts.append(now)
+            self._synthesizing = True
+        try:
             try:
                 audio = synthesize(text, region, voice)
             except (BotoCoreError, ClientError, OSError) as exc:
                 raise AudioUnavailable from exc
-            self._cache[key] = (monotonic() + CACHE_TTL_SECONDS, audio)
-            if len(self._cache) > CACHE_ENTRIES:
-                self._cache.popitem(last=False)
+            with self._lock:
+                self._cache[key] = (monotonic() + CACHE_TTL_SECONDS, audio)
+                if len(self._cache) > CACHE_ENTRIES:
+                    self._cache.popitem(last=False)
             return audio
         finally:
-            self._lock.release()
+            with self._lock:
+                self._synthesizing = False
 
 
 listening_audio = ListeningAudio()

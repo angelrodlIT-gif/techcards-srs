@@ -3,6 +3,7 @@ from unittest.mock import Mock
 
 import pytest
 from botocore.exceptions import ClientError, NoCredentialsError
+from fastapi.testclient import TestClient
 
 from app import listening, main
 from app.config import Settings
@@ -79,6 +80,10 @@ def test_audio_requires_opt_in_local_host_and_eligible_card(client, polly):
     path = f"/study/{card['id']}"
     assert client.post(f"{path}/audio", headers={"Host": "127.0.0.1"}).status_code == 422
     assert client.post(f"{path}/audio", headers={"Polly-Opt-In": "true"}).status_code == 403
+    with TestClient(main.app, client=("192.0.2.5", 50000)) as remote_client:
+        assert remote_client.post(f"{path}/audio", headers=OPT_IN).status_code == 403
+    forwarded = {**OPT_IN, "X-Forwarded-For": "192.0.2.5"}
+    assert client.post(f"{path}/audio", headers=forwarded).status_code == 403
     assert client.post("/study/999/audio", headers=OPT_IN).status_code == 404
     plain = create_card(client, kind="sentence").json()
     assert client.post(f"/study/{plain['id']}/audio", headers=OPT_IN).status_code == 409
@@ -139,3 +144,18 @@ def test_cache_expires_and_ignores_old_transcript_after_edit(client, polly, monk
     assert client.post(path, headers=OPT_IN).status_code == 200
     assert speech.call_args.kwargs["Text"] == new_transcript
     assert speech.call_count == 3
+
+
+def test_cached_audio_is_available_while_a_cache_miss_is_in_flight(polly):
+    _, _, speech = polly
+    assert main.listening_audio.get(TRANSCRIPT) == b"mock-mp3"
+
+    def synthesize_uncached(**_):
+        assert main.listening_audio.get(TRANSCRIPT) == b"mock-mp3"
+        with pytest.raises(listening.AudioUnavailable):
+            main.listening_audio.get("A concurrent cache miss.")
+        return {"AudioStream": BytesIO(b"uncached"), "ContentType": "audio/mpeg"}
+
+    speech.side_effect = synthesize_uncached
+    assert main.listening_audio.get("A different transcript.") == b"uncached"
+    assert speech.call_count == 2
