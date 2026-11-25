@@ -6,7 +6,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session, aliased, joinedload, selectinload
 
 from app.db import get_db
 from app.generator import CardGenerator, get_generator
@@ -609,24 +609,35 @@ def list_interviews(
     offset: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=100),
 ):
-    query = (
-        select(InterviewSession)
-        .options(selectinload(InterviewSession.turns))
-        .order_by(InterviewSession.id)
-    )
+    page = select(InterviewSession).order_by(InterviewSession.id)
     if role is not None:
-        query = query.where(InterviewSession.role == role)
+        page = page.where(InterviewSession.role == role)
     if status is not None:
-        query = query.where(InterviewSession.status == status)
-    return db.scalars(query.offset(offset).limit(limit)).all()
+        page = page.where(InterviewSession.status == status)
+    page_subq = page.offset(offset).limit(limit).subquery()
+    session_alias = aliased(InterviewSession, page_subq)
+    return (
+        db.execute(
+            select(session_alias)
+            .options(joinedload(session_alias.turns))
+            .order_by(session_alias.id)
+        )
+        .unique()
+        .scalars()
+        .all()
+    )
 
 
 @app.get("/interviews/{session_id}", response_model=InterviewSessionOut)
 def get_interview(session_id: int, db: DB):
-    session = db.scalar(
-        select(InterviewSession)
-        .options(selectinload(InterviewSession.turns))
-        .where(InterviewSession.id == session_id)
+    session = (
+        db.execute(
+            select(InterviewSession)
+            .options(joinedload(InterviewSession.turns))
+            .where(InterviewSession.id == session_id)
+        )
+        .unique()
+        .scalar_one_or_none()
     )
     if session is None:
         raise HTTPException(404, "InterviewSession not found")

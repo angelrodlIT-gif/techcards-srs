@@ -658,6 +658,55 @@ def test_delete_interview_locks_session_before_deleting_turns(client, db_engine,
         assert db.query(InterviewTurn).filter(InterviewTurn.session_id == sid).count() == 0
 
 
+def test_get_and_list_interviews_load_turns_in_single_joined_query(client, db_engine):
+    s1 = client.post("/interviews", json={"role": "cloud_support"}).json()
+    s2 = client.post("/interviews", json={"role": "junior_aws"}).json()
+
+    recorded: list[str] = []
+
+    def on_sql(_conn, _cursor, statement, _params, _context, _executemany):
+        sql = " ".join(statement.upper().split())
+        if sql.startswith("SELECT"):
+            recorded.append(sql)
+
+    event.listen(db_engine, "before_cursor_execute", on_sql)
+    try:
+        # GET /interviews (all)
+        recorded.clear()
+        list_resp = client.get("/interviews")
+        assert list_resp.status_code == 200
+        list_body = list_resp.json()
+        assert [s["id"] for s in list_body] == [s1["id"], s2["id"]]
+        assert all([t["turn_index"] for t in s["turns"]] == [1, 2, 3] for s in list_body)
+        assert len(recorded) == 1
+        assert "JOIN INTERVIEW_TURNS" in recorded[0]
+        assert "FROM INTERVIEW_TURNS" not in recorded[0]
+
+        # GET /interviews with pagination (must paginate sessions, not joined turn rows)
+        recorded.clear()
+        page_resp = client.get("/interviews", params={"offset": 1, "limit": 1})
+        assert page_resp.status_code == 200
+        page_body = page_resp.json()
+        assert [s["id"] for s in page_body] == [s2["id"]]
+        assert [t["turn_index"] for t in page_body[0]["turns"]] == [1, 2, 3]
+        assert len(recorded) == 1
+        assert "JOIN INTERVIEW_TURNS" in recorded[0]
+        assert "FROM INTERVIEW_TURNS" not in recorded[0]
+
+        # GET /interviews/{session_id}
+        recorded.clear()
+        get_resp = client.get(f"/interviews/{s1['id']}")
+        assert get_resp.status_code == 200
+        get_body = get_resp.json()
+        assert get_body["id"] == s1["id"]
+        assert [t["turn_index"] for t in get_body["turns"]] == [1, 2, 3]
+        assert len(recorded) == 1
+        assert "JOIN INTERVIEW_TURNS" in recorded[0]
+        assert "FROM INTERVIEW_TURNS" not in recorded[0]
+    finally:
+        event.remove(db_engine, "before_cursor_execute", on_sql)
+
+
 def test_postgres_concurrent_interview_delete_and_create_races(client, db_engine):
     if db_engine.dialect.name != "postgresql":
         pytest.skip("PostgreSQL row-level locking test")
