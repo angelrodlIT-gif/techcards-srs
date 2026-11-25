@@ -7,6 +7,9 @@
     loadSeq: 0,
     deckSeq: 0,
     decks: new Map(),
+    selectionRevision: 0,
+    creatingDeck: false,
+    uncertainDeckNames: new Set(),
     grading: false,
     templatesLoaded: false,
     templateSeq: 0,
@@ -87,7 +90,8 @@
   const setGradeDisabled = (disabled) =>
     $("grade-controls").querySelectorAll("button[data-quality]").forEach((btn) => { btn.disabled = disabled; });
   const setStudyNavDisabled = (disabled) => {
-    for (const id of ["deck-select", "deck-id", "load-next-btn", "refresh-decks-btn"]) $(id).disabled = disabled;
+    for (const id of ["deck-select", "deck-search", "deck-id", "load-next-btn", "refresh-decks-btn"]) $(id).disabled = disabled;
+    $("deck-fields").disabled = disabled || state.creatingDeck;
   };
 
   function destinationLabel(deckId) {
@@ -113,27 +117,96 @@
     $("card-accepted").replaceChildren();
   }
 
-  async function loadDecks() {
-    if (state.grading) return;
-    const seq = ++state.deckSeq;
-    const res = await api("/decks");
-    if (seq !== state.deckSeq || state.grading) return;
-    if (!res.ok || !Array.isArray(res.data)) return setStatus($("study-status"), res.error, "error");
-    state.decks = new Map(res.data.map((deck) => [deck.id, deck]));
-    const select = $("deck-select");
-    const current = $("deck-id").value.trim();
-    select.replaceChildren(new Option("Elige un mazo", ""));
-    for (const d of res.data) select.append(new Option(`#${d.id} — ${d.name}`, String(d.id)));
-    if (current && res.data.some((d) => String(d.id) === current)) {
-      select.value = current;
-    } else if (!current && res.data.length > 0) {
-      select.value = $("deck-id").value = String(res.data[0].id);
-      syncDestinations();
-      await loadNextCard();
-    } else if (res.data.length === 0) {
-      setStatus($("study-status"), "Aún no hay mazos. Crea uno en la documentación de la API y pulsa «Actualizar mazos».");
+  function renderDeckPicker() {
+    const current = deckIdValue();
+    const query = $("deck-search").value.trim().toLocaleLowerCase("es");
+    const options = document.createDocumentFragment();
+    options.append(new Option("Elige un mazo", ""));
+    let matches = 0;
+    for (const deck of state.decks.values()) {
+      const matched = deck.name.toLocaleLowerCase("es").includes(query) || deck.id.includes(query);
+      if (matched) matches++;
+      if (matched || deck.id === current) {
+        const prefix = matched ? "" : "Mazo actual: ";
+        options.append(new Option(`${prefix}#${deck.id} — ${deck.name}`, deck.id));
+      }
     }
+    $("deck-select").replaceChildren(options);
+    $("deck-select").value = state.decks.has(current) ? current : "";
+    return matches;
+  }
+
+  function renderDeckList() {
+    const matches = renderDeckPicker();
+    let message = "";
+    if ($("deck-search").value.trim()) message = `Coincidencias: ${matches}.`;
+    else if (!state.decks.size) message = "Aún no hay mazos. Abre «Crear un mazo» para empezar.";
+    setStatus($("deck-list-status"), message);
+  }
+
+  async function loadDecks(autoSelect = true) {
+    const seq = ++state.deckSeq;
+    const revision = state.selectionRevision;
+    const decks = new Map();
+    const pageSize = 100;
+    setStatus($("deck-list-status"), "Cargando mazos…");
+    for (let offset = 0; ; offset += pageSize) {
+      const res = await api(`/decks?offset=${offset}&limit=${pageSize}`);
+      if (seq !== state.deckSeq) return;
+      if (!res.ok || !Array.isArray(res.data)) {
+        return setStatus($("deck-list-status"), res.error || "No se pudo cargar la lista de mazos.", "error");
+      }
+      for (const deck of res.data) decks.set(deck.id, deck);
+      if (res.data.length < pageSize) break;
+    }
+    state.decks = decks;
+    const pickFirst = autoSelect && decks.size && revision === state.selectionRevision && !state.grading &&
+      !$("deck-id").value.trim() && !$("deck-search").value.trim();
+    if (pickFirst) $("deck-id").value = decks.keys().next().value;
+    renderDeckList();
     syncDestinations();
+    if (pickFirst) await loadNextCard();
+  }
+
+  async function createDeck(event) {
+    event.preventDefault();
+    if (state.grading || state.creatingDeck) return;
+    const input = $("deck-name");
+    const name = input.value.trim();
+    const status = $("deck-create-status");
+    if (!name) {
+      input.focus();
+      return setStatus(status, "Escribe un nombre para el mazo.", "error");
+    }
+    const uncertainMessage = "No se pudo confirmar la creación. Actualiza la lista y busca el mazo antes de volver a crearlo.";
+    if (state.uncertainDeckNames.has(name)) return setStatus(status, uncertainMessage, "error");
+    const revision = state.selectionRevision;
+    state.creatingDeck = true;
+    $("deck-fields").disabled = true;
+    setStatus(status, "Creando mazo…");
+    const res = await post("/decks", { name });
+    state.creatingDeck = false;
+    $("deck-fields").disabled = state.grading;
+    if (!res.ok || !res.data?.id) {
+      if (res.status >= 400 && res.status < 500) return setStatus(status, res.error, "error");
+      state.uncertainDeckNames.add(name);
+      return setStatus(status, uncertainMessage, "error");
+    }
+    input.value = "";
+    const deck = res.data;
+    state.decks.set(deck.id, deck);
+    setStatus(status, `Mazo «${deck.name}» creado (#${deck.id}).`, "ok");
+    const selectCreated = !state.grading && revision === state.selectionRevision;
+    if (selectCreated) {
+      state.selectionRevision++;
+      $("deck-search").value = "";
+      $("deck-id").value = deck.id;
+    }
+    renderDeckList();
+    syncDestinations();
+    if (selectCreated) loadNextCard();
+    // A list request started before this POST can lack the new deck.
+    loadDecks(false);
   }
 
   async function loadNextCard(note = "", focusFrom = null) {
@@ -212,6 +285,7 @@
     if (!state.card || state.grading || $("answer-panel").hidden) return;
     const { card_id: cardId, deck_id: deckId } = state.card;
     $("card-heading").focus();
+    state.selectionRevision++;
     state.grading = true;
     state.loadSeq++;
     setStudyNavDisabled(true);
@@ -325,6 +399,7 @@
     const override = row.querySelector("input");
     for (const ctrl of row.querySelectorAll("input, button")) ctrl.disabled = pending;
     row.querySelector(".approve-error").disabled = pending || !deckIdValue();
+    row.querySelector(".deck-destination").textContent = destinationLabel(state.pendingErrors.get(errId) || deckIdValue());
     const statusEl = row.querySelector("p.status");
     if (statusEl) setStatus(statusEl, rowStatus ? rowStatus.text : "", rowStatus ? rowStatus.kind : "");
     if (focusOverride && override && !pending) override.focus();
@@ -421,8 +496,9 @@
 
   $("deck-select").addEventListener("change", (e) => {
     if (state.grading) return;
-    state.deckSeq++;
+    state.selectionRevision++;
     $("deck-id").value = e.target.value;
+    renderDeckList();
     syncDestinations();
     if (e.target.value) loadNextCard();
     else { state.loadSeq++; state.card = null; clearAnswer(); $("study-card").hidden = true; setStatus($("study-status"), ""); }
@@ -430,15 +506,20 @@
   $("deck-id").addEventListener("input", () => {
     syncDestinations();
     state.loadSeq++;
-    state.deckSeq++;
+    state.selectionRevision++;
     state.card = null;
     clearAnswer();
     $("study-card").hidden = true;
-    $("deck-select").value = $("deck-id").value;
+    renderDeckPicker();
     setStatus($("study-status"), "");
   });
   $("deck-id").addEventListener("keydown", (e) => { if (e.key === "Enter" && !state.grading) loadNextCard("", e.target); });
   $("load-next-btn").addEventListener("click", (e) => loadNextCard("", e.currentTarget));
+  $("deck-search").addEventListener("input", () => {
+    state.selectionRevision++;
+    renderDeckList();
+  });
+  $("deck-form").addEventListener("submit", createDeck);
   $("refresh-decks-btn").addEventListener("click", () => loadDecks());
   $("reveal-btn").addEventListener("click", () => revealCard());
   $("study-card").addEventListener("keydown", (e) => {

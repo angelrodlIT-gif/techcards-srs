@@ -27,6 +27,7 @@
     .status.ok { color: #2e7d32; }
     .item { border-top: 1px solid #dfdfdf; padding-top: 0.7rem; margin-top: 0.7rem; overflow-wrap: anywhere; }
     :focus-visible { outline: 3px solid #195a9a; outline-offset: 2px; }
+    #deck-fields { border: 0; padding: 0; min-width: 0; }
     header { gap: 1rem; }
     @media (max-width: 34rem) {
       #deck-heading + .row { display: grid; align-items: stretch; }
@@ -46,6 +47,8 @@
     <section aria-labelledby="deck-heading">
       <h2 id="deck-heading">Mazo</h2>
       <div class="row">
+        <label for="deck-search">Buscar mazo</label>
+        <input type="search" id="deck-search" placeholder="Nombre o ID">
         <label for="deck-select">Mazo</label>
         <select id="deck-select" aria-label="Seleccionar mazo"><option value="">Elige un mazo</option></select>
         <label for="deck-id">ID del mazo</label>
@@ -53,6 +56,18 @@
         <button id="load-next-btn" type="button">Cargar siguiente tarjeta</button>
         <button id="refresh-decks-btn" type="button">Actualizar mazos</button>
       </div>
+      <p id="deck-list-status" class="status" role="status"></p>
+      <details id="new-deck">
+        <summary>Crear un mazo</summary>
+        <form id="deck-form">
+          <fieldset id="deck-fields" class="row">
+            <label for="deck-name">Nombre del mazo</label>
+            <input id="deck-name" required maxlength="120">
+            <button type="submit">Crear mazo</button>
+          </fieldset>
+        </form>
+        <p id="deck-create-status" class="status" role="status"></p>
+      </details>
       <p id="study-status" class="status" role="status" aria-live="polite"></p>
     </section>
 

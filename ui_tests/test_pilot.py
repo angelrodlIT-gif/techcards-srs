@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 from playwright.sync_api import expect, sync_playwright
@@ -34,7 +35,7 @@ def test_large_deck_id_reaches_both_writes_exactly(page, typed):
     template = {"id": "tpl", "category": "grammar", "title": "Example"}
     error = {"id": BIG + 2, "status": "draft", "attempted": "a", "corrected": "b", "rationale": "c"}
     decks = [] if typed else [{"id": BIG, "name": "Large"}]
-    page.route("**/decks", lambda r: r.fulfill(json=decks))
+    page.route("**/decks?*", lambda r: r.fulfill(json=decks))
     page.route("**/study/next?*", lambda r: r.fulfill(status=204))
     page.route("**/templates", lambda r: r.fulfill(json=[template]))
     page.route("**/templates/tpl", lambda r: r.fulfill(json=template))
@@ -74,7 +75,7 @@ def prompt(card_id=BIG, deck_id=BIG):
 
 def test_keyboard_loop_and_mobile_layout(page):
     grades = []
-    page.route("**/decks", lambda r: r.fulfill(json=[{"id": BIG, "name": "Networks"}]))
+    page.route("**/decks?*", lambda r: r.fulfill(json=[{"id": BIG, "name": "Networks"}]))
     page.route("**/study/next?*", lambda r: r.fulfill(json=prompt()))
     page.route(f"**/study/{BIG}/reveal", lambda r: r.fulfill(json={"back": "Resolve names"}))
 
@@ -109,15 +110,17 @@ def test_keyboard_loop_and_mobile_layout(page):
 
 def test_clear_selection_while_refreshing(page):
     refresh = []
-    page.route("**/decks", lambda r: r.fulfill(json=[{"id": 1, "name": "First"}]))
+    page.route("**/decks?*", lambda r: r.fulfill(json=[{"id": 1, "name": "First"}]))
     page.route("**/study/next?*", lambda r: r.fulfill(json=prompt(1, 1)))
     page.goto(f"{ORIGIN}/ui")
     expect(page.locator("#study-card")).to_be_visible()
-    page.route("**/decks", lambda r: refresh.append(r))
-    with page.expect_request("**/decks"):
+    page.route("**/decks?*", lambda r: refresh.append(r))
+    with page.expect_request("**/decks?*"):
         page.locator("#refresh-decks-btn").click()
     page.locator("#deck-select").select_option("")
-    with page.expect_event("requestfinished", predicate=lambda req: req.url.endswith("/decks")):
+    with page.expect_event(
+        "requestfinished", predicate=lambda req: urlsplit(req.url).path == "/decks"
+    ):
         refresh[0].fulfill(json=[{"id": 1, "name": "First"}])
     expect(page.locator("#deck-id")).to_have_value("")
     expect(page.locator("#study-card")).to_be_hidden()
@@ -125,7 +128,7 @@ def test_clear_selection_while_refreshing(page):
 
 def test_edit_deck_during_reveal(page):
     inflight = []
-    page.route("**/decks", lambda r: r.fulfill(json=[{"id": BIG, "name": "First"}]))
+    page.route("**/decks?*", lambda r: r.fulfill(json=[{"id": BIG, "name": "First"}]))
     page.route("**/study/next?*", lambda r: r.fulfill(json=prompt()))
     page.route("**/reveal", lambda r: inflight.append(r))
     page.goto(f"{ORIGIN}/ui")
@@ -154,7 +157,7 @@ def test_large_successful_write_in_legacy_browser_cannot_be_repeated(page):
         requests.append(route.request.post_data_json)
         route.fulfill(status=201, json={"id": BIG, "front": title})
 
-    page.route("**/decks", lambda r: r.fulfill(json=[{"id": 1, "name": "First"}]))
+    page.route("**/decks?*", lambda r: r.fulfill(json=[{"id": 1, "name": "First"}]))
     page.route("**/study/next?*", lambda r: r.fulfill(status=204))
     page.route("**/templates", lambda r: r.fulfill(json=[template]))
     page.route("**/templates/tpl", lambda r: r.fulfill(json=template))
@@ -176,7 +179,7 @@ def test_large_successful_write_in_legacy_browser_cannot_be_repeated(page):
 def test_destinations_follow_picker_manual_id_and_invalid_input(page):
     template = {"id": "tpl", "category": "grammar", "title": "Example"}
     error = {"id": 8, "status": "draft", "attempted": "a", "corrected": "b", "rationale": "c"}
-    page.route("**/decks", lambda r: r.fulfill(json=[{"id": BIG, "name": "Redes"}]))
+    page.route("**/decks?*", lambda r: r.fulfill(json=[{"id": BIG, "name": "Redes"}]))
     page.route("**/study/next?*", lambda r: r.fulfill(status=204))
     page.route("**/templates", lambda r: r.fulfill(json=[template]))
     page.route("**/templates/tpl", lambda r: r.fulfill(json=template))
@@ -199,3 +202,93 @@ def test_destinations_follow_picker_manual_id_and_invalid_input(page):
     for button in (create, approve):
         expect(button).to_be_enabled()
         expect(button).to_have_accessible_description(f"Destino: Redes (#{BIG})")
+
+
+def test_search_reaches_later_pages_without_switching_decks(page):
+    decks = [{"id": i, "name": f"Deck {i}"} for i in range(1, 101)]
+    page.route("**/decks?offset=0&limit=100", lambda r: r.fulfill(json=decks))
+    page.route(
+        "**/decks?offset=100&limit=100", lambda r: r.fulfill(json=[{"id": BIG, "name": "DNS"}])
+    )
+    page.route("**/study/next?*", lambda r: r.fulfill(status=204))
+    page.goto(f"{ORIGIN}/ui")
+    select = page.locator("#deck-select")
+    expect(select.locator("option")).to_have_count(102)
+    page.get_by_label("Buscar mazo").fill("dns")
+    expect(page.locator("#deck-list-status")).to_have_text("Coincidencias: 1.")
+    expect(select).to_have_value("1")
+    select.select_option(str(BIG))
+    expect(page.locator("#deck-id")).to_have_value(str(BIG))
+    page.get_by_label("Buscar mazo").fill("not found")
+    expect(page.locator("#deck-list-status")).to_have_text("Coincidencias: 0.")
+    expect(select).to_have_value(str(BIG))
+    page.get_by_label("Buscar mazo").fill("4740993")
+    expect(page.locator("#deck-list-status")).to_have_text("Coincidencias: 1.")
+
+
+@pytest.mark.parametrize("switch", [False, True], ids=["select-new", "preserve-user-choice"])
+def test_create_first_deck_inline(page, switch):
+    catalog = []
+    writes = []
+    page.route("**/decks?*", lambda r: r.fulfill(json=catalog))
+    page.route("**/decks", lambda r: writes.append(r))
+    page.route("**/study/next?*", lambda r: r.fulfill(status=204))
+    page.goto(f"{ORIGIN}/ui")
+    expect(page.locator("#deck-list-status")).to_contain_text("Aún no hay mazos")
+    page.get_by_text("Crear un mazo", exact=True).click()
+    name = page.get_by_label("Nombre del mazo")
+    name.fill("  Redes  ")
+    create = page.get_by_role("button", name="Crear mazo")
+    with page.expect_request("**/decks"):
+        create.click()
+    expect(create).to_be_disabled()
+    assert writes[0].request.post_data_json == {"name": "Redes"}
+    if switch:
+        page.locator("#deck-id").fill("14")
+    catalog.append({"id": BIG, "name": "Redes"})
+    writes[0].fulfill(status=201, json=catalog[0])
+    expect(page.locator("#deck-create-status")).to_contain_text(f"Mazo «Redes» creado (#{BIG})")
+    expect(page.locator("#deck-id")).to_have_value("14" if switch else str(BIG))
+    expect(page.locator("#deck-select option")).to_have_count(2)
+    expect(create).to_be_enabled()
+    expect(name).to_be_empty()
+    assert len(writes) == 1
+
+
+def test_uncertain_deck_creation_blocks_repeated_submit(page):
+    posts = []
+
+    def interrupted(route):
+        posts.append(route.request.post_data_json)
+        route.abort()
+
+    page.route("**/decks?*", lambda r: r.fulfill(json=[]))
+    page.route("**/decks", interrupted)
+    page.goto(f"{ORIGIN}/ui")
+    page.get_by_text("Crear un mazo", exact=True).click()
+    page.get_by_label("Nombre del mazo").fill("Redes")
+    submit = page.get_by_role("button", name="Crear mazo")
+    submit.click()
+    expect(page.locator("#deck-create-status")).to_contain_text("No se pudo confirmar")
+    submit.click()
+    assert posts == [{"name": "Redes"}]
+
+
+def test_uncertain_template_write_stays_locked_for_its_destination(page):
+    template = {"id": "tpl", "category": "grammar", "title": "Example"}
+    page.route("**/decks?*", lambda r: r.fulfill(json=[{"id": 1, "name": "First"}]))
+    page.route("**/study/next?*", lambda r: r.fulfill(status=204))
+    page.route("**/templates", lambda r: r.fulfill(json=[template]))
+    page.route("**/templates/tpl", lambda r: r.fulfill(json=template))
+    page.route("**/templates/tpl/cards", lambda r: r.fulfill(status=201, body="{"))
+    page.goto(f"{ORIGIN}/ui")
+    page.locator("#templates-section summary").click()
+    page.locator("#template-select").select_option("tpl")
+    create = page.locator("#create-from-template-btn")
+    create.click()
+    expect(page.locator("#templates-status")).to_contain_text("No se pudo confirmar")
+    expect(create).to_be_disabled()
+    page.locator("#deck-id").fill("2")
+    expect(create).to_be_enabled()
+    page.locator("#deck-id").fill("1")
+    expect(create).to_be_disabled()
