@@ -11,7 +11,9 @@
 
 The picker reads the offset-based API in pages of 100 and searches the complete catalog locally by name or decimal ID. Filtering keeps the current deck selected. Template creation and error approval show the exact destination ID and the deck name when available. A manually entered ID outside the catalog is labeled by ID.
 
-The UI reads integer ID tokens before numeric conversion, including on engines without JSON reviver source support. During the current page session, another click cannot repeat a successful or uncertain template write to the same deck. After an uncertain result, inspect the destination deck before reloading. These guards are local to the page; the API does not provide cross-tab or persistent idempotency.
+The UI reads integer ID tokens before numeric conversion, including on engines without JSON reviver source support. During the current page session, another click cannot repeat a successful or uncertain template write to the same deck. After an uncertain result, inspect the destination deck before reloading. Grading now refreshes the due queue after a confirmed or uncertain response and blocks a second grade for that card and due date. A later scheduled occurrence can still be graded. Saving an error draft refreshes the error list and blocks resubmitting the same original text, correction and rationale (ignoring surrounding whitespace). An uncertain response preserves the draft fields for inspection. A validation rejection leaves them editable.
+
+These guards are local to the page; the API does not provide cross-tab or persistent idempotency.
 
 ## Run the pilot
 

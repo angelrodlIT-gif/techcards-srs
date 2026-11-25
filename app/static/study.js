@@ -11,6 +11,8 @@
     creatingDeck: false,
     uncertainDeckNames: new Set(),
     grading: false,
+    gradeWrites: new Map(),
+    draftWrites: new Map(),
     templatesLoaded: false,
     templateSeq: 0,
     activeTemplateId: null,
@@ -209,7 +211,11 @@
     loadDecks(false);
   }
 
-  async function loadNextCard(note = "", focusFrom = null) {
+  // SM-2 advances the due date after a review. A later scheduled occurrence
+  // of the same card must remain eligible, even in a long-lived tab.
+  const reviewKey = (card) => JSON.stringify([card.card_id, card.due_date]);
+
+  async function loadNextCard(notice = null, focusFrom = null) {
     if (state.grading) return;
     const status = $("study-status");
     const deckId = deckIdValue();
@@ -226,19 +232,27 @@
     state.card = null;
     clearAnswer();
     $("study-card").hidden = true;
-    setStatus(status, note ? `${note} Cargando tarjeta…` : "Cargando tarjeta…");
+    function report(message, kind = "") {
+      const text = [notice?.text, message].filter(Boolean).join(" ");
+      setStatus(status, text, notice?.kind === "error" ? "error" : kind || notice?.kind);
+    }
+    report("Cargando tarjeta…");
 
     const res = await api(`/study/next?deck_id=${encodeURIComponent(deckId)}`);
     if (seq !== state.loadSeq || state.grading) return;
     const restoreFocus = focusFrom && document.activeElement === focusFrom;
     if (restoreFocus) $("load-next-btn").focus();
     if (res.status === 204) {
-      return setStatus(status, note ? `${note} Terminaste las tarjetas pendientes.` : "Estás al día con este mazo. Puedes elegir otro o añadir una tarjeta desde Plantillas.", "ok");
+      return report(notice?.kind === "ok" ? "Terminaste las tarjetas pendientes." : "Estás al día con este mazo. Puedes elegir otro o añadir una tarjeta desde Plantillas.", "ok");
     }
-    if (res.status === 404) return setStatus(status, `No se encontró el mazo #${deckId}.`, "error");
-    if (!res.ok || !res.data) return setStatus(status, res.error, "error");
+    if (res.status === 404) return report(`No se encontró el mazo #${deckId}.`, "error");
+    if (!res.ok || !res.data) return report(res.error, "error");
 
     const c = res.data;
+    const prior = state.gradeWrites.get(reviewKey(c));
+    if (prior) {
+      return setStatus(status, `${prior.text} Este repaso está bloqueado para evitar enviarlo dos veces.`, prior.kind);
+    }
     state.card = c;
     $("card-meta").textContent = [
       `Tarjeta #${c.card_id}`, c.kind, c.source_label ? `fuente: ${c.source_label}` : null,
@@ -249,7 +263,7 @@
     setGradeDisabled(true);
     $("study-card").hidden = false;
     if (restoreFocus) $("reveal-btn").focus();
-    setStatus(status, note, note ? "ok" : "");
+    report("");
   }
 
   async function revealCard() {
@@ -283,7 +297,9 @@
 
   async function gradeCard(quality) {
     if (!state.card || state.grading || $("answer-panel").hidden) return;
-    const { card_id: cardId, deck_id: deckId } = state.card;
+    const key = reviewKey(state.card);
+    if (state.gradeWrites.has(key)) return;
+    const { card_id: cardId } = state.card;
     $("card-heading").focus();
     state.selectionRevision++;
     state.grading = true;
@@ -295,15 +311,18 @@
     const res = await post(`/study/${encodeURIComponent(cardId)}/grade`, { quality });
     state.grading = false;
     setStudyNavDisabled(false);
-    if (!res.ok || !res.data) {
+    if (res.status === 404 || res.status === 422) {
       setGradeDisabled(false);
       $("reveal-btn").disabled = !$("answer-panel").hidden;
       return setStatus($("study-status"), res.error, "error");
     }
+    const notice = res.ok && res.data?.due_date && Number.isInteger(res.data.interval_days)
+      ? { text: `Calificación: ${quality}. Próximo repaso: ${res.data.due_date} (intervalo: ${res.data.interval_days} d).`, kind: "ok" }
+      : { text: `No se pudo confirmar la calificación de la tarjeta #${cardId}.`, kind: "error" };
+    state.gradeWrites.set(key, notice);
     const nextFocus = document.activeElement === $("card-heading") ? $("load-next-btn") : null;
     nextFocus?.focus();
-    $("deck-id").value = String(deckId);
-    await loadNextCard(`Calificación: ${quality}. Próximo repaso: ${res.data.due_date} (intervalo: ${res.data.interval_days} d).`, nextFocus);
+    await loadNextCard(notice, nextFocus);
   }
 
   async function loadTemplates() {
@@ -473,25 +492,40 @@
     syncDestinations();
   }
 
+  function draftPayload() {
+    return {
+      attempted: $("err-attempted").value.trim(),
+      corrected: $("err-corrected").value.trim(),
+      rationale: $("err-rationale").value.trim(),
+    };
+  }
+
+  function syncDraftAction() {
+    const prior = state.draftWrites.get(JSON.stringify(draftPayload()));
+    $("error-form").querySelector("button[type=submit]").disabled = Boolean(prior);
+    setStatus($("draft-status"), prior?.text || "", prior?.kind);
+  }
+
   async function createError(event) {
     event.preventDefault();
     const form = $("error-form");
+    const payload = draftPayload();
+    const key = JSON.stringify(payload);
     const controls = [...form.querySelectorAll("textarea, button[type=submit]")];
-    if (controls.some((c) => c.disabled)) return;
-    const payload = {
-      attempted: $("err-attempted").value,
-      corrected: $("err-corrected").value,
-      rationale: $("err-rationale").value,
-    };
+    if (controls.some((c) => c.disabled) || state.draftWrites.has(key)) return;
     controls.forEach((c) => { c.disabled = true; });
     const res = await post("/errors", payload);
-    if (!res.ok) {
-      controls.forEach((c) => { c.disabled = false; });
-      return setStatus($("errors-status"), res.error, "error");
-    }
-    form.reset();
     controls.forEach((c) => { c.disabled = false; });
-    await loadErrors(`Borrador #${res.data.id} guardado.`);
+    if (res.status === 422) return setStatus($("draft-status"), res.error, "error");
+    const confirmed = res.ok && res.data?.id;
+    const notice = confirmed
+      ? { text: `Borrador #${res.data.id} guardado.`, kind: "ok" }
+      : { text: "No se pudo confirmar el borrador. Comprueba el registro. El reenvío de este contenido está bloqueado en esta página.", kind: "error" };
+    state.draftWrites.set(key, notice);
+    if (confirmed) form.reset();
+    syncDraftAction();
+    setStatus($("draft-status"), notice.text, notice.kind);
+    await loadErrors();
   }
 
   $("deck-select").addEventListener("change", (e) => {
@@ -513,8 +547,8 @@
     renderDeckPicker();
     setStatus($("study-status"), "");
   });
-  $("deck-id").addEventListener("keydown", (e) => { if (e.key === "Enter" && !state.grading) loadNextCard("", e.target); });
-  $("load-next-btn").addEventListener("click", (e) => loadNextCard("", e.currentTarget));
+  $("deck-id").addEventListener("keydown", (e) => { if (e.key === "Enter" && !state.grading) loadNextCard(null, e.target); });
+  $("load-next-btn").addEventListener("click", (e) => loadNextCard(null, e.currentTarget));
   $("deck-search").addEventListener("input", () => {
     state.selectionRevision++;
     renderDeckList();
@@ -542,6 +576,7 @@
   $("create-from-template-btn").addEventListener("click", () => createCardFromTemplate());
   $("errors-section").addEventListener("toggle", (e) => { if (e.target.open && !state.errorsLoaded) loadErrors(); });
   $("error-form").addEventListener("submit", createError);
+  $("error-form").addEventListener("input", syncDraftAction);
   $("error-filter").addEventListener("change", () => loadErrors());
   $("load-errors-btn").addEventListener("click", () => loadErrors());
 

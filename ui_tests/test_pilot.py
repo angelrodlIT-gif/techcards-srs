@@ -76,7 +76,7 @@ def prompt(card_id=BIG, deck_id=BIG):
 def test_keyboard_loop_and_mobile_layout(page):
     grades = []
     page.route("**/decks?*", lambda r: r.fulfill(json=[{"id": BIG, "name": "Networks"}]))
-    page.route("**/study/next?*", lambda r: r.fulfill(json=prompt()))
+    page.route("**/study/next?*", lambda r: r.fulfill(json=prompt(BIG + 2 if grades else BIG)))
     page.route(f"**/study/{BIG}/reveal", lambda r: r.fulfill(json={"back": "Resolve names"}))
 
     def grade(route):
@@ -355,6 +355,9 @@ def test_draft_refreshes_and_locks_only_the_same_contents(page, outcome):
     submit = page.get_by_role("button", name="Guardar borrador")
     with page.expect_request("**/errors?*", timeout=3000):
         submit.click()
+    if outcome != "confirmed":
+        expect(page.locator("#draft-status")).to_contain_text("No se pudo confirmar")
+        expect(page.locator("#err-attempted")).to_have_value("a")
     for field, value in draft.items():
         page.locator(f"#err-{field}").fill(value + " ")
     expect(submit).to_be_disabled()
@@ -362,3 +365,28 @@ def test_draft_refreshes_and_locks_only_the_same_contents(page, outcome):
     page.locator("#err-rationale").fill("Different reason")
     expect(submit).to_be_enabled()
     assert posts == [draft]
+
+
+def test_validation_rejections_leave_grade_and_draft_correctable(page):
+    def reject(route):
+        route.fulfill(status=422, json={"detail": "Entrada no válida"})
+
+    page.route("**/decks?*", lambda r: r.fulfill(json=[{"id": BIG, "name": "First"}]))
+    page.route("**/study/next?*", lambda r: r.fulfill(json=prompt()))
+    page.route("**/reveal", lambda r: r.fulfill(json={"back": "Answer"}))
+    page.route("**/grade", reject)
+    page.route("**/errors?*", lambda r: r.fulfill(json=[]))
+    page.route("**/errors", reject)
+    page.goto(f"{ORIGIN}/ui")
+    page.locator("#reveal-btn").click()
+    page.locator('[data-quality="4"]').click()
+    expect(page.locator("#study-status")).to_have_text("Entrada no válida")
+    expect(page.locator('[data-quality="3"]')).to_be_enabled()
+    page.locator("#errors-section summary").click()
+    for field in ("attempted", "corrected", "rationale"):
+        page.locator(f"#err-{field}").fill(field)
+    submit = page.get_by_role("button", name="Guardar borrador")
+    submit.click()
+    expect(page.locator("#draft-status")).to_have_text("Entrada no válida")
+    expect(submit).to_be_enabled()
+    expect(page.locator("#err-attempted")).to_have_value("attempted")
