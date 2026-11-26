@@ -1,5 +1,5 @@
 import {api, all, esc} from './api.js';
-import {workshop, submitWorkshop} from './workshop.js';
+const loadWorkshop = () => import('./workshop.js');
 
 const main = document.querySelector('main');
 const notice = document.querySelector('#notice');
@@ -89,7 +89,7 @@ async function render() {
         if (current !== version) return;
         session = {cards,deck,notes:[],answer:null};
         html = study();
-      } else if (Object.hasOwn(views,view)) html = title(views[view][2]) + await workshop(view,decks);
+      } else if (Object.hasOwn(views,view)) html = title(views[view][2]) + await (await loadWorkshop()).workshop(view,decks);
       else html = title('Vista desconocida') + '<a href="#inicio">Ir al inicio</a>';
     }
     if (current === version) {
@@ -109,7 +109,7 @@ async function act(button, form) {
   if (button) button.disabled = true;
   try {
     if (form) {
-      const message = await submitWorkshop(form);
+      const message = await (await loadWorkshop()).submitWorkshop(form);
       if (current !== version) return;
       await render();
       flash(message);
@@ -129,12 +129,18 @@ async function act(button, form) {
       main.querySelector('h2')?.focus();
       flash('');
     }
-  } catch (e) { if (current === version) flash(e.message,true); }
+  } catch (e) { if (current === version) {
+      if (button?.hasAttribute('data-grade')) {
+        main.innerHTML = title('Comprueba tu cola') + '<p>Vuelve a consultar las tarjetas pendientes antes de calificar de nuevo.</p><button data-refresh>Actualizar sesión</button>';
+        session = null;
+      }
+      flash(e.message,true);
+    } }
   finally { busy = false; if (button) button.disabled = false; }
 }
 main.addEventListener('click', e => {
   const button = e.target.closest('button');
-  if (button?.matches('[data-refresh]')) render();
+  if (button?.matches('[data-refresh]')) { flash(''); render(); }
   if (button?.matches('[data-grade],[data-reveal]')) act(button);
 });
 main.addEventListener('submit', e => { e.preventDefault(); act(e.submitter,e.target); });
@@ -143,6 +149,10 @@ document.addEventListener('keydown', e => {
   const selector = e.code === 'Space' && !e.target.closest('button') ? '[data-reveal]' : /^[0-5]$/.test(e.key) ? '[data-grade="'+e.key+'"]' : null;
   const button = selector && main.querySelector(selector);
   if (button) { e.preventDefault(); button.click(); }
+});
+document.querySelector('.skip').addEventListener('click', event => {
+  event.preventDefault();
+  main.focus();
 });
 window.addEventListener('hashchange', () => { flash(''); window.scrollTo(0,0); render(); });
 render();
