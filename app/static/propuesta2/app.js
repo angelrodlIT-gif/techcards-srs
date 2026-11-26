@@ -13,7 +13,7 @@ const link = key => `<a href="#${key}"><span aria-hidden="true">${views[key][0]}
 menu.innerHTML = '<small>Observatorio</small>' + ['inicio','analitica'].map(link).join('') +
   '<small>Biblioteca</small>' + ['crear','plantillas','fuentes','errores'].map(link).join('');
 document.querySelector('#date').textContent = new Intl.DateTimeFormat('es-MX',{weekday:'short',day:'numeric',month:'short'}).format(new Date());
-let version = 0, session, busy = false;
+let version = 0, session, busy = false, noticeTimer;
 const fmt = n => n.toLocaleString('es-MX');
 const path = () => location.hash.slice(1) || 'inicio';
 const title = text => `<h1>${esc(text)}</h1>`;
@@ -21,8 +21,10 @@ const stat = (label, value, description) => `<article class="metric"><span>${lab
 const studyLink = (deck, label) => `<a class="primary" href="#estudio/${deck.id}">${label} <b aria-hidden="true">↗</b></a>`;
 const empty = (heading, copy) => `<div class="empty"><span aria-hidden="true">✧</span><h3>${heading}</h3><p>${copy}</p></div>`;
 function flash(message, error = false) {
+  clearTimeout(noticeTimer);
   notice.classList.toggle('error', error);
   notice.textContent = message;
+  if (message && !error && !message.endsWith('…')) noticeTimer = setTimeout(() => flash(''), 5500);
 }
 
 async function dashboard(decks) {
@@ -43,7 +45,7 @@ async function dashboard(decks) {
     <section aria-label="Resumen de actividad" class="stats">${stat('Por repasar',fmt(count),'Tarjetas pendientes') + stat('Recuerdo',rate,'Notas de 3 a 5') + stat('Sesiones',fmt(metrics.practice.sessions),'Histórico de práctica')}</section>
     <div class="section-head"><h2>Mis mazos</h2><a href="#crear">＋ Crear mazo</a></div>
     <div class="decks">${rows.map((row,i) => `<article class="deck"><div class="cover tone${i%3}" aria-hidden="true"><span>✧</span></div><div class="deck-name"><h3>${esc(row.name)}</h3><p>${esc(row.description) || 'Mazo de estudio'}</p></div>
-    ${row.count ? `<a class="due" href="#estudio/${row.id}" aria-label="Estudiar ${esc(row.name)}, ${row.count} pendientes">${fmt(row.count)} pendientes ↗</a>` : '<span class="done">Al día ✓</span>'}</article>`).join('') || empty('Tu biblioteca empieza aquí','Los mazos que crees aparecerán con su próxima cola de repaso.')}</div>`;
+    ${row.count ? `<a class="due" href="#estudio/${row.id}" aria-label="Estudiar ${esc(row.name)}, ${row.count} pendientes">${fmt(row.count)} ${row.count === 1 ? 'pendiente' : 'pendientes'} ↗</a>` : '<span class="done">Al día ✓</span>'}</article>`).join('') || empty('Tu biblioteca empieza aquí','Los mazos que crees aparecerán con su próxima cola de repaso.')}</div>`;
 }
 
 async function analytics() {
@@ -125,8 +127,9 @@ async function act(button, form) {
       }
       if (current !== version) return;
       main.innerHTML = study();
-      main.querySelector('h2')?.setAttribute('tabindex','-1');
-      main.querySelector('h2')?.focus();
+      const target = main.querySelector(s.answer ? '.answer p' : 'h2');
+      target?.setAttribute('tabindex','-1');
+      target?.focus();
       flash('');
     }
   } catch (e) { if (current === version) {
@@ -145,7 +148,7 @@ main.addEventListener('click', e => {
 });
 main.addEventListener('submit', e => { e.preventDefault(); act(e.submitter,e.target); });
 document.addEventListener('keydown', e => {
-  if (!session || e.repeat || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey || e.target.closest('input,textarea,select,a,[contenteditable=true]')) return;
+  if (!session || !(e.target instanceof Element) || e.repeat || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey || e.target.closest('input,textarea,select,a,[contenteditable=true]')) return;
   const selector = e.code === 'Space' && !e.target.closest('button') ? '[data-reveal]' : /^[0-5]$/.test(e.key) ? '[data-grade="'+e.key+'"]' : null;
   const button = selector && main.querySelector(selector);
   if (button) { e.preventDefault(); button.click(); }
