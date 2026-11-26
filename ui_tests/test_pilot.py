@@ -390,3 +390,85 @@ def test_validation_rejections_leave_grade_and_draft_correctable(page):
     expect(page.locator("#draft-status")).to_have_text("Entrada no válida")
     expect(submit).to_be_enabled()
     expect(page.locator("#err-attempted")).to_have_value("attempted")
+
+
+@pytest.mark.parametrize(("width", "font_scale"), [(320, 1), (1024, 1), (320, 2)])
+def test_long_study_content_fits(page, width, font_scale):
+    page.set_viewport_size({"width": width, "height": 700})
+    name = "👩🏽‍💻 " + "DistributedSystemsCertification" * 3
+    token = "bartholomew.fitzgerald@northwind-industries-holdings.example.com"
+    # Test-only switch, also usable with Playwright's interactive inspector.
+    page.add_init_script("""document.addEventListener('DOMContentLoaded', () => {
+        const picker = document.createElement('select');
+        picker.setAttribute('aria-label', 'Test data');
+        for (const label of ['Demo data', 'Worst case', 'Empty']) picker.add(new Option(label));
+        picker.value = new URLSearchParams(location.search).get('data') || 'Demo data';
+        picker.onchange = () => { location.search = new URLSearchParams({data: picker.value}); };
+        Object.assign(picker.style, {position: 'fixed', bottom: '0', left: '50%',
+                                     transform: 'translateX(-50%)', zIndex: '1'});
+        document.body.append(picker);
+    });""")
+    page.route("**/ui?*", lambda r: r.fulfill(path=STATIC / "study.html"))
+
+    def decks(route):
+        rows = [{"id": BIG, "name": name if "Worst" in page.url else "Redes"}]
+        route.fulfill(json=[] if "Empty" in page.url else rows)
+
+    page.route("**/decks?*", decks)
+    page.route(
+        "**/study/next?*",
+        lambda r: r.fulfill(
+            json=dict(prompt(), repetitions=2147483647, source_label=token)
+            if "Worst" in page.url
+            else prompt()
+        ),
+    )
+    page.route(
+        "**/reveal",
+        lambda r: r.fulfill(
+            json={"back": name, "accepted_answers": [token]}
+            if "Worst" in page.url
+            else {"back": "Redes"}
+        ),
+    )
+    page.goto(f"{ORIGIN}/ui")
+    expect(page.locator("#card-meta")).to_contain_text("repasos: 0")
+    picker = page.get_by_label("Test data")
+    picker.select_option(label="Empty")
+    expect(page.locator("#deck-list-status")).to_contain_text("Aún no hay mazos")
+    picker.select_option(label="Worst case")
+    page.locator("#reveal-btn").click()
+    page.locator("html").evaluate(
+        "(el, scale) => el.style.fontSize = 16 * scale + 'px'", font_scale
+    )
+    expect(page.locator("#card-back")).to_have_text(name)
+    expect(page.locator("#card-meta")).to_contain_text(f"Tarjeta #{BIG}")
+    expect(page.locator("#card-meta")).to_contain_text("2147483647")
+    for selector in ("#card-meta", "#card-accepted", "html"):
+        assert page.locator(selector).evaluate("el => el.scrollWidth <= el.clientWidth"), selector
+
+
+@pytest.mark.parametrize("reduced", [False, True], ids=["standard", "reduced"])
+def test_form_press_feedback(page, reduced):
+    page.emulate_media(reduced_motion="reduce" if reduced else "no-preference")
+    page.route("**/decks?*", lambda r: r.fulfill(json=[]))
+    page.goto(f"{ORIGIN}/ui")
+    page.locator("#new-deck summary").click()
+    button = page.get_by_role("button", name="Crear mazo")
+    button.hover()
+    page.mouse.down()
+    if reduced:
+        expect(button).to_have_css("transform", "none")
+    else:
+        expect(button).to_have_css("transform", "matrix(0.97, 0, 0, 0.97, 0, 0)")
+        expect(button).to_have_css("transition-duration", "0.16s")
+    page.mouse.up()
+    if not reduced:
+        expect(button).to_have_css("transition-duration", "0.1s")
+    page.get_by_label("Nombre del mazo").focus()
+    page.keyboard.press("Tab")
+    expect(button).to_be_focused()
+    page.keyboard.down("Space")
+    expect(button).to_have_css("transition-duration", "0s")
+    expect(button).to_have_css("transform", "none")
+    page.keyboard.up("Space")

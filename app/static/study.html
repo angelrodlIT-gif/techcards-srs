@@ -2,11 +2,13 @@
 <html lang="es">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>TechCards SRS — Estudio local</title>
   <style>
     :root { color-scheme: light; background: #fff; color: #000; font-family: system-ui, Ubuntu, sans-serif; line-height: 1.5; }
-    body { max-width: 48rem; margin: 1.5rem auto; padding: 0 1rem 3rem; }
+    body { max-width: 50rem; margin: 0 auto; min-height: 100dvh; box-sizing: border-box;
+      padding: calc(1.5rem + env(safe-area-inset-top)) calc(1rem + env(safe-area-inset-right))
+               calc(3rem + env(safe-area-inset-bottom)) calc(1rem + env(safe-area-inset-left)); }
     header { display: flex; justify-content: space-between; align-items: baseline; border-bottom: 1px solid #dfdfdf; padding-bottom: 0.5rem; }
     h1, h2 { margin: 0; font-size: 1.05rem; }
     h1 { font-size: 1.35rem; }
@@ -15,12 +17,27 @@
     .row { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-top: 0.5rem; }
     .field { display: flex; flex-direction: column; gap: 0.25rem; margin-top: 0.5rem; }
     input, select, textarea, button { font: inherit; padding: 0.35rem 0.6rem; border-radius: 4px; border: 1px solid #cfcfcf; }
+    input, textarea, select { font-size: max(1rem, 16px); }
+    button { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
     textarea { width: 100%; box-sizing: border-box; min-height: 3rem; }
     a { color: #0000ee; }
     select, input { max-width: 100%; box-sizing: border-box; }
     button { background: #f2f2f2; cursor: pointer; }
+    #study-card { padding: clamp(1rem, 3vw, 1.5rem); box-shadow: 0 2px 8px rgb(0 0 0 / 0.07); }
+    #card-front { font-size: 1.125rem; line-height: 1.55; }
+    #reveal-btn { color: white; background: #244b70; border-color: #244b70; }
+    @media (hover: hover) and (pointer: fine) {
+      button:enabled:hover { background: #e4e8eb; }
+      #reveal-btn:enabled:hover { background: #193954; }
+    }
+    button:enabled:active { box-shadow: inset 0 0 0 2px currentColor; }
+    @media (prefers-reduced-motion: no-preference) {
+      form button:not(:focus-visible) { transition: transform 100ms cubic-bezier(0.23, 1, 0.32, 1); }
+      form button:enabled:active:not(:focus-visible) { transform: scale(0.97); transition-duration: 160ms; }
+    }
     :disabled { opacity: 0.55; cursor: not-allowed; }
     .box { white-space: pre-wrap; overflow-wrap: anywhere; padding: 0.7rem; border-radius: 4px; background: #f7f7f7; margin: 0.5rem 0; }
+    #card-meta, #card-accepted { overflow-wrap: anywhere; }
     .meta { font-size: 0.85rem; opacity: 0.8; }
     .status { margin: 0.5rem 0 0; font-size: 0.9rem; }
     .status.error { color: #c62828; }
@@ -28,11 +45,11 @@
     .item { border-top: 1px solid #dfdfdf; padding-top: 0.7rem; margin-top: 0.7rem; overflow-wrap: anywhere; }
     :focus-visible { outline: 3px solid #195a9a; outline-offset: 2px; }
     #deck-fields { border: 0; padding: 0; min-width: 0; }
-    header { gap: 1rem; }
+    header { flex-wrap: wrap; gap: 0.5rem 1rem; overflow-wrap: anywhere; }
     @media (max-width: 34rem) {
-      #deck-heading + .row { display: grid; align-items: stretch; }
+      #deck-heading + .row { display: grid; grid-template-columns: minmax(0, 1fr); align-items: stretch; }
       #deck-id, #deck-select { width: 100%; min-width: 0; }
-      #grade-controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      #grade-controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 6.5rem), 1fr)); }
       button, input, select { min-height: 44px; }
     }
   </style>
