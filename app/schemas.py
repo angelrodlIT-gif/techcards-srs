@@ -39,7 +39,10 @@ Explanation = Annotated[str, StringConstraints(min_length=1, max_length=5000), N
 MAX_ACCEPTED_ANSWERS = 20
 MAX_ACCEPTED_ANSWER_CHARS = 5000
 CLOZE_BLANK_RE = re.compile(r"_{4,}")
-Kind = Literal["vocabulary", "interview_phrase", "behavioral", "sentence", "cloze", "es_en"]
+Kind = Literal[
+    "vocabulary", "interview_phrase", "behavioral", "sentence", "cloze", "es_en", "listening"
+]
+MAX_LISTENING_CHARS = 1000
 SourceStatus = Literal["draft", "approved", "discarded"]
 ErrorStatus = SourceStatus
 ErrorCategory = Literal["technical", "star"]
@@ -129,9 +132,13 @@ class CardPayloadBase(CardExtrasMixin):
     kind: Kind = "vocabulary"
 
     @model_validator(mode="after")
-    def validate_cloze_front(self) -> Self:
+    def validate_format(self) -> Self:
         if self.kind == "cloze" and CLOZE_BLANK_RE.findall(self.front) != ["____"]:
             raise ValueError("cloze card front must contain exactly one '____' blank")
+        if self.kind == "listening" and len(self.back) > MAX_LISTENING_CHARS:
+            raise ValueError(
+                f"listening transcript must be at most {MAX_LISTENING_CHARS} characters"
+            )
         return self
 
 

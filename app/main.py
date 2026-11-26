@@ -1,8 +1,8 @@
 from collections.abc import Callable
 from datetime import UTC, date, datetime
-from typing import Annotated
+from typing import Annotated, Literal
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -11,9 +11,11 @@ from sqlalchemy.orm import Session, contains_eager, joinedload, selectinload
 from app.db import get_db
 from app.generator import CardGenerator, get_generator
 from app.learning import LearningSummary, summarize_learning
+from app.listening import AudioUnavailable, SynthesisLimitReached, listening_audio
 from app.models import Card, Deck, ErrorLog, Review, Source
 from app.remediation import STAR_PREFIX, build_remediation_draft
 from app.schemas import (
+    MAX_LISTENING_CHARS,
     CardInput,
     CardOut,
     DeckInput,
@@ -298,6 +300,41 @@ def study_reveal(card_id: int, db: DB):
         accepted_answers=card.accepted_answers,
         explanation=card.explanation,
     )
+
+
+@app.post(
+    "/study/{card_id}/audio",
+    response_class=Response,
+    responses={
+        200: {"content": {"audio/mpeg": {"schema": {"type": "string", "format": "binary"}}}},
+        403: {"description": "Audio requires a direct loopback connection"},
+        404: {"description": "Card not found"},
+        409: {"description": "Card is ineligible for listening audio"},
+        429: {"description": "Synthesis budget exhausted"},
+        503: {"description": "Audio unavailable. Use the reveal endpoint for text-only study."},
+    },
+)
+def study_audio(
+    card_id: int, db: DB, request: Request, polly_opt_in: Annotated[Literal["true"], Header()]
+):
+    if (
+        request.client is None
+        or request.client.host not in {"127.0.0.1", "::1"}
+        or request.url.hostname not in {"127.0.0.1", "::1", "localhost"}
+        or "forwarded" in request.headers
+        or "x-forwarded-for" in request.headers
+    ):
+        raise HTTPException(403, "Listening audio requires a direct loopback connection")
+    card = require(db, Card, card_id)
+    if card.kind != "listening" or not 1 <= len(card.back) <= MAX_LISTENING_CHARS:
+        raise HTTPException(409, "Card is ineligible for listening audio")
+    try:
+        audio = listening_audio.get(card.back)
+    except SynthesisLimitReached as exc:
+        raise HTTPException(429, "Synthesis budget exhausted. Reveal for the transcript.") from exc
+    except AudioUnavailable as exc:
+        raise HTTPException(503, "Audio unavailable. Reveal for the transcript.") from exc
+    return Response(audio, media_type="audio/mpeg", headers={"Cache-Control": "no-store"})
 
 
 @app.post("/study/{card_id}/grade", response_model=ReviewOut, status_code=201)

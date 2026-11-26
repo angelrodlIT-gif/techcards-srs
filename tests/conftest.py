@@ -39,7 +39,7 @@ def client(db_engine):
 
     app.dependency_overrides[get_db] = override_db
     try:
-        with TestClient(app) as test_client:
+        with TestClient(app, client=("127.0.0.1", 50000)) as test_client:
             yield test_client
     finally:
         app.dependency_overrides.clear()
