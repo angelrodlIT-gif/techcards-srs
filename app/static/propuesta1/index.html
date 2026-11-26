@@ -1,6 +1,253 @@
 <!doctype html>
 <html lang="es">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Propuesta 1</title>
-<link rel="stylesheet" href="styles.css"></head>
-<body><main><h1>Propuesta 1</h1><p>En construcción.</p></main><script src="app.js" type="module"></script></body>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" media="(prefers-color-scheme: light)" content="#F6F4EF" id="meta-theme-light">
+  <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#141311" id="meta-theme-dark">
+  <title>TechCards · Atelier de Estudio</title>
+  <script>
+    (function () {
+      try {
+        var saved = localStorage.getItem("techcards_p1_theme");
+        if (saved === "light" || saved === "dark") {
+          document.documentElement.dataset.theme = saved;
+        }
+      } catch (_) {}
+    })();
+  </script>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Saltar al contenido</a>
+
+  <div class="app-shell">
+    <!-- Desktop Sidebar -->
+    <aside class="sidebar" aria-label="Navegación principal">
+      <div class="sidebar-top">
+        <a href="#inicio" class="brand" data-nav="inicio" aria-label="TechCards Atelier, ir a Inicio">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 28 28" width="24" height="24" fill="none">
+              <rect x="3" y="5" width="18" height="19" rx="3.5" stroke="currentColor" stroke-width="1.8"/>
+              <path d="M9 3.5h13.5A2.5 2.5 0 0 1 25 6v14.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+              <path d="M7.5 11.5h9M7.5 15.5h6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+            </svg>
+          </span>
+          <span class="brand-text">
+            <strong class="brand-title">TechCards</strong>
+            <span class="brand-sub">Atelier SRS</span>
+          </span>
+        </a>
+
+        <nav class="sidebar-nav" aria-label="Secciones">
+          <a href="#inicio" class="nav-item" data-nav="inicio">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 20 20" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3" y="3" width="6" height="6" rx="1.5"/>
+                <rect x="11" y="3" width="6" height="6" rx="1.5"/>
+                <rect x="3" y="11" width="6" height="6" rx="1.5"/>
+                <rect x="11" y="11" width="6" height="6" rx="1.5"/>
+              </svg>
+            </span>
+            <span class="nav-label">Inicio</span>
+            <span class="nav-badge" data-badge="due" hidden>0</span>
+          </a>
+
+          <a href="#estudiar" class="nav-item" data-nav="estudiar">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 20 20" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3" y="4" width="14" height="12" rx="2"/>
+                <path d="M7 8.5h6M7 11.5h4"/>
+              </svg>
+            </span>
+            <span class="nav-label">Estudiar</span>
+            <span class="nav-kbd" aria-hidden="true">S</span>
+          </a>
+
+          <a href="#crear" class="nav-item" data-nav="crear">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 20 20" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M10 4v12M4 10h12"/>
+              </svg>
+            </span>
+            <span class="nav-label">Crear</span>
+          </a>
+
+          <a href="#errores" class="nav-item" data-nav="errores">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 20 20" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 15.5 14.5 5l1.5 1.5L5.5 17H4v-1.5Z"/>
+                <path d="M12.5 7 14 8.5"/>
+              </svg>
+            </span>
+            <span class="nav-label">Errores</span>
+            <span class="nav-badge nav-badge--warn" data-badge="draftErrors" hidden>0</span>
+          </a>
+
+          <a href="#analitica" class="nav-item" data-nav="analitica">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 20 20" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 16V9M10 16V4M16 16v-5"/>
+              </svg>
+            </span>
+            <span class="nav-label">Analítica</span>
+          </a>
+        </nav>
+      </div>
+
+      <div class="sidebar-footer">
+        <div class="sidebar-control-group">
+          <span class="sidebar-control-label">Fuente de datos</span>
+          <div class="segmented segmented--compact" role="group" aria-label="Fuente de datos">
+            <button type="button" class="seg-btn" data-data-mode="live" aria-pressed="true">API real</button>
+            <button type="button" class="seg-btn" data-data-mode="demo" aria-pressed="false">Datos demo</button>
+          </div>
+        </div>
+
+        <div class="sidebar-meta-row">
+          <button type="button" class="icon-pill-btn" data-action="cycle-theme" aria-label="Cambiar tema visual">
+            <span class="theme-icon" aria-hidden="true">◐</span>
+            <span data-theme-label>Tema: Auto</span>
+          </button>
+          <a href="/propuestas" class="subtle-link">Propuestas</a>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Main Column -->
+    <div class="workspace-col">
+      <!-- Mobile Header -->
+      <header class="mobile-header">
+        <a href="#inicio" class="brand brand--compact" data-nav="inicio">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 28 28" width="20" height="20" fill="none">
+              <rect x="3" y="5" width="18" height="19" rx="3.5" stroke="currentColor" stroke-width="1.9"/>
+              <path d="M9 3.5h13.5A2.5 2.5 0 0 1 25 6v14.5" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/>
+              <path d="M7.5 11.5h9M7.5 15.5h6" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/>
+            </svg>
+          </span>
+          <strong class="brand-title">TechCards</strong>
+        </a>
+
+        <div class="mobile-header-actions">
+          <button type="button" class="chip-toggle" data-action="toggle-demo" aria-pressed="false" id="mobile-demo-toggle">
+            Datos demo
+          </button>
+          <button type="button" class="icon-btn" data-action="cycle-theme" aria-label="Cambiar tema claro u oscuro" title="Cambiar tema">
+            <span aria-hidden="true">◐</span>
+          </button>
+        </div>
+      </header>
+
+      <!-- Explicit Banner when Demo or Break-UI mode is active -->
+      <div id="mode-banner" class="mode-banner" role="status" hidden>
+        <div class="mode-banner-inner">
+          <div class="mode-banner-copy">
+            <span class="mode-dot" aria-hidden="true"></span>
+            <strong id="mode-banner-title">Modo Datos demo</strong>
+            <span id="mode-banner-desc">Vista previa sintética de solo lectura. No se envía nada a la API.</span>
+          </div>
+          <div class="mode-banner-controls">
+            <div class="segmented segmented--banner" role="group" aria-label="Cambiar conjunto de prueba">
+              <button type="button" class="seg-btn" data-data-mode="live" aria-pressed="false">API real</button>
+              <button type="button" class="seg-btn" data-data-mode="demo" aria-pressed="false">Demo</button>
+              <button type="button" class="seg-btn" data-data-mode="worst" aria-pressed="false">Caso extremo</button>
+              <button type="button" class="seg-btn" data-data-mode="empty" aria-pressed="false">Vacío</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Main Workspace -->
+      <main id="main-content" class="main-canvas" tabindex="-1">
+        <div id="view-root" class="view-root" aria-live="off">
+          <div class="skeleton-stack" aria-label="Cargando espacio de estudio">
+            <div class="skeleton skeleton--title"></div>
+            <div class="skeleton skeleton--hero"></div>
+            <div class="skeleton-grid">
+              <div class="skeleton skeleton--card"></div>
+              <div class="skeleton skeleton--card"></div>
+            </div>
+          </div>
+        </div>
+      </main>
+    </div>
+  </div>
+
+  <!-- Mobile Bottom Navigation -->
+  <nav class="mobile-tabbar" aria-label="Navegación móvil">
+    <a href="#inicio" class="tabbar-item" data-nav="inicio">
+      <span class="tabbar-icon" aria-hidden="true">
+        <svg viewBox="0 0 20 20" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="3" width="6" height="6" rx="1.5"/>
+          <rect x="11" y="3" width="6" height="6" rx="1.5"/>
+          <rect x="3" y="11" width="6" height="6" rx="1.5"/>
+          <rect x="11" y="11" width="6" height="6" rx="1.5"/>
+        </svg>
+        <span class="tabbar-dot" data-dot="due" hidden></span>
+      </span>
+      <span class="tabbar-label">Inicio</span>
+    </a>
+
+    <a href="#estudiar" class="tabbar-item" data-nav="estudiar">
+      <span class="tabbar-icon" aria-hidden="true">
+        <svg viewBox="0 0 20 20" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="4" width="14" height="12" rx="2"/>
+          <path d="M7 8.5h6M7 11.5h4"/>
+        </svg>
+      </span>
+      <span class="tabbar-label">Estudiar</span>
+    </a>
+
+    <a href="#crear" class="tabbar-item" data-nav="crear">
+      <span class="tabbar-icon" aria-hidden="true">
+        <svg viewBox="0 0 20 20" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M10 4v12M4 10h12"/>
+        </svg>
+      </span>
+      <span class="tabbar-label">Crear</span>
+    </a>
+
+    <a href="#errores" class="tabbar-item" data-nav="errores">
+      <span class="tabbar-icon" aria-hidden="true">
+        <svg viewBox="0 0 20 20" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 15.5 14.5 5l1.5 1.5L5.5 17H4v-1.5Z"/>
+          <path d="M12.5 7 14 8.5"/>
+        </svg>
+        <span class="tabbar-dot tabbar-dot--warn" data-dot="draftErrors" hidden></span>
+      </span>
+      <span class="tabbar-label">Errores</span>
+    </a>
+
+    <a href="#analitica" class="tabbar-item" data-nav="analitica">
+      <span class="tabbar-icon" aria-hidden="true">
+        <svg viewBox="0 0 20 20" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 16V9M10 16V4M16 16v-5"/>
+        </svg>
+      </span>
+      <span class="tabbar-label">Analítica</span>
+    </a>
+  </nav>
+
+  <!-- Native accessible modal dialog -->
+  <dialog id="app-dialog" class="modal-dialog" aria-labelledby="dialog-title">
+    <div class="modal-surface">
+      <header class="modal-header">
+        <h2 id="dialog-title" class="modal-title"></h2>
+        <button type="button" class="icon-btn" id="dialog-close-btn" aria-label="Cerrar ventana">
+          <svg viewBox="0 0 20 20" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+            <path d="M5 5l10 10M15 5 5 15"/>
+          </svg>
+        </button>
+      </header>
+      <div id="dialog-body" class="modal-body"></div>
+    </div>
+  </dialog>
+
+  <!-- Toast notifications -->
+  <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="false"></div>
+
+  <script src="app.js" type="module"></script>
+</body>
 </html>
