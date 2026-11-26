@@ -120,9 +120,21 @@ def _unlink_and_delete_locked_cards(db: Session, card_ids: list[int]) -> None:
     _delete_locked_cards(db, card_ids)
 
 
+def _acquire_sqlite_write_lock(db: Session) -> None:
+    if db.get_bind().dialect.name != "sqlite":
+        return
+    conn = db.connection()
+    raw = conn.connection.dbapi_connection
+    if not getattr(raw, "in_transaction", False):
+        # In sqlite3's legacy transaction mode, SELECT neither begins a transaction
+        # nor acquires a write lock; BEGIN IMMEDIATE keeps selection and deletion atomic.
+        conn.exec_driver_sql("BEGIN IMMEDIATE")
+
+
 # Canonical lock order across all deletion and retention paths:
 # decks / sources -> error_logs (id) -> cards (id) -> reviews (id).
 def delete_errors(db: Session, condition, *, delete_cards: bool = True) -> int:
+    _acquire_sqlite_write_lock(db)
     # Approvals also lock the error row first, so FOR UPDATE sees any card_id
     # committed by a concurrent approval.
     rows = db.execute(
@@ -141,13 +153,14 @@ def delete_errors(db: Session, condition, *, delete_cards: bool = True) -> int:
                 select(Card.id).where(Card.id.in_(batch)).order_by(Card.id).with_for_update()
             ).all()
     for batch in _chunks(error_ids):
-        db.execute(delete(ErrorLog).where(ErrorLog.id.in_(batch)))
+        db.execute(delete(ErrorLog).where(ErrorLog.id.in_(batch), condition))
     if delete_cards and card_ids:
         _delete_locked_cards(db, card_ids)
     return len(error_ids)
 
 
 def delete_card(db: Session, card_id: int) -> int:
+    _acquire_sqlite_write_lock(db)
     db.execute(
         select(ErrorLog.id)
         .where(ErrorLog.card_id == card_id)
@@ -161,6 +174,7 @@ def delete_card(db: Session, card_id: int) -> int:
 
 
 def delete_deck(db: Session, deck_id: int) -> int:
+    _acquire_sqlite_write_lock(db)
     if db.scalar(select(Deck.id).where(Deck.id == deck_id).with_for_update()) is None:
         return 0
     _lock_error_logs_for_cards(db, select(Card.id).where(Card.deck_id == deck_id))
@@ -176,6 +190,7 @@ def delete_deck(db: Session, deck_id: int) -> int:
 
 
 def delete_source(db: Session, source_id: int, *, delete_cards: bool = True) -> int:
+    _acquire_sqlite_write_lock(db)
     # Source approval holds the same lock while creating its linked card.
     if db.scalar(select(Source.id).where(Source.id == source_id).with_for_update()) is None:
         return 0
@@ -197,11 +212,12 @@ def delete_source(db: Session, source_id: int, *, delete_cards: bool = True) -> 
 
 
 def delete_reviews(db: Session, condition) -> int:
+    _acquire_sqlite_write_lock(db)
     review_ids = list(
         db.scalars(select(Review.id).where(condition).order_by(Review.id).with_for_update())
     )
     for batch in _chunks(review_ids):
-        db.execute(delete(Review).where(Review.id.in_(batch)))
+        db.execute(delete(Review).where(Review.id.in_(batch), condition))
     return len(review_ids)
 
 

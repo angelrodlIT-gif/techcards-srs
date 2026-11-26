@@ -1,3 +1,4 @@
+import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
@@ -12,7 +13,8 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.db import get_db, get_engine
 from app.main import app
-from app.models import ErrorLog
+from app.models import Base, Card, Deck, ErrorLog, Review
+from app.personal_data import delete_errors, delete_reviews
 
 NOW = datetime(2026, 2, 1, tzinfo=UTC)
 OLD = datetime(2026, 1, 1, tzinfo=UTC)
@@ -480,3 +482,125 @@ def test_postgres_concurrent_card_and_error_deletion_no_deadlock(client, db_engi
     assert r_ret.json()["matched"] == 1
     assert export(client)["cards"] == []
     assert export(client)["error_logs"] == []
+
+
+def test_sqlite_deletion_and_retention_hold_write_lock_before_select(tmp_path):
+    db_path = tmp_path / "sqlite_toctou.db"
+    engine = create_engine(f"sqlite:///{db_path}")
+
+    @event.listens_for(engine, "connect")
+    def enable_foreign_keys(connection, _):
+        connection.execute("PRAGMA foreign_keys=ON")
+
+    Base.metadata.create_all(engine)
+    conn2 = sqlite3.connect(db_path, timeout=0.05)
+    conn2.execute("PRAGMA foreign_keys=ON")
+    try:
+        with Session(engine) as db, db.begin():
+            deck = Deck(name="SQLite Lock")
+            db.add(deck)
+            db.flush()
+            card = Card(deck_id=deck.id, front="Q1", back="A1", due_date=OLD.date())
+            derived = Card(deck_id=deck.id, front="Q2", back="A2", due_date=OLD.date())
+            db.add_all([card, derived])
+            db.flush()
+            old_review = Review(
+                card_id=card.id,
+                quality=4,
+                reviewed_at=OLD,
+                interval_days=1,
+                ease_factor=2.5,
+                repetitions=1,
+                due_date=OLD.date(),
+            )
+            old_error = ErrorLog(**ERROR, status="approved", card_id=derived.id, created_at=OLD)
+            db.add_all([old_review, old_error])
+            db.flush()
+            deck_id = deck.id
+            card_id = card.id
+            derived_id = derived.id
+            review_id = old_review.id
+            error_id = old_error.id
+
+        # 1. During delete_reviews, right after SELECT and before DELETE, a second SQLite
+        # connection must be blocked from deleting & reusing the selected review ID.
+        review_race_attempted = {"seen": False, "locked": False}
+
+        def intercept_review_select(_conn, _cursor, statement, _params, _context, _executemany):
+            sql = " ".join(statement.upper().split())
+            if sql.startswith("SELECT REVIEWS.ID FROM REVIEWS"):
+                review_race_attempted["seen"] = True
+                try:
+                    conn2.execute("DELETE FROM reviews WHERE id = ?", (review_id,))
+                    conn2.execute(
+                        "INSERT INTO reviews "
+                        "(id, card_id, quality, reviewed_at, interval_days, ease_factor, "
+                        "repetitions, due_date) VALUES (?, ?, 5, ?, 1, 2.5, 1, ?)",
+                        (review_id, card_id, NOW.isoformat(), NOW.date().isoformat()),
+                    )
+                    conn2.commit()
+                except sqlite3.OperationalError as exc:
+                    conn2.rollback()
+                    assert "locked" in str(exc).lower()
+                    review_race_attempted["locked"] = True
+
+        event.listen(engine, "after_cursor_execute", intercept_review_select)
+        try:
+            with Session(engine) as db, db.begin():
+                assert delete_reviews(db, Review.reviewed_at < NOW) == 1
+        finally:
+            event.remove(engine, "after_cursor_execute", intercept_review_select)
+
+        assert review_race_attempted == {"seen": True, "locked": True}
+
+        # Once committed, conn2 can write normally again.
+        conn2.execute(
+            "INSERT INTO reviews "
+            "(id, card_id, quality, reviewed_at, interval_days, ease_factor, "
+            "repetitions, due_date) VALUES (?, ?, 5, ?, 1, 2.5, 1, ?)",
+            (review_id, card_id, NOW.isoformat(), NOW.date().isoformat()),
+        )
+        conn2.commit()
+
+        # 2. During delete_errors, right after SELECT and before DELETE, a second SQLite
+        # connection must be blocked from deleting & reusing the selected error/card IDs.
+        error_race_attempted = {"seen": False, "locked": False}
+
+        def intercept_error_select(_conn, _cursor, statement, _params, _context, _executemany):
+            sql = " ".join(statement.upper().split())
+            if sql.startswith("SELECT ERROR_LOGS.ID, ERROR_LOGS.CARD_ID FROM ERROR_LOGS"):
+                error_race_attempted["seen"] = True
+                try:
+                    conn2.execute("DELETE FROM error_logs WHERE id = ?", (error_id,))
+                    conn2.execute("DELETE FROM cards WHERE id = ?", (derived_id,))
+                    conn2.execute(
+                        "INSERT INTO cards "
+                        "(id, deck_id, front, back, kind, repetitions, interval_days, "
+                        "ease_factor, due_date) VALUES (?, ?, 'New', 'Card', 'vocabulary', "
+                        "0, 0, 2.5, ?)",
+                        (derived_id, deck_id, NOW.date().isoformat()),
+                    )
+                    conn2.commit()
+                except sqlite3.OperationalError as exc:
+                    conn2.rollback()
+                    assert "locked" in str(exc).lower()
+                    error_race_attempted["locked"] = True
+
+        event.listen(engine, "after_cursor_execute", intercept_error_select)
+        try:
+            with Session(engine) as db, db.begin():
+                assert delete_errors(db, ErrorLog.created_at < NOW) == 1
+        finally:
+            event.remove(engine, "after_cursor_execute", intercept_error_select)
+
+        assert error_race_attempted == {"seen": True, "locked": True}
+
+        # 3. Calling a deletion helper when the session already started a SQLite write
+        # transaction must succeed without nesting BEGIN IMMEDIATE.
+        with Session(engine) as db, db.begin():
+            db.add(Deck(name="Already Writing"))
+            db.flush()
+            assert delete_reviews(db, Review.reviewed_at < NOW) == 0
+    finally:
+        conn2.close()
+        engine.dispose()
