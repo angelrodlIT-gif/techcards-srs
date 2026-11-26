@@ -154,41 +154,7 @@ function renderCrear(decks) {
     </section>
   `;
 
-  const manualCardPanel = `
-    <section class="panel">
-      <p class="kicker">Edición manual</p>
-      <h2>Nueva tarjeta</h2>
-      ${
-        hasDecks
-          ? `<form data-action="create-card">
-              ${deckSelect(decks)}
-              ${kindSelect('vocabulary')}
-              <label>Anverso (pregunta o consigna)
-                <textarea name="front" rows="2" required maxlength="5000" placeholder="Para formato hueco usa exactamente ____"></textarea>
-              </label>
-              <label>Reverso (respuesta o transcripción)
-                <textarea name="back" rows="2" required maxlength="5000" placeholder="Respuesta esperada (máx. 1000 caracteres en comprensión auditiva)"></textarea>
-              </label>
-              <details>
-                <summary>Campos opcionales</summary>
-                <label>Etiqueta de fuente
-                  <input type="text" name="source_label" maxlength="255" placeholder="Ej. notas-redes">
-                </label>
-                <label>Respuestas aceptadas (una por línea)
-                  <textarea name="accepted_answers" rows="2" placeholder="Sinónimos o variantes válidas"></textarea>
-                </label>
-                <label>Explicación
-                  <textarea name="explanation" rows="2" maxlength="5000" placeholder="Contexto o regla clave"></textarea>
-                </label>
-              </details>
-              <button type="submit" class="primary">Guardar tarjeta</button>
-            </form>`
-          : '<p class="empty">Crea primero un mazo para añadir tarjetas manualmente.</p>'
-      }
-    </section>
-  `;
-
-  return `<div class="grid">${deckPanel}${generatePanel}${manualCardPanel}</div>`;
+  return `<div class="grid">${deckPanel}${generatePanel}</div>`;
 }
 
 async function renderPlantillas(decks) {
@@ -221,7 +187,7 @@ async function renderPlantillas(decks) {
         : '';
 
       return `
-        <article class="panel">
+        <article class="panel template">
           <p class="kicker">${safe(category)}${kind ? ` · ${safe(kind)}` : ''}</p>
           <h3>${safe(tpl.title)}</h3>
           <p>${lines(tpl.front)}</p>
@@ -249,7 +215,7 @@ async function renderFuentes(decks) {
   const createPanel = `
     <section class="panel">
       <p class="kicker">Curación de fuentes</p>
-      <h2>Nueva fuente</h2>
+      <h2>Guardar un fragmento</h2>
       <form data-action="create-source">
         <label>Etiqueta o título
           <input type="text" name="label" required maxlength="255" placeholder="Ej. RFC 9110 — Métodos HTTP">
@@ -332,7 +298,7 @@ async function renderFuentes(decks) {
       </section>`
     : '';
 
-  return `${createPanel}${draftsSection}${historySection}`;
+  return `<details class="composer"><summary>＋ Nueva fuente</summary>${createPanel}</details>${draftsSection}${historySection}`;
 }
 
 async function renderErrores(decks) {
@@ -443,7 +409,7 @@ async function renderErrores(decks) {
       </section>`
     : '';
 
-  return `${suggestPanel}${draftsSection}${historySection}`;
+  return `<details class="composer"><summary>＋ Registrar un error</summary>${suggestPanel}</details>${draftsSection}${historySection}`;
 }
 
 export async function workshop(view, decks) {
@@ -497,24 +463,6 @@ export async function submitWorkshop(form) {
       return count === 1
         ? 'Se generó 1 tarjeta nueva en el mazo.'
         : `Se generaron ${count} tarjetas nuevas en el mazo.`;
-    }
-
-    case 'create-card': {
-      const deckId = requirePositiveId(fd.get('deck_id'), 'mazo');
-      const kind = String(fd.get('kind') ?? 'vocabulary').trim() || 'vocabulary';
-      const front = requireText(fd.get('front'), 'Anverso');
-      const back = requireText(fd.get('back'), 'Reverso');
-      validateCardFormat(kind, front, back);
-      const sourceLabel = optionalText(fd.get('source_label'));
-      const explanation = optionalText(fd.get('explanation'));
-      const acceptedAnswers = parseAcceptedAnswers(fd.get('accepted_answers'));
-      const payload = { deck_id: deckId, front, back, kind };
-      if (sourceLabel) payload.source_label = sourceLabel;
-      if (acceptedAnswers.length) payload.accepted_answers = acceptedAnswers;
-      if (explanation) payload.explanation = explanation;
-      const card = await api('/cards', payload);
-      const cardId = idValue(card?.id);
-      return cardId ? `Tarjeta #${cardId} creada en el mazo.` : 'Tarjeta creada en el mazo.';
     }
 
     case 'template-card': {

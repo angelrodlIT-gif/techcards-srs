@@ -107,3 +107,12 @@ progress{width:100%;height:8px;accent-color:var(--gold)}
  .metric small{font-size:.72rem;line-height:1.4;font-family:inherit}.metric strong{font-size:1.65rem}
  .deck{display:grid;grid-template-columns:auto minmax(0,1fr);gap:.5rem 1rem}.due,.done{grid-column:2;justify-self:start}
 }
+.composer{margin-bottom:1rem}.composer>summary{background:#253039;border:1px solid var(--line);border-radius:7px;padding:.65rem 1rem;color:var(--gold);font-weight:600}
+.composer[open]>summary{margin-bottom:1rem}
+.panel details>summary{justify-content:flex-start;text-decoration:underline;text-underline-offset:4px}
+.panel details[open]>label{margin-top:.75rem}
+.panel a{text-decoration:underline}
+.template{position:relative;overflow:hidden;border-top:3px solid #a8c2bb}
+.template:nth-child(even){border-top-color:var(--gold)}
+.template h3{font:1.65rem/1.15 Georgia,serif;letter-spacing:-.03em}
+.template form{border-top:1px solid var(--line);padding-top:1rem}
