@@ -13,6 +13,7 @@ from app.generator import CardGenerator, get_generator
 from app.learning import LearningSummary, summarize_learning
 from app.listening import AudioUnavailable, SynthesisLimitReached, listening_audio
 from app.models import Card, Deck, ErrorLog, Review, Source
+from app.proposals import router as proposals_router
 from app.remediation import STAR_PREFIX, build_remediation_draft
 from app.schemas import (
     MAX_LISTENING_CHARS,
@@ -65,6 +66,7 @@ def normalize_utc(value: datetime) -> datetime:
 
 
 app = FastAPI(title="TechCards SRS", version="0.1.0")
+app.include_router(proposals_router)
 DB = Annotated[Session, Depends(get_db)]
 Generator = Annotated[CardGenerator, Depends(get_generator)]
 Clock = Annotated[Callable[[], datetime], Depends(get_clock)]
