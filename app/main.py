@@ -8,11 +8,10 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, contains_eager, joinedload, selectinload
 
+from app import personal_data
 from app.db import get_db
 from app.generator import CardGenerator, get_generator
 from app.models import Card, Deck, ErrorLog, Review, Source
-from app.personal_data import delete_errors
-from app.personal_data import router as personal_data_router
 from app.remediation import STAR_PREFIX, build_remediation_draft
 from app.schemas import (
     CardInput,
@@ -64,7 +63,7 @@ def normalize_utc(value: datetime) -> datetime:
 
 
 app = FastAPI(title="TechCards SRS", version="0.1.0")
-app.include_router(personal_data_router)
+app.include_router(personal_data.router)
 DB = Annotated[Session, Depends(get_db)]
 Generator = Annotated[CardGenerator, Depends(get_generator)]
 Clock = Annotated[Callable[[], datetime], Depends(get_clock)]
@@ -113,8 +112,9 @@ def update_deck(deck_id: int, payload: DeckInput, db: DB):
 
 @app.delete("/decks/{deck_id}", status_code=204)
 def delete_deck(deck_id: int, db: DB):
-    db.delete(require(db, Deck, deck_id))
-    db.commit()
+    with db.begin():
+        if not personal_data.delete_deck(db, deck_id):
+            raise HTTPException(404, "Deck not found")
     return Response(status_code=204)
 
 
@@ -198,8 +198,9 @@ def update_card(card_id: int, payload: CardInput, db: DB):
 
 @app.delete("/cards/{card_id}", status_code=204)
 def delete_card(card_id: int, db: DB):
-    db.delete(require(db, Card, card_id))
-    db.commit()
+    with db.begin():
+        if not personal_data.delete_card(db, card_id):
+            raise HTTPException(404, "Card not found")
     return Response(status_code=204)
 
 
@@ -420,8 +421,9 @@ def update_source(source_id: int, payload: SourceInput, db: DB):
 
 @app.delete("/sources/{source_id}", status_code=204)
 def delete_source(source_id: int, db: DB):
-    db.delete(require(db, Source, source_id))
-    db.commit()
+    with db.begin():
+        if not personal_data.delete_source(db, source_id, delete_cards=False):
+            raise HTTPException(404, "Source not found")
     return Response(status_code=204)
 
 
@@ -569,7 +571,7 @@ def update_error(error_id: int, payload: ErrorLogInput, db: DB):
 @app.delete("/errors/{error_id}", status_code=204)
 def delete_error(error_id: int, db: DB, delete_card: bool = Query(False)):
     with db.begin():
-        if not delete_errors(db, ErrorLog.id == error_id, delete_cards=delete_card):
+        if not personal_data.delete_errors(db, ErrorLog.id == error_id, delete_cards=delete_card):
             raise HTTPException(404, "ErrorLog not found")
     return Response(status_code=204)
 

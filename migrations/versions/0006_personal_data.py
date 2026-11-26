@@ -15,6 +15,29 @@ def card_checks():
 
 
 def upgrade():
+    # Pre-0006 SQLite connections ran without PRAGMA foreign_keys=ON, so deleted
+    # decks or cards could leave orphaned children or dangling error-log links.
+    # Clean them up before FK enforcement is enabled so reused SQLite IDs cannot
+    # reattach old rows to unrelated parents.
+    op.execute(
+        sa.text(
+            "DELETE FROM cards "
+            "WHERE NOT EXISTS (SELECT 1 FROM decks WHERE decks.id = cards.deck_id)"
+        )
+    )
+    op.execute(
+        sa.text(
+            "DELETE FROM reviews "
+            "WHERE NOT EXISTS (SELECT 1 FROM cards WHERE cards.id = reviews.card_id)"
+        )
+    )
+    op.execute(
+        sa.text(
+            "UPDATE error_logs SET card_id = NULL "
+            "WHERE card_id IS NOT NULL "
+            "AND NOT EXISTS (SELECT 1 FROM cards WHERE cards.id = error_logs.card_id)"
+        )
+    )
     with op.batch_alter_table("cards", table_args=card_checks()) as batch:
         batch.add_column(sa.Column("source_id", sa.Integer(), nullable=True))
         batch.create_foreign_key(

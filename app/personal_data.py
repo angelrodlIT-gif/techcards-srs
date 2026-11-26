@@ -3,7 +3,7 @@ from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Response
 from pydantic import AwareDatetime, BaseModel, ConfigDict, StrictBool, field_validator
-from sqlalchemy import delete, func, select, text
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -79,27 +79,130 @@ def export_personal_data(db: DB, response: Response):
     return {"format_version": 1, "data": tables}
 
 
+BATCH_SIZE = 500
+
+
+def _chunks(values: list[int]):
+    for offset in range(0, len(values), BATCH_SIZE):
+        yield values[offset : offset + BATCH_SIZE]
+
+
+def _lock_error_logs_for_cards(db: Session, card_ids_subquery) -> None:
+    db.execute(
+        select(ErrorLog.id)
+        .where(ErrorLog.card_id.in_(card_ids_subquery))
+        .order_by(ErrorLog.id)
+        .with_for_update(of=ErrorLog)
+    ).all()
+
+
+def _delete_locked_cards(db: Session, card_ids: list[int]) -> None:
+    # Cards are already locked FOR UPDATE in PK order, so no new reviews can be
+    # added while we lock and delete existing reviews in PK order.
+    review_ids: list[int] = []
+    for batch in _chunks(card_ids):
+        review_ids.extend(db.scalars(select(Review.id).where(Review.card_id.in_(batch))).all())
+    if review_ids:
+        review_ids.sort()
+        for batch in _chunks(review_ids):
+            db.execute(
+                select(Review.id).where(Review.id.in_(batch)).order_by(Review.id).with_for_update()
+            ).all()
+        for batch in _chunks(review_ids):
+            db.execute(delete(Review).where(Review.id.in_(batch)))
+    for batch in _chunks(card_ids):
+        db.execute(delete(Card).where(Card.id.in_(batch)))
+
+
+def _unlink_and_delete_locked_cards(db: Session, card_ids: list[int]) -> None:
+    for batch in _chunks(card_ids):
+        db.execute(update(ErrorLog).where(ErrorLog.card_id.in_(batch)).values(card_id=None))
+    _delete_locked_cards(db, card_ids)
+
+
+# Canonical lock order across all deletion and retention paths:
+# decks / sources -> error_logs (id) -> cards (id) -> reviews (id).
 def delete_errors(db: Session, condition, *, delete_cards: bool = True) -> int:
-    # Approvals lock the error row and create a fresh card in one transaction.
-    # RETURNING sees the final link if a concurrent approval committed first.
-    card_ids = (
-        db.execute(delete(ErrorLog).where(condition).returning(ErrorLog.card_id)).scalars().all()
+    # Approvals also lock the error row first, so FOR UPDATE sees any card_id
+    # committed by a concurrent approval.
+    rows = db.execute(
+        select(ErrorLog.id, ErrorLog.card_id)
+        .where(condition)
+        .order_by(ErrorLog.id)
+        .with_for_update()
+    ).all()
+    if not rows:
+        return 0
+    error_ids = [row.id for row in rows]
+    card_ids = sorted({row.card_id for row in rows if row.card_id is not None})
+    if delete_cards and card_ids:
+        for batch in _chunks(card_ids):
+            db.execute(
+                select(Card.id).where(Card.id.in_(batch)).order_by(Card.id).with_for_update()
+            ).all()
+    for batch in _chunks(error_ids):
+        db.execute(delete(ErrorLog).where(ErrorLog.id.in_(batch)))
+    if delete_cards and card_ids:
+        _delete_locked_cards(db, card_ids)
+    return len(error_ids)
+
+
+def delete_card(db: Session, card_id: int) -> int:
+    db.execute(
+        select(ErrorLog.id)
+        .where(ErrorLog.card_id == card_id)
+        .order_by(ErrorLog.id)
+        .with_for_update(of=ErrorLog)
+    ).all()
+    if db.scalar(select(Card.id).where(Card.id == card_id).with_for_update()) is None:
+        return 0
+    _unlink_and_delete_locked_cards(db, [card_id])
+    return 1
+
+
+def delete_deck(db: Session, deck_id: int) -> int:
+    if db.scalar(select(Deck.id).where(Deck.id == deck_id).with_for_update()) is None:
+        return 0
+    _lock_error_logs_for_cards(db, select(Card.id).where(Card.deck_id == deck_id))
+    card_ids = list(
+        db.scalars(
+            select(Card.id).where(Card.deck_id == deck_id).order_by(Card.id).with_for_update()
+        )
     )
-    if not delete_cards:
-        return len(card_ids)
-    linked_ids = [card_id for card_id in card_ids if card_id is not None]
-    for offset in range(0, len(linked_ids), 500):
-        db.execute(delete(Card).where(Card.id.in_(linked_ids[offset : offset + 500])))
-    return len(card_ids)
+    if card_ids:
+        _unlink_and_delete_locked_cards(db, card_ids)
+    db.execute(delete(Deck).where(Deck.id == deck_id))
+    return 1
 
 
-def delete_source(db: Session, source_id: int) -> int:
+def delete_source(db: Session, source_id: int, *, delete_cards: bool = True) -> int:
     # Source approval holds the same lock while creating its linked card.
     if db.scalar(select(Source.id).where(Source.id == source_id).with_for_update()) is None:
         return 0
-    db.execute(delete(Card).where(Card.source_id == source_id))
+    if delete_cards:
+        _lock_error_logs_for_cards(db, select(Card.id).where(Card.source_id == source_id))
+    card_ids = list(
+        db.scalars(
+            select(Card.id).where(Card.source_id == source_id).order_by(Card.id).with_for_update()
+        )
+    )
+    if card_ids:
+        if delete_cards:
+            _unlink_and_delete_locked_cards(db, card_ids)
+        else:
+            for batch in _chunks(card_ids):
+                db.execute(update(Card).where(Card.id.in_(batch)).values(source_id=None))
     db.execute(delete(Source).where(Source.id == source_id))
     return 1
+
+
+def delete_reviews(db: Session, condition) -> int:
+    review_ids = list(
+        db.scalars(select(Review.id).where(condition).order_by(Review.id).with_for_update())
+    )
+    for batch in _chunks(review_ids):
+        db.execute(delete(Review).where(Review.id.in_(batch)))
+    return len(review_ids)
 
 
 @router.delete("/{collection}/{row_id}", status_code=204)
@@ -112,8 +215,12 @@ def delete_personal_row(
             matched = delete_errors(db, ErrorLog.id == row_id)
         elif model is Source:
             matched = delete_source(db, row_id)
+        elif model is Deck:
+            matched = delete_deck(db, row_id)
+        elif model is Card:
+            matched = delete_card(db, row_id)
         else:
-            matched = db.execute(delete(model).where(model.id == row_id)).rowcount
+            matched = delete_reviews(db, Review.id == row_id)
         if not matched:
             raise HTTPException(404, "Personal data row not found")
 
@@ -129,7 +236,7 @@ def retain_personal_data(payload: RetentionInput, db: DB) -> RetentionResult:
         elif model is ErrorLog:
             matched = delete_errors(db, condition)
         else:
-            matched = db.execute(delete(model).where(condition)).rowcount
+            matched = delete_reviews(db, condition)
     return RetentionResult(
         collection=payload.collection, before=before, applied=payload.apply, matched=matched
     )

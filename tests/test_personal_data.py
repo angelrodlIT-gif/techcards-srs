@@ -1,11 +1,17 @@
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 
+import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import create_engine, inspect, text
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
+from app.db import get_db, get_engine
+from app.main import app
 from app.models import ErrorLog
 
 NOW = datetime(2026, 2, 1, tzinfo=UTC)
@@ -165,3 +171,312 @@ def test_personal_data_migration_preserves_legacy_rows(tmp_path, monkeypatch):
     finally:
         engine.dispose()
         get_settings.cache_clear()
+
+
+def test_personal_data_migration_cleans_legacy_sqlite_orphans(tmp_path, monkeypatch):
+    db_url = f"sqlite:///{tmp_path / 'legacy_orphans.db'}"
+    engine = create_engine(db_url)
+    config = Config("alembic.ini")
+    monkeypatch.setenv("DATABASE_URL", db_url)
+    get_settings.cache_clear()
+    get_engine.cache_clear()
+    try:
+        command.upgrade(config, "0005")
+        with engine.begin() as connection:
+            # Simulate a pre-0006 SQLite DB where deck 2 and card 3 were deleted
+            # without PRAGMA foreign_keys=ON, leaving orphaned children and links.
+            connection.execute(text("INSERT INTO decks VALUES (1, 'Valid', '')"))
+            connection.execute(
+                text(
+                    "INSERT INTO cards (id, deck_id, front, back, kind, repetitions, "
+                    "interval_days, ease_factor, due_date) VALUES "
+                    "(1, 1, 'Valid Q', 'Valid A', 'vocabulary', 0, 0, 2.5, '2026-02-01'), "
+                    "(2, 2, 'Orphan Q', 'Orphan A', 'vocabulary', 0, 0, 2.5, '2026-02-01')"
+                )
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO reviews (id, card_id, quality, reviewed_at, interval_days, "
+                    "ease_factor, repetitions, due_date) VALUES "
+                    "(1, 1, 4, '2026-02-01 00:00:00', 1, 2.5, 1, '2026-02-02'), "
+                    "(2, 2, 4, '2026-02-01 00:00:00', 1, 2.5, 1, '2026-02-02'), "
+                    "(3, 3, 4, '2026-02-01 00:00:00', 1, 2.5, 1, '2026-02-02')"
+                )
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO error_logs (id, attempted, corrected, rationale, status, card_id) "
+                    "VALUES "
+                    "(1, 'Valid', 'Valid', 'Keep link', 'approved', 1), "
+                    "(2, 'Orphan card', 'Fixed', 'Deck deleted', 'approved', 2), "
+                    "(3, 'Deleted card', 'Fixed', 'Card deleted', 'approved', 3)"
+                )
+            )
+
+        command.upgrade(config, "head")
+        with engine.connect() as connection:
+            assert connection.execute(text("PRAGMA foreign_key_check")).all() == []
+            assert connection.execute(text("SELECT id, deck_id, source_id FROM cards")).all() == [
+                (1, 1, None)
+            ]
+            assert connection.execute(text("SELECT id, card_id FROM reviews")).all() == [(1, 1)]
+            assert connection.execute(
+                text("SELECT id, card_id FROM error_logs ORDER BY id")
+            ).all() == [(1, 1), (2, None), (3, None)]
+
+        # Reopen through get_engine() (which enables PRAGMA foreign_keys=ON) and verify
+        # that reusing deleted deck/card IDs cannot attach or delete unrelated rows.
+        app_engine = get_engine()
+        previous_overrides = dict(app.dependency_overrides)
+
+        def override_db():
+            with Session(app_engine) as session:
+                yield session
+
+        app.dependency_overrides[get_db] = override_db
+        try:
+            with TestClient(app) as api_client:
+                reused_deck = create(api_client, "/decks", name="Reused Deck ID")
+                assert reused_deck["id"] == 2
+                assert api_client.get("/cards", params={"deck_id": 2}).json() == []
+
+                reused_card = create(
+                    api_client, "/cards", deck_id=reused_deck["id"], front="New Q", back="New A"
+                )
+                assert reused_card["id"] == 2
+
+                # Deleting the legacy error log that used to point at card 2 must NOT
+                # delete the new unrelated card that reused ID 2.
+                assert api_client.delete("/personal-data/error_logs/2").status_code == 204
+                assert api_client.get(f"/cards/{reused_card['id']}").status_code == 200
+                assert api_client.delete("/personal-data/error_logs/3").status_code == 204
+                assert api_client.get(f"/cards/{reused_card['id']}").status_code == 200
+                assert api_client.get("/cards/1").status_code == 200
+        finally:
+            app.dependency_overrides.clear()
+            app.dependency_overrides.update(previous_overrides)
+            app_engine.dispose()
+    finally:
+        engine.dispose()
+        get_engine.cache_clear()
+        get_settings.cache_clear()
+
+
+def _record_sql(db_engine, action):
+    statements: list[str] = []
+
+    def before_execute(_conn, _cursor, statement, _params, _context, _executemany):
+        statements.append(" ".join(statement.upper().split()))
+
+    event.listen(db_engine, "before_cursor_execute", before_execute)
+    try:
+        result = action()
+    finally:
+        event.remove(db_engine, "before_cursor_execute", before_execute)
+    return result, statements
+
+
+def _first_prefix(statements: list[str], prefix: str) -> int:
+    for idx, sql in enumerate(statements):
+        if sql.startswith(prefix):
+            return idx
+    raise AssertionError(f"Expected SQL starting with {prefix!r} in {statements!r}")
+
+
+def test_deletion_and_retention_use_canonical_lock_order(client, db_engine, set_clock):
+    set_clock(OLD)
+    deck = create(client, "/decks", name="Lock Order")
+    err1 = create(client, "/errors", **ERROR)
+    card1 = create(client, f"/errors/{err1['id']}/approve", deck_id=deck["id"])["card"]
+    create(client, "/reviews", card_id=card1["id"], quality=4)
+
+    # Direct personal-data card deletion locks error_logs before cards, and cards before reviews.
+    resp, stmts = _record_sql(
+        db_engine, lambda: client.delete(f"/personal-data/cards/{card1['id']}")
+    )
+    assert resp.status_code == 204
+    assert client.get(f"/cards/{card1['id']}").status_code == 404
+    assert client.get(f"/errors/{err1['id']}").json()["card_id"] is None
+    assert _first_prefix(stmts, "SELECT ERROR_LOGS.ID FROM ERROR_LOGS") < _first_prefix(
+        stmts, "SELECT CARDS.ID FROM CARDS"
+    )
+    assert _first_prefix(stmts, "SELECT CARDS.ID FROM CARDS") < _first_prefix(
+        stmts, "SELECT REVIEWS.ID FROM REVIEWS"
+    )
+
+    # Standard /cards/{id} deletion follows the exact same lock order.
+    err2 = create(client, "/errors", **ERROR)
+    card2 = create(client, f"/errors/{err2['id']}/approve", deck_id=deck["id"])["card"]
+    create(client, "/reviews", card_id=card2["id"], quality=4)
+    resp, stmts = _record_sql(db_engine, lambda: client.delete(f"/cards/{card2['id']}"))
+    assert resp.status_code == 204
+    assert client.get(f"/errors/{err2['id']}").json()["card_id"] is None
+    assert _first_prefix(stmts, "SELECT ERROR_LOGS.ID FROM ERROR_LOGS") < _first_prefix(
+        stmts, "SELECT CARDS.ID FROM CARDS"
+    )
+    assert _first_prefix(stmts, "SELECT CARDS.ID FROM CARDS") < _first_prefix(
+        stmts, "SELECT REVIEWS.ID FROM REVIEWS"
+    )
+
+    # Error-log deletion locks error_logs before cards, and cards before reviews.
+    err3 = create(client, "/errors", **ERROR)
+    card3 = create(client, f"/errors/{err3['id']}/approve", deck_id=deck["id"])["card"]
+    create(client, "/reviews", card_id=card3["id"], quality=5)
+    resp, stmts = _record_sql(
+        db_engine, lambda: client.delete(f"/personal-data/error_logs/{err3['id']}")
+    )
+    assert resp.status_code == 204
+    assert client.get(f"/cards/{card3['id']}").status_code == 404
+    assert _first_prefix(stmts, "SELECT ERROR_LOGS.ID, ERROR_LOGS.CARD_ID") < _first_prefix(
+        stmts, "SELECT CARDS.ID FROM CARDS"
+    )
+    assert _first_prefix(stmts, "SELECT CARDS.ID FROM CARDS") < _first_prefix(
+        stmts, "SELECT REVIEWS.ID FROM REVIEWS"
+    )
+
+    # Error-log retention locks error_logs in PK order before cards in PK order.
+    err4 = create(client, "/errors", **ERROR)
+    card4 = create(client, f"/errors/{err4['id']}/approve", deck_id=deck["id"])["card"]
+    create(client, "/reviews", card_id=card4["id"], quality=5)
+    resp, stmts = _record_sql(
+        db_engine,
+        lambda: client.post(
+            "/personal-data/retention",
+            json={"collection": "error_logs", "before": NOW.isoformat(), "apply": True},
+        ),
+    )
+    assert resp.status_code == 200
+    assert resp.json()["matched"] == 3
+    assert client.get(f"/cards/{card4['id']}").status_code == 404
+    assert _first_prefix(stmts, "SELECT ERROR_LOGS.ID, ERROR_LOGS.CARD_ID") < _first_prefix(
+        stmts, "SELECT CARDS.ID FROM CARDS"
+    )
+    assert _first_prefix(stmts, "SELECT CARDS.ID FROM CARDS") < _first_prefix(
+        stmts, "SELECT REVIEWS.ID FROM REVIEWS"
+    )
+    assert any("FROM ERROR_LOGS" in s and "ORDER BY ERROR_LOGS.ID" in s for s in stmts)
+    assert any("FROM CARDS" in s and "ORDER BY CARDS.ID" in s for s in stmts)
+
+    # Deck deletion locks decks -> error_logs -> cards -> reviews.
+    err5 = create(client, "/errors", **ERROR)
+    card5 = create(client, f"/errors/{err5['id']}/approve", deck_id=deck["id"])["card"]
+    create(client, "/reviews", card_id=card5["id"], quality=4)
+    resp, stmts = _record_sql(
+        db_engine, lambda: client.delete(f"/personal-data/decks/{deck['id']}")
+    )
+    assert resp.status_code == 204
+    assert client.get(f"/errors/{err5['id']}").json()["card_id"] is None
+    assert _first_prefix(stmts, "SELECT DECKS.ID FROM DECKS") < _first_prefix(
+        stmts, "SELECT ERROR_LOGS.ID FROM ERROR_LOGS"
+    )
+    assert _first_prefix(stmts, "SELECT ERROR_LOGS.ID FROM ERROR_LOGS") < _first_prefix(
+        stmts, "SELECT CARDS.ID FROM CARDS"
+    )
+    assert _first_prefix(stmts, "SELECT CARDS.ID FROM CARDS") < _first_prefix(
+        stmts, "SELECT REVIEWS.ID FROM REVIEWS"
+    )
+
+    # Source deletion locks sources -> error_logs -> cards -> reviews.
+    deck2 = create(client, "/decks", name="Source Lock Order")
+    source = create(client, "/sources", label="Docs")
+    source_card = create(
+        client, f"/sources/{source['id']}/approve", deck_id=deck2["id"], front="Q", back="A"
+    )["card"]
+    create(client, "/reviews", card_id=source_card["id"], quality=4)
+    resp, stmts = _record_sql(
+        db_engine, lambda: client.delete(f"/personal-data/sources/{source['id']}")
+    )
+    assert resp.status_code == 204
+    assert client.get(f"/cards/{source_card['id']}").status_code == 404
+    assert _first_prefix(stmts, "SELECT SOURCES.ID FROM SOURCES") < _first_prefix(
+        stmts, "SELECT ERROR_LOGS.ID FROM ERROR_LOGS"
+    )
+    assert _first_prefix(stmts, "SELECT ERROR_LOGS.ID FROM ERROR_LOGS") < _first_prefix(
+        stmts, "SELECT CARDS.ID FROM CARDS"
+    )
+    assert _first_prefix(stmts, "SELECT CARDS.ID FROM CARDS") < _first_prefix(
+        stmts, "SELECT REVIEWS.ID FROM REVIEWS"
+    )
+
+
+def test_postgres_concurrent_card_and_error_deletion_no_deadlock(client, db_engine, set_clock):
+    if db_engine.dialect.name != "postgresql":
+        pytest.skip("PostgreSQL concurrency test requires TEST_DATABASE_URL")
+
+    set_clock(OLD)
+    deck = create(client, "/decks", name="PG Concurrency")
+
+    def run_coordinated_race(first_request, second_request):
+        first_locked = threading.Event()
+        second_attempting = threading.Event()
+        release_first = threading.Event()
+        first_tid: dict[str, int | None] = {"id": None}
+
+        def after_execute(_conn, _cursor, statement, _params, _context, _executemany):
+            sql = " ".join(statement.upper().split())
+            if first_tid["id"] is None and "FROM ERROR_LOGS" in sql and "FOR UPDATE" in sql:
+                first_tid["id"] = threading.get_ident()
+                first_locked.set()
+                assert release_first.wait(timeout=10)
+
+        def before_execute(_conn, _cursor, statement, _params, _context, _executemany):
+            sql = " ".join(statement.upper().split())
+            tid = threading.get_ident()
+            if (
+                first_tid["id"] is not None
+                and tid != first_tid["id"]
+                and ("FOR UPDATE" in sql or "DELETE FROM CARDS" in sql)
+            ):
+                second_attempting.set()
+
+        event.listen(db_engine, "after_cursor_execute", after_execute)
+        event.listen(db_engine, "before_cursor_execute", before_execute)
+        try:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+
+                def run_first():
+                    with TestClient(app, raise_server_exceptions=False) as tc:
+                        return first_request(tc)
+
+                def run_second():
+                    with TestClient(app, raise_server_exceptions=False) as tc:
+                        return second_request(tc)
+
+                f1 = pool.submit(run_first)
+                assert first_locked.wait(timeout=5)
+                f2 = pool.submit(run_second)
+                assert second_attempting.wait(timeout=5)
+                release_first.set()
+                return f1.result(timeout=10), f2.result(timeout=10)
+        finally:
+            release_first.set()
+            event.remove(db_engine, "after_cursor_execute", after_execute)
+            event.remove(db_engine, "before_cursor_execute", before_execute)
+
+    # Case 1: Error-log deletion locks error_logs first while card deletion runs concurrently.
+    err1 = create(client, "/errors", **ERROR)
+    card1 = create(client, f"/errors/{err1['id']}/approve", deck_id=deck["id"])["card"]
+    r_err, r_card = run_coordinated_race(
+        lambda tc: tc.delete(f"/personal-data/error_logs/{err1['id']}"),
+        lambda tc: tc.delete(f"/personal-data/cards/{card1['id']}"),
+    )
+    assert r_err.status_code == 204
+    assert r_card.status_code == 404
+    assert export(client)["cards"] == []
+    assert export(client)["error_logs"] == []
+
+    # Case 2: Card deletion locks error_logs first while error-log retention runs concurrently.
+    err2 = create(client, "/errors", **ERROR)
+    card2 = create(client, f"/errors/{err2['id']}/approve", deck_id=deck["id"])["card"]
+    r_card2, r_ret = run_coordinated_race(
+        lambda tc: tc.delete(f"/personal-data/cards/{card2['id']}"),
+        lambda tc: tc.post(
+            "/personal-data/retention",
+            json={"collection": "error_logs", "before": NOW.isoformat(), "apply": True},
+        ),
+    )
+    assert r_card2.status_code == 204
+    assert r_ret.status_code == 200
+    assert r_ret.json()["matched"] == 1
+    assert export(client)["cards"] == []
+    assert export(client)["error_logs"] == []
