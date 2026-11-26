@@ -1,6 +1,212 @@
 <!doctype html>
-<html lang="es">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Propuesta 3</title>
-<link rel="stylesheet" href="styles.css"></head>
-<body><main><h1>Propuesta 3</h1><p>En construcción.</p></main><script src="app.js" type="module"></script></body>
+<html lang="es" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
+  <meta name="color-scheme" content="dark light" />
+  <meta id="theme-color-meta" name="theme-color" content="#0b0c0f" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <title>Cabina · TechCards SRS</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <a href="#main-content" class="skip-link">Saltar al contenido</a>
+
+  <div id="app-shell" class="app-shell">
+    <!-- Desktop Cockpit Sidebar -->
+    <aside class="sidebar" aria-label="Navegación principal">
+      <div class="sidebar-top">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 2L2 7l10 5 10-5-10-5z"></path>
+              <path d="M2 17l10 5 10-5"></path>
+              <path d="M2 12l10 5 10-5"></path>
+            </svg>
+          </div>
+          <div class="brand-copy">
+            <span class="brand-name">Cabina SRS</span>
+            <span class="brand-sub" id="api-status-label">Conectando…</span>
+          </div>
+          <span class="status-dot" id="api-status-dot" aria-hidden="true"></span>
+        </div>
+
+        <button type="button" class="cmd-trigger" id="sidebar-cmd-btn" aria-label="Abrir paleta de comandos (Ctrl+K)">
+          <span class="cmd-trigger-left">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="11" cy="11" r="8"></circle>
+              <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+            </svg>
+            <span>Ir a mazo o acción…</span>
+          </span>
+          <kbd class="kbd" id="cmd-shortcut-hint">Ctrl K</kbd>
+        </button>
+
+        <nav class="nav-list" aria-label="Vistas">
+          <button type="button" class="nav-item" data-view="dashboard" aria-current="page">
+            <span class="nav-icon" data-icon="cockpit"></span>
+            <span class="nav-label">Cabina</span>
+            <span class="nav-badge tabular" id="nav-badge-due" hidden>0</span>
+          </button>
+          <button type="button" class="nav-item" data-view="study">
+            <span class="nav-icon" data-icon="focus"></span>
+            <span class="nav-label">Modo foco</span>
+          </button>
+          <button type="button" class="nav-item" data-view="create">
+            <span class="nav-icon" data-icon="create"></span>
+            <span class="nav-label">Crear</span>
+          </button>
+          <button type="button" class="nav-item" data-view="errors">
+            <span class="nav-icon" data-icon="errors"></span>
+            <span class="nav-label">Errores</span>
+            <span class="nav-badge tabular" id="nav-badge-errors" hidden>0</span>
+          </button>
+          <button type="button" class="nav-item" data-view="analytics">
+            <span class="nav-icon" data-icon="analytics"></span>
+            <span class="nav-label">Analítica</span>
+          </button>
+        </nav>
+      </div>
+
+      <div class="sidebar-footer">
+        <div class="demo-control" role="group" aria-label="Modo de datos">
+          <label class="switch-row" for="demo-mode-toggle">
+            <span class="switch-text">
+              <span class="switch-title">Datos demo</span>
+              <span class="switch-sub">Solo vista · no escribe API</span>
+            </span>
+            <input type="checkbox" id="demo-mode-toggle" class="switch-input" />
+            <span class="switch-track" aria-hidden="true"></span>
+          </label>
+          <div class="demo-variant-bar" id="demo-variant-bar" hidden role="radiogroup" aria-label="Conjunto de prueba">
+            <button type="button" class="segment-btn" data-demo-variant="demo" aria-pressed="true">Demo</button>
+            <button type="button" class="segment-btn" data-demo-variant="worst" aria-pressed="false">Peor caso</button>
+          </div>
+        </div>
+
+        <div class="sidebar-footer-actions">
+          <button type="button" class="icon-text-btn" id="theme-toggle-btn" aria-label="Cambiar entre tema oscuro y claro">
+            <span class="nav-icon" id="theme-toggle-icon" data-icon="sun"></span>
+            <span id="theme-toggle-label">Tema claro</span>
+          </button>
+          <a href="/propuestas" class="icon-text-btn subtle-link">
+            <span class="nav-icon" data-icon="arrow-left"></span>
+            <span>Propuestas</span>
+          </a>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Mobile Frosted Top Bar -->
+    <header class="mobile-topbar" id="mobile-topbar">
+      <div class="mobile-topbar-left">
+        <span class="status-dot" id="mobile-status-dot" aria-hidden="true"></span>
+        <span class="mobile-topbar-title" id="mobile-view-title">Cabina</span>
+      </div>
+      <div class="mobile-topbar-actions">
+        <button type="button" class="icon-btn" id="mobile-demo-btn" aria-label="Alternar Datos demo" title="Datos demo">
+          <span class="nav-icon" data-icon="flask"></span>
+        </button>
+        <button type="button" class="icon-btn" id="mobile-cmd-btn" aria-label="Abrir paleta de comandos">
+          <span class="nav-icon" data-icon="search"></span>
+        </button>
+        <button type="button" class="icon-btn" id="mobile-theme-btn" aria-label="Cambiar tema">
+          <span class="nav-icon" id="mobile-theme-icon" data-icon="sun"></span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Main Viewport -->
+    <div class="workspace">
+      <div id="demo-banner" class="demo-banner" hidden role="status">
+        <div class="demo-banner-copy">
+          <strong id="demo-banner-title">Modo Datos demo</strong>
+          <span id="demo-banner-desc">Vista de demostración en memoria — ninguna acción escribe en la API.</span>
+        </div>
+        <div class="demo-banner-actions">
+          <div class="segmented compact" role="group" aria-label="Dataset de demostración">
+            <button type="button" class="segment-btn" data-demo-variant="demo" aria-pressed="true">Demo</button>
+            <button type="button" class="segment-btn" data-demo-variant="worst" aria-pressed="false">Peor caso</button>
+          </div>
+          <button type="button" class="btn btn-ghost btn-sm" id="exit-demo-btn">Volver a API real</button>
+        </div>
+      </div>
+
+      <main id="main-content" class="main-content" tabindex="-1"></main>
+    </div>
+
+    <!-- Mobile Translucent Bottom Tab Bar -->
+    <nav class="mobile-tabbar" id="mobile-tabbar" aria-label="Navegación móvil">
+      <button type="button" class="tabbar-item" data-view="dashboard" aria-current="page">
+        <span class="nav-icon" data-icon="cockpit"></span>
+        <span class="tabbar-label">Cabina</span>
+        <span class="tabbar-dot" id="mobile-badge-due" hidden></span>
+      </button>
+      <button type="button" class="tabbar-item" data-view="study">
+        <span class="nav-icon" data-icon="focus"></span>
+        <span class="tabbar-label">Estudiar</span>
+      </button>
+      <button type="button" class="tabbar-item" data-view="create">
+        <span class="nav-icon" data-icon="create"></span>
+        <span class="tabbar-label">Crear</span>
+      </button>
+      <button type="button" class="tabbar-item" data-view="errors">
+        <span class="nav-icon" data-icon="errors"></span>
+        <span class="tabbar-label">Errores</span>
+      </button>
+      <button type="button" class="tabbar-item" data-view="analytics">
+        <span class="nav-icon" data-icon="analytics"></span>
+        <span class="tabbar-label">Analítica</span>
+      </button>
+    </nav>
+  </div>
+
+  <!-- Command Palette (Instant — zero animation per keyboard-shortcut standard) -->
+  <div id="command-palette-backdrop" class="cmd-backdrop" hidden>
+    <div class="cmd-dialog" role="dialog" aria-modal="true" aria-labelledby="cmd-dialog-label">
+      <h2 id="cmd-dialog-label" class="sr-only">Paleta de comandos</h2>
+      <div class="cmd-input-row">
+        <span class="nav-icon muted-icon" data-icon="search" aria-hidden="true"></span>
+        <input
+          type="search"
+          id="cmd-input"
+          class="cmd-input"
+          placeholder="Saltar a un mazo, vista o acción…"
+          autocomplete="off"
+          autocorrect="off"
+          autocapitalize="none"
+          spellcheck="false"
+          enterkeyhint="go"
+          aria-controls="cmd-results"
+        />
+        <kbd class="kbd">Esc</kbd>
+      </div>
+      <div id="cmd-results" class="cmd-results" role="listbox" aria-label="Resultados de comandos"></div>
+      <div class="cmd-footer" aria-hidden="true">
+        <span><kbd class="kbd">↑</kbd> <kbd class="kbd">↓</kbd> navegar</span>
+        <span><kbd class="kbd">↵</kbd> ejecutar</span>
+        <span><kbd class="kbd">Esc</kbd> cerrar</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Generic Modal / Bottom Sheet Host -->
+  <div id="modal-backdrop" class="modal-backdrop" hidden>
+    <div id="modal-panel" class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <div class="modal-header">
+        <h2 id="modal-title" class="modal-title"></h2>
+        <button type="button" class="icon-btn" id="modal-close-btn" aria-label="Cerrar diálogo">
+          <span class="nav-icon" data-icon="x"></span>
+        </button>
+      </div>
+      <div id="modal-body" class="modal-body"></div>
+    </div>
+  </div>
+
+  <!-- Toast Stack -->
+  <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="false"></div>
+
+  <script type="module" src="app.js"></script>
+</body>
 </html>
