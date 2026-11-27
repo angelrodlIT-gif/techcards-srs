@@ -56,10 +56,11 @@ docker compose down
 Use **Try it out** in `/docs`, in this order (use IDs returned by the API):
 
 1. `POST /decks`: `{"name":"Cloud interviews","description":"Technical English practice"}`.
-2. `POST /cards/generate`: `{"deck_id":1,"text":"AWS support role using Python, Linux and troubleshooting","max_cards":6}`.
-3. `GET /decks/1/due`: inspect cards due today.
-4. Answer a card aloud, then `POST /reviews`: `{"card_id":1,"quality":4}`.
-5. `GET /cards/1`: see its updated interval, ease and UTC due date.
+2. Preview cards with `POST /cards/generate/preview` using `{"deck_id":1,"text":"AWS support role using Python, Linux and troubleshooting","max_cards":6}`.
+3. Read the evaluation and edit the draft. Submit the draft with the original text as `source_text` to `POST /cards/generate/approve`. See [Generated card evaluation](docs/CARD_EVALUATION.md).
+4. Inspect the approved cards due today with `GET /decks/1/due`.
+5. Answer a card aloud, then send `{"card_id":1,"quality":4}` to `POST /reviews`.
+6. Check the updated interval, ease and UTC due date with `GET /cards/1`.
 
 Grades: 0–2 recall failure, 3 difficult correct recall, 4 correct with hesitation,
 5 easy correct recall. Failed cards return tomorrow. `POST /reviews` is intentionally

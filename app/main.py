@@ -10,8 +10,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, contains_eager, joinedload, selectinload
 
 from app.db import get_db
+from app.evaluation import evaluate_generated_card
 from app.generator import (
     CardGenerator,
+    GeneratedCard,
     GeneratorError,
     GeneratorUpstreamError,
     get_generator,
@@ -36,7 +38,11 @@ from app.schemas import (
     ErrorStatus,
     ErrorSuggestionInput,
     ErrorSuggestionOut,
+    GeneratedCardApproveInput,
+    GeneratedCardApproveOut,
+    GeneratedCardDraftOut,
     GenerateInput,
+    GeneratePreviewInput,
     Kind,
     ReviewInput,
     ReviewOut,
@@ -149,39 +155,111 @@ def due_cards(
     ).all()
 
 
-# Register this static path before /cards/{card_id}.
-@app.post("/cards/generate", response_model=list[CardOut], status_code=201)
-def generate_cards(payload: GenerateInput, db: DB, generator: Generator, clock: Clock):
-    require(db, Deck, payload.deck_id)
-    # Release the read transaction and pooled connection before the outbound call.
+def require_deck_incarnation(db: Session, deck_id: int, expected: str | None = None) -> str:
+    incarnation = db.scalar(select(Deck.incarnation).where(Deck.id == deck_id))
+    if incarnation is None or (expected is not None and incarnation != expected):
+        raise HTTPException(404, "Deck not found")
+    return incarnation
+
+
+def generate_drafts(
+    payload: GenerateInput, db: Session, generator: CardGenerator
+) -> tuple[str, list[GeneratedCard]]:
+    incarnation = require_deck_incarnation(db, payload.deck_id)
+    # Return the pooled connection before calling the provider.
     db.rollback()
     generated = generator.generate(payload.text, payload.max_cards)
     if not generated:
         raise GeneratorUpstreamError("Generator returned no cards.")
+    return incarnation, generated[: payload.max_cards]
+
+
+def save_generated_cards(
+    db: Session, deck_id: int, incarnation: str, cards: list[Card]
+) -> list[CardOut]:
+    db.add_all(cards)
+    try:
+        # PostgreSQL checks the foreign key and locks the parent through commit.
+        # SQLite holds its writer lock from the first insert through commit.
+        db.flush()
+        require_deck_incarnation(db, deck_id, incarnation)
+        result = [CardOut.model_validate(card) for card in cards]
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        require_deck_incarnation(db, deck_id, incarnation)
+        raise
+    except HTTPException:
+        db.rollback()
+        raise
+    return result
+
+
+# Register these static paths before /cards/{card_id}.
+@app.post("/cards/generate", response_model=list[CardOut], status_code=201, deprecated=True)
+def generate_cards(payload: GenerateInput, db: DB, generator: Generator, clock: Clock):
+    incarnation, generated = generate_drafts(payload, db, generator)
     today = normalize_utc(clock()).date()
-    # Validate provider output before any rows are persisted.
     try:
         cards = [
             Card(
                 **CardInput(
-                    deck_id=payload.deck_id, front=c.front, back=c.back, kind=c.kind
+                    deck_id=payload.deck_id, front=card.front, back=card.back, kind=card.kind
                 ).model_dump(),
                 due_date=today,
             )
-            for c in generated[: payload.max_cards]
+            for card in generated
         ]
     except ValidationError as exc:
         raise GeneratorUpstreamError("Generator returned invalid card output.") from exc
-    require(db, Deck, payload.deck_id)
-    db.add_all(cards)
-    try:
-        db.commit()
-    except IntegrityError as exc:
-        db.rollback()
-        raise HTTPException(404, "Deck not found") from exc
-    for card in cards:
-        db.refresh(card)
-    return cards
+    return save_generated_cards(db, payload.deck_id, incarnation, cards)
+
+
+@app.post("/cards/generate/preview", response_model=list[GeneratedCardDraftOut])
+def preview_generated_cards(payload: GeneratePreviewInput, db: DB, generator: Generator):
+    incarnation, generated = generate_drafts(payload, db, generator)
+    drafts = []
+    for card in generated:
+        try:
+            draft = GeneratedCardDraftOut(
+                deck_id=payload.deck_id,
+                deck_incarnation=incarnation,
+                front=card.front,
+                back=card.back,
+                kind=card.kind,
+                source_label=payload.source_label,
+                evaluation=evaluate_generated_card(
+                    front=card.front, back=card.back, kind=card.kind, source_text=payload.text
+                ),
+            )
+        except (AttributeError, TypeError, ValidationError) as exc:
+            raise GeneratorUpstreamError("Generator returned invalid card output.") from exc
+        drafts.append(draft)
+    require_deck_incarnation(db, payload.deck_id, incarnation)
+    return drafts
+
+
+@app.post("/cards/generate/approve", response_model=GeneratedCardApproveOut, status_code=201)
+def approve_generated_card(payload: GeneratedCardApproveInput, db: DB, clock: Clock):
+    incarnation = require_deck_incarnation(db, payload.deck_id, payload.deck_incarnation)
+    db.rollback()
+    evaluation = evaluate_generated_card(
+        front=payload.front,
+        back=payload.back,
+        kind=payload.kind,
+        source_text=payload.source_text,
+        accepted_answers=payload.accepted_answers,
+        explanation=payload.explanation,
+    )
+    if not evaluation.ready_for_review:
+        checks = [name for name, value in evaluation.checks if value == "fail"]
+        raise HTTPException(422, {"checks": checks, "reasons": evaluation.rejection_reasons})
+    card = Card(
+        **payload.model_dump(exclude={"source_text", "deck_incarnation"}),
+        due_date=normalize_utc(clock()).date(),
+    )
+    (saved_card,) = save_generated_cards(db, payload.deck_id, incarnation, [card])
+    return GeneratedCardApproveOut(card=saved_card, evaluation=evaluation)
 
 
 @app.post("/cards", response_model=CardOut, status_code=201)

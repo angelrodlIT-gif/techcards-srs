@@ -1,11 +1,28 @@
 from datetime import UTC, date, datetime
 
 from sqlalchemy import JSON, CheckConstraint, Date, DateTime, ForeignKey, Index, String, Text, text
+from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.sql.functions import FunctionElement
 
 
 class Base(DeclarativeBase):
     pass
+
+
+class DeckIncarnationDefault(FunctionElement):
+    type = String(32)
+    inherit_cache = True
+
+
+@compiles(DeckIncarnationDefault, "postgresql")
+def postgres_deck_incarnation(element, compiler, **kwargs):
+    return "replace(gen_random_uuid()::text, '-', '')"
+
+
+@compiles(DeckIncarnationDefault, "sqlite")
+def sqlite_deck_incarnation(element, compiler, **kwargs):
+    return "(lower(hex(randomblob(16))))"
 
 
 class Deck(Base):
@@ -13,6 +30,7 @@ class Deck(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(120))
     description: Mapped[str] = mapped_column(Text, default="")
+    incarnation: Mapped[str] = mapped_column(String(32), server_default=DeckIncarnationDefault())
 
 
 class Card(Base):

@@ -92,6 +92,9 @@ defaults to `""` (max 5,000 characters). Whitespace-only names return `422`.
 
 ### 2. Generate flashcards from pasted text (`POST /cards/generate`)
 
+For new integrations, use [preview and approve](CARD_EVALUATION.md). The legacy
+endpoint below still writes provider output directly for existing clients.
+
 Use the `id` from step 1 as `deck_id`:
 
 ```console

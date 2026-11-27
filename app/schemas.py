@@ -176,10 +176,57 @@ class CardOut(BaseModel):
         return [] if value is None else value
 
 
+GenerationSource = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=10, max_length=20000), NoNul
+]
+DeckIncarnation = Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{32}$")]
+EvaluationCheck = Literal["pass", "warn", "fail"]
+
+
 class GenerateInput(BaseModel):
     deck_id: int = Field(gt=0)
-    text: Annotated[str, StringConstraints(strip_whitespace=True, min_length=10, max_length=20000)]
+    text: GenerationSource
     max_cards: int = Field(default=6, ge=1, le=20)
+
+
+class GeneratePreviewInput(GenerateInput):
+    source_label: RequiredSourceLabel | None = None
+
+
+class CardEvaluationChecks(BaseModel):
+    english_usefulness: EvaluationCheck
+    technical_accuracy: EvaluationCheck
+    ambiguity: EvaluationCheck
+    source_grounding: EvaluationCheck
+
+
+class CardEvaluationOut(BaseModel):
+    status: Literal["draft", "rejected"]
+    ready_for_review: bool
+    checks: CardEvaluationChecks
+    uncertainty: list[str]
+    rejection_reasons: list[str]
+
+
+class GeneratedCardDraftOut(CardExtrasMixin):
+    deck_id: int
+    deck_incarnation: DeckIncarnation
+    front: str
+    back: str
+    kind: Kind
+    source_label: str | None
+    evaluation: CardEvaluationOut
+
+
+class GeneratedCardApproveInput(CardInput):
+    source_text: GenerationSource
+    deck_incarnation: DeckIncarnation | None = None
+    source_label: RequiredSourceLabel | None = None
+
+
+class GeneratedCardApproveOut(BaseModel):
+    card: CardOut
+    evaluation: CardEvaluationOut
 
 
 class ReviewInput(BaseModel):
