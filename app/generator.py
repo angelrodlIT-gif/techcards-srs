@@ -36,7 +36,9 @@ Transport = Callable[[urllib.request.Request, float], Any]
 MAX_GENERATED_CARDS = 20
 MAX_RESPONSE_BYTES = 1_048_576
 RESPONSE_READ_CHUNK_BYTES = 16_384
+MAX_CONCURRENT_DNS_LOOKUPS = 8
 LOOPBACK_HTTP_HOSTS = frozenset({"127.0.0.1", "localhost"})
+_DNS_LOOKUP_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_DNS_LOOKUPS)
 
 SYSTEM_PROMPT = (
     "You generate technical English flashcards for IT interview practice. "
@@ -130,7 +132,7 @@ def validate_generator_base_url(raw_url: str) -> str:
         raise GeneratorConfigError("GENERATOR_BASE_URL must be an absolute https:// URL.")
     if parsed.username is not None or parsed.password is not None:
         raise GeneratorConfigError("GENERATOR_BASE_URL must not include credentials.")
-    if parsed.query or parsed.fragment:
+    if "?" in trimmed or "#" in trimmed or parsed.query or parsed.fragment:
         raise GeneratorConfigError("GENERATOR_BASE_URL must not include a query or fragment.")
     try:
         port = parsed.port
@@ -174,6 +176,14 @@ def _resolve_with_deadline(host: str, port: int, deadline: float) -> list[tuple[
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise TimeoutError("timed out")
+    semaphore = _DNS_LOOKUP_SEMAPHORE
+    if not semaphore.acquire(timeout=remaining):
+        raise TimeoutError("timed out")
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        semaphore.release()
+        raise TimeoutError("timed out")
+
     result: list[tuple[Any, ...]] = []
     error: list[BaseException] = []
 
@@ -182,9 +192,15 @@ def _resolve_with_deadline(host: str, port: int, deadline: float) -> list[tuple[
             result.extend(socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM))
         except BaseException as exc:
             error.append(exc)
+        finally:
+            semaphore.release()
 
     thread = threading.Thread(target=_lookup, daemon=True)
-    thread.start()
+    try:
+        thread.start()
+    except BaseException:
+        semaphore.release()
+        raise
     thread.join(timeout=remaining)
     if thread.is_alive() or time.monotonic() > deadline:
         raise TimeoutError("timed out")
@@ -518,7 +534,12 @@ def _expected_content_length(response: Any) -> int | None:
                 raise GeneratorUpstreamError(
                     "AI generator provider returned an invalid Content-Length header."
                 )
-            parsed_lengths.add(int(token))
+            try:
+                parsed_lengths.add(int(token))
+            except ValueError as exc:
+                raise GeneratorUpstreamError(
+                    "AI generator provider returned an invalid Content-Length header."
+                ) from exc
     if len(parsed_lengths) != 1:
         raise GeneratorUpstreamError(
             "AI generator provider returned conflicting Content-Length headers."
@@ -848,6 +869,53 @@ class OpenAICompatibleGenerator:
         return validated[:max_cards]
 
 
+def _parse_generator_timeout_seconds(raw: Any) -> float:
+    error_message = (
+        f"GENERATOR_TIMEOUT_SECONDS must be > 0 and <= {MAX_GENERATOR_TIMEOUT_SECONDS:g}."
+    )
+    if isinstance(raw, bool):
+        raise GeneratorConfigError(error_message)
+    if isinstance(raw, int | float):
+        value = float(raw)
+    elif isinstance(raw, str):
+        trimmed = raw.strip()
+        if not trimmed:
+            raise GeneratorConfigError(error_message)
+        try:
+            value = float(trimmed)
+        except ValueError as exc:
+            raise GeneratorConfigError(error_message) from exc
+    else:
+        raise GeneratorConfigError(error_message)
+    if not math.isfinite(value) or not (0.0 < value <= MAX_GENERATOR_TIMEOUT_SECONDS):
+        raise GeneratorConfigError(error_message)
+    return value
+
+
+def _parse_generator_max_input_chars(raw: Any) -> int:
+    error_message = (
+        f"GENERATOR_MAX_INPUT_CHARS must be between "
+        f"{MIN_GENERATOR_INPUT_CHARS} and {MAX_GENERATOR_INPUT_CHARS}."
+    )
+    if isinstance(raw, bool):
+        raise GeneratorConfigError(error_message)
+    if isinstance(raw, int):
+        value = raw
+    elif isinstance(raw, str):
+        trimmed = raw.strip()
+        if not re.fullmatch(r"[+-]?[0-9]+", trimmed):
+            raise GeneratorConfigError(error_message)
+        try:
+            value = int(trimmed)
+        except ValueError as exc:
+            raise GeneratorConfigError(error_message) from exc
+    else:
+        raise GeneratorConfigError(error_message)
+    if not (MIN_GENERATOR_INPUT_CHARS <= value <= MAX_GENERATOR_INPUT_CHARS):
+        raise GeneratorConfigError(error_message)
+    return value
+
+
 def get_generator() -> CardGenerator:
     try:
         settings = get_settings()
@@ -869,8 +937,8 @@ def get_generator() -> CardGenerator:
             api_key=api_key,
             model=settings.generator_model or "",
             base_url=settings.generator_base_url,
-            timeout_seconds=settings.generator_timeout_seconds,
-            max_input_chars=settings.generator_max_input_chars,
+            timeout_seconds=_parse_generator_timeout_seconds(settings.generator_timeout_seconds),
+            max_input_chars=_parse_generator_max_input_chars(settings.generator_max_input_chars),
         )
 
     raise GeneratorConfigError(f"Unsupported generator provider: {settings.generator_provider!r}.")

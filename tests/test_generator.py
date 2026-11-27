@@ -14,6 +14,7 @@ from pydantic import ValidationError
 
 from app.config import Settings, get_settings
 from app.generator import (
+    MAX_CONCURRENT_DNS_LOOKUPS,
     MAX_RESPONSE_BYTES,
     GeneratedCard,
     GeneratorConfigError,
@@ -149,7 +150,25 @@ def test_opt_in_provider_selection_and_secret_redaction(monkeypatch):
                 "GENERATOR_MODEL": "gpt-4o-mini",
                 "GENERATOR_TIMEOUT_SECONDS": "0",
             },
-            "generator_timeout_seconds",
+            "GENERATOR_TIMEOUT_SECONDS",
+        ),
+        (
+            {
+                "GENERATOR_PROVIDER": "openai_compatible",
+                "GENERATOR_API_KEY": "sk-test",
+                "GENERATOR_MODEL": "gpt-4o-mini",
+                "GENERATOR_TIMEOUT_SECONDS": "invalid",
+            },
+            "GENERATOR_TIMEOUT_SECONDS",
+        ),
+        (
+            {
+                "GENERATOR_PROVIDER": "openai_compatible",
+                "GENERATOR_API_KEY": "sk-test",
+                "GENERATOR_MODEL": "gpt-4o-mini",
+                "GENERATOR_TIMEOUT_SECONDS": "nan",
+            },
+            "GENERATOR_TIMEOUT_SECONDS",
         ),
         (
             {
@@ -158,7 +177,25 @@ def test_opt_in_provider_selection_and_secret_redaction(monkeypatch):
                 "GENERATOR_MODEL": "gpt-4o-mini",
                 "GENERATOR_MAX_INPUT_CHARS": "9",
             },
-            "generator_max_input_chars",
+            "GENERATOR_MAX_INPUT_CHARS",
+        ),
+        (
+            {
+                "GENERATOR_PROVIDER": "openai_compatible",
+                "GENERATOR_API_KEY": "sk-test",
+                "GENERATOR_MODEL": "gpt-4o-mini",
+                "GENERATOR_MAX_INPUT_CHARS": "invalid",
+            },
+            "GENERATOR_MAX_INPUT_CHARS",
+        ),
+        (
+            {
+                "GENERATOR_PROVIDER": "openai_compatible",
+                "GENERATOR_API_KEY": "sk-test",
+                "GENERATOR_MODEL": "gpt-4o-mini",
+                "GENERATOR_MAX_INPUT_CHARS": "12.5",
+            },
+            "GENERATOR_MAX_INPUT_CHARS",
         ),
     ],
 )
@@ -184,6 +221,40 @@ def test_settings_rejects_unsupported_provider_directly(monkeypatch):
     monkeypatch.setenv("GENERATOR_PROVIDER", "unsupported")
     with pytest.raises(ValidationError):
         Settings()
+
+
+@pytest.mark.parametrize(
+    "ai_env_overrides",
+    [
+        {"GENERATOR_TIMEOUT_SECONDS": "0"},
+        {"GENERATOR_TIMEOUT_SECONDS": "invalid"},
+        {"GENERATOR_MAX_INPUT_CHARS": "0"},
+        {"GENERATOR_MAX_INPUT_CHARS": "invalid"},
+        {"GENERATOR_TIMEOUT_SECONDS": "0", "GENERATOR_MAX_INPUT_CHARS": "5"},
+    ],
+)
+def test_mock_provider_ignores_invalid_ai_only_settings(client, monkeypatch, ai_env_overrides):
+    _clear_generator_env(monkeypatch)
+    monkeypatch.setenv("GENERATOR_PROVIDER", "mock")
+    for key, value in ai_env_overrides.items():
+        monkeypatch.setenv(key, value)
+    get_settings.cache_clear()
+
+    try:
+        settings = get_settings()
+        assert settings.generator_provider == "mock"
+        generator = get_generator()
+        assert isinstance(generator, MockGenerator)
+
+        did = _create_deck(client)
+        res = client.post(
+            "/cards/generate",
+            json={"deck_id": did, "text": "AWS Python troubleshooting role", "max_cards": 3},
+        )
+        assert res.status_code == 201
+        assert len(res.json()) == 3
+    finally:
+        _clear_generator_env(monkeypatch)
 
 
 @pytest.mark.parametrize(
@@ -218,6 +289,8 @@ def test_validate_generator_base_url_allows_https_and_loopback_http(raw_url, exp
         "https://user:supersecret@api.openai.com/v1",
         "https://api.openai.com/v1?key=secret",
         "https://api.openai.com/v1#fragment",
+        "https://api.openai.com/v1?",
+        "https://api.openai.com/v1#",
         "https://api.openai.com:99999/v1",
         "https://api.openai.com:0/v1",
         "https://api.openai.com/v1\nX-Injected: 1",
@@ -1662,4 +1735,120 @@ def test_send_catches_unicode_encode_error_as_503(client):
     )
     assert res.status_code == 503
     assert "\u2603" not in res.text
+    assert client.get("/cards", params={"deck_id": did}).json() == []
+
+
+def test_stalled_dns_lookups_are_bounded_by_semaphore(client, monkeypatch):
+    release_dns = threading.Event()
+    started_lookups = 0
+    started_lock = threading.Lock()
+    spawned_threads = 0
+    real_thread = threading.Thread
+
+    def slow_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        nonlocal started_lookups
+        with started_lock:
+            started_lookups += 1
+        release_dns.wait(timeout=2.0)
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("127.0.0.1", 443))]
+
+    def counting_thread(*args, **kwargs):
+        nonlocal spawned_threads
+        spawned_threads += 1
+        return real_thread(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "app.generator._DNS_LOOKUP_SEMAPHORE",
+        threading.BoundedSemaphore(MAX_CONCURRENT_DNS_LOOKUPS),
+    )
+    monkeypatch.setattr("app.generator.socket.getaddrinfo", slow_getaddrinfo)
+    monkeypatch.setattr("app.generator.threading.Thread", counting_thread)
+    monkeypatch.delenv("http_proxy", raising=False)
+    monkeypatch.delenv("https_proxy", raising=False)
+    monkeypatch.delenv("HTTP_PROXY", raising=False)
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+
+    try:
+        generator = OpenAICompatibleGenerator(
+            api_key="sk-dns-bound-secret",
+            model="gpt-4o-mini",
+            base_url="https://slow-dns.example.invalid/v1",
+            timeout_seconds=0.03,
+        )
+        # Occupy all MAX_CONCURRENT_DNS_LOOKUPS slots with stalled lookups.
+        for _ in range(MAX_CONCURRENT_DNS_LOOKUPS):
+            with pytest.raises(GeneratorTimeoutError) as exc_info:
+                generator.generate("Python backend API troubleshooting", max_cards=2)
+            assert exc_info.value.status_code == 504
+
+        assert spawned_threads == MAX_CONCURRENT_DNS_LOOKUPS
+
+        # Additional requests must time out with 504 without spawning any new threads.
+        for _ in range(3):
+            with pytest.raises(GeneratorTimeoutError) as exc_info:
+                generator.generate("Python backend API troubleshooting", max_cards=2)
+            assert exc_info.value.status_code == 504
+
+        did = _create_deck(client)
+        app.dependency_overrides[get_generator] = lambda: generator
+        res = client.post(
+            "/cards/generate",
+            json={"deck_id": did, "text": "Python backend API troubleshooting"},
+        )
+        assert res.status_code == 504
+        assert "sk-dns-bound-secret" not in res.text
+        assert client.get("/cards", params={"deck_id": did}).json() == []
+        assert spawned_threads == MAX_CONCURRENT_DNS_LOOKUPS
+        assert started_lookups <= MAX_CONCURRENT_DNS_LOOKUPS
+    finally:
+        release_dns.set()
+
+
+def test_huge_digit_content_length_returns_502_never_500(client):
+    huge_length = "9" * 5000
+    read_called = False
+
+    class HugeLengthHeaders:
+        def get_all(self, name: str):
+            if name.lower() == "content-length":
+                return [huge_length]
+            return None
+
+    class HugeLengthResponse:
+        headers = HugeLengthHeaders()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, size: int = -1) -> bytes:
+            nonlocal read_called
+            read_called = True
+            return b""
+
+    generator = OpenAICompatibleGenerator(
+        api_key="sk-huge-cl-secret",
+        model="gpt-4o-mini",
+        opener=lambda req, timeout: HugeLengthResponse(),
+    )
+    with pytest.raises(GeneratorUpstreamError) as exc_info:
+        generator.generate("Python backend API troubleshooting", max_cards=2)
+    assert exc_info.value.status_code == 502
+    assert read_called is False
+
+    did = _create_deck(client)
+    app.dependency_overrides[get_generator] = lambda: OpenAICompatibleGenerator(
+        api_key="sk-huge-cl-secret",
+        model="gpt-4o-mini",
+        opener=lambda req, timeout: HugeLengthResponse(),
+    )
+    res = client.post(
+        "/cards/generate",
+        json={"deck_id": did, "text": "Python backend API troubleshooting"},
+    )
+    assert res.status_code == 502
+    assert "Content-Length" in res.json()["detail"]
+    assert "sk-huge-cl-secret" not in res.text
     assert client.get("/cards", params={"deck_id": did}).json() == []
