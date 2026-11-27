@@ -59,3 +59,30 @@ the bytes may remain in memory until expiry, eviction, or restart.
 - `POST /errors/{id}/approve` (`201`, `409` if not `draft`) atomically marks the error `approved`, creates a card (`kind` defaults to `behavioral` when omitted on `[STAR remediation]` entries and `interview_phrase` otherwise; explicit `kind`, `front`, `back`, `explanation` overrides are honored), and links them (`error_logs.card_id` FK `ON DELETE SET NULL`, exposed as `error.card_id` and `card.error_id`).
 - `GET /errors/export` (optional `status`, `offset`, `limit` `1..1000`) returns a UTC-timestamped JSON snapshot (`exported_at`, `count`, `items`) preserving each original `attempted` answer alongside its linked `card` schedule snapshot (or `null`).
 - **Consent, privacy, and retention:** Submitted interview text is stored only after explicit `consent: true`, exclusively in local loopback PostgreSQL (`127.0.0.1`) with zero third-party uploads. Do **not** submit employer-confidential, client, PII, or NDA material. Entries are retained locally until the learner deletes them (`GET /errors/export` is a read-only snapshot and does not delete stored rows): `DELETE /errors/{id}` (`204`) removes only the error log (keeping the card with `error_id: null`), while `DELETE /errors/{id}?delete_card=true` (`204`) atomically hard-deletes both the error log and its linked card (cascading that card's reviews).
+
+## Pronunciation practice
+
+For pronunciation, vocabulary, sentence, interview phrase, and listening cards
+with references up to 1,000 characters, use `/study/{card_id}/pronunciation`:
+
+- **Listen and shadow.** Send `POST /audio` with `Polly-Opt-In: true` to hear
+  the reference when Polly is configured. Repeat along with the clip, or read
+  the reference aloud if audio is unavailable.
+- **Record and replay.** With the learner's consent, send the audio bytes to
+  `POST /recording` with `Recording-Consent: true` and an audio content type
+  (WebM, Ogg, WAV, MPEG, or MP4). The limit is 512 KiB. Use `GET /recording`
+  to replay and `DELETE /recording` to discard the active attempt.
+- **Compare.** Send `POST /compare` with your `spoken_transcript` and optional
+  `learner_notes`. If the microphone is unavailable, send
+  `{"microphone_available": false}` to practice without a recording. Term
+  feedback compares the supplied text. Listen to the recording to assess your
+  speech, then use the study grade endpoint to self-grade.
+
+These endpoints require a direct loopback connection to the API process.
+Forwarded requests and requests arriving through the Docker bridge are
+rejected. For local clients on the host, run the API directly on loopback.
+Recording bytes stay in the serving worker's memory for up to one hour, with
+a limit of 32 clips per worker. Use one worker if you need to replay across
+requests. Changing the reference, deck, or kind, or deleting the card, makes
+its prior clips inaccessible. Superseded bytes expire from memory or are
+evicted. Restarting the worker clears its recordings.
