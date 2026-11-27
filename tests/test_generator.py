@@ -3004,3 +3004,129 @@ def test_valid_chunked_response_with_extension_and_trailer_over_real_loopback_ht
         assert len(client.get("/cards", params={"deck_id": did}).json()) == 1
     finally:
         server_thread.join(timeout=2.0)
+
+
+def test_duplicate_zero_content_length_with_trailing_json_raw_socket_returns_502_no_cards(client):
+    secret = "sk-dup-zero-cl-socket-secret"
+    valid_body = _chat_completion_bytes(
+        {
+            "cards": [
+                {
+                    "front": "Should trailing bytes past Content-Length: 0, 0 persist?",
+                    "back": "No, bytes beyond the declared length must never reach the parser.",
+                    "kind": "vocabulary",
+                }
+            ]
+        }
+    )
+    raw_http = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Content-Length: 0, 0\r\n"
+        b"Connection: close\r\n"
+        b"\r\n" + valid_body
+    )
+    strict_opener = _make_raw_http_socket_opener(raw_http)
+
+    did = _create_deck(client)
+    app.dependency_overrides[get_generator] = lambda: OpenAICompatibleGenerator(
+        api_key=secret,
+        model="gpt-4o-mini",
+        opener=strict_opener,
+    )
+    res = client.post(
+        "/cards/generate",
+        json={"deck_id": did, "text": "HTTP Content-Length framing check"},
+    )
+    assert res.status_code == 502
+    assert secret not in res.text
+    assert client.get("/cards", params={"deck_id": did}).json() == []
+
+
+def test_duplicate_zero_content_length_with_trailing_json_fake_response_returns_502_no_cards(
+    client,
+):
+    secret = "sk-dup-zero-cl-fake-secret"
+    valid_body = _chat_completion_bytes(
+        {
+            "cards": [
+                {
+                    "front": "Should a fake response exceeding Content-Length: 0, 0 persist?",
+                    "back": "No, bodies exceeding declared Content-Length must be rejected.",
+                    "kind": "vocabulary",
+                }
+            ]
+        }
+    )
+
+    class FakeExcessBodyResponse:
+        headers = {"Content-Length": "0, 0"}
+        length = None
+
+        def __init__(self) -> None:
+            self._stream = io.BytesIO(valid_body)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, size: int = -1) -> bytes:
+            return self._stream.read(size)
+
+    did = _create_deck(client)
+    app.dependency_overrides[get_generator] = lambda: OpenAICompatibleGenerator(
+        api_key=secret,
+        model="gpt-4o-mini",
+        opener=lambda req, timeout: FakeExcessBodyResponse(),
+    )
+    res = client.post(
+        "/cards/generate",
+        json={"deck_id": did, "text": "HTTP Content-Length fake response check"},
+    )
+    assert res.status_code == 502
+    assert "content-length" in res.json()["detail"].lower()
+    assert secret not in res.text
+    assert client.get("/cards", params={"deck_id": did}).json() == []
+
+
+def test_chunked_response_with_bws_before_extension_semicolon_returns_201_and_persists(client):
+    valid_body = _chat_completion_bytes(
+        {
+            "cards": [
+                {
+                    "front": "Does HTTP/1.1 allow BWS before a chunk extension semicolon?",
+                    "back": "Yes, optional SP and HTAB may precede ';' in chunk-ext.",
+                    "kind": "vocabulary",
+                }
+            ]
+        }
+    )
+    raw_http = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"Connection: close\r\n"
+        b"\r\n"
+        + f"{len(valid_body):x} \t;ext=1\r\n".encode()
+        + valid_body
+        + b"\r\n0 \t;final=1\r\n\r\n"
+    )
+    strict_opener = _make_raw_http_socket_opener(raw_http)
+
+    did = _create_deck(client)
+    app.dependency_overrides[get_generator] = lambda: OpenAICompatibleGenerator(
+        api_key="sk-chunk-ext-bws-secret",
+        model="gpt-4o-mini",
+        opener=strict_opener,
+    )
+    res = client.post(
+        "/cards/generate",
+        json={"deck_id": did, "text": "HTTP/1.1 chunk extension BWS handling"},
+    )
+    assert res.status_code == 201
+    cards = res.json()
+    assert len(cards) == 1
+    assert cards[0]["front"] == "Does HTTP/1.1 allow BWS before a chunk extension semicolon?"
+    assert len(client.get("/cards", params={"deck_id": did}).json()) == 1

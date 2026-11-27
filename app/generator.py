@@ -446,7 +446,7 @@ class _StrictHTTPResponse(http.client.HTTPResponse):
             raise ValueError("invalid chunk size")
         i = line.find(b";")
         if i >= 0:
-            line = line[:i]
+            line = line[:i].rstrip(b" \t")
         if not line or not all(c in b"0123456789abcdefABCDEF" for c in line):
             if self.fp is not None:
                 self._close_conn()
@@ -854,6 +854,12 @@ class OpenAICompatibleGenerator:
     def _read_response_with_deadline(self, response: Any, deadline: float) -> bytes:
         _ensure_response_deadline_socket(response, deadline)
         expected_content_length = _expected_content_length(response)
+        if (
+            expected_content_length is not None
+            and isinstance(response, http.client.HTTPResponse)
+            and getattr(response, "length", None) is None
+        ):
+            response.length = expected_content_length
         chunks = bytearray()
         max_bytes = MAX_RESPONSE_BYTES + 1
         while len(chunks) < max_bytes:
@@ -883,12 +889,20 @@ class OpenAICompatibleGenerator:
                     raise GeneratorUpstreamError(
                         "AI generator provider returned an incomplete response."
                     )
-                if expected_content_length is not None and len(chunks) < expected_content_length:
+                if expected_content_length is not None and len(chunks) != expected_content_length:
+                    if len(chunks) < expected_content_length:
+                        raise GeneratorUpstreamError(
+                            "AI generator provider returned an incomplete response."
+                        )
                     raise GeneratorUpstreamError(
-                        "AI generator provider returned an incomplete response."
+                        "AI generator provider response exceeded declared Content-Length."
                     )
                 break
             chunks.extend(chunk)
+            if expected_content_length is not None and len(chunks) > expected_content_length:
+                raise GeneratorUpstreamError(
+                    "AI generator provider response exceeded declared Content-Length."
+                )
         return bytes(chunks)
 
     def _send(self, request: urllib.request.Request) -> bytes:
