@@ -26,12 +26,17 @@ the evaluator and approval endpoint.
 | Input | Observation |
 | --- | --- |
 | Cloud support vacancy | The AWS interview practice template passed with an ambiguity warning for the placeholder. A template with an added migration claim was rejected. |
-| AWS VPC documentation | The two-letter cloze answer `IP` passed. An alternate answer calling security groups stateless was rejected. [VPC infrastructure security](https://docs.aws.amazon.com/vpc/latest/userguide/infrastructure-security.html), [route table concepts](https://docs.aws.amazon.com/vpc/latest/userguide/RouteTables.html) |
+| AWS VPC documentation | The two-letter cloze answer `IP` passed. A quoted sentence about stateless ACLs was rejected when the prompt asked which AWS control is stateful. [VPC infrastructure security](https://docs.aws.amazon.com/vpc/latest/userguide/infrastructure-security.html), [route table concepts](https://docs.aws.amazon.com/vpc/latest/userguide/RouteTables.html) |
 | Interview notes | The exact statement `I saved $50,000.` passed. Reassigned AWS/GCP counts, reversed latency measurements, and a colleague's work recast as the speaker's were rejected. |
 
 The evaluator checks wording offline and recognizes a limited set of technical
 contradictions. It expects answers to use a complete sentence from the source
 or a built-in glossary definition for a term in both the prompt and source.
+A non-cloze answer or alternative must contain a sentence that addresses the
+prompt's subject and requested detail. For example, a property question needs
+the stated property, a quantity question needs a number, and a why question
+needs wording that indicates a reason. Cloze answers are checked as completed
+prompts. Practice templates must match the prompt they were designed for.
 First-person claims and metrics need matching source wording. Correct
 paraphrases and partial quotes can be rejected. A passing result depends on the
 supplied source and still calls for human review. The evaluator reports no

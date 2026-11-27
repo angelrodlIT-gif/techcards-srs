@@ -27,6 +27,18 @@ STAR = (
     "use star: describe the situation, task, action and result. "
     "choose a real experience; do not invent an outcome"
 )
+STAR_PROMPT = re.compile(r"tell me about a time you solved a problem involving ([a-z0-9+-]+)\.?")
+PROMPT_FILLER = frozenset(
+    "a an the of in on for to into with and or as at by from is are was were be being been "
+    "do does did can could should would will you your we our i my it its this that these those "
+    "what which who where when why how much many say source mention explain technical english "
+    "listen transcribe".split()
+)
+PROPERTY_QUESTION = re.compile(
+    r"^(?:which|what) ([a-z0-9 ]+?) (?:is|are) ((?:not )?[a-z][a-z0-9]*)\??$"
+)
+QUESTION_CATEGORIES = {"control", "service", "protocol", "tool", "database", "feature"}
+CAUSAL_LINK = re.compile(r"\b(?:because|since|due to|so that|which (?:allows|lets))\b")
 CONTRADICTION = re.compile(
     r"\b(?:security groups? (?:is|are) stateless|"
     r"(?:network acls?|nacls?) (?:is|are) stateful|"
@@ -46,6 +58,31 @@ def normalize(value: str) -> str:
     return re.sub(r"(?<=\$) (?=\d)|(?<=\d) (?=%)", "", value)
 
 
+def sentence_answers_prompt(front: str, answer: str, glossary_term: str | None) -> bool:
+    prompt_terms = set(WORD.findall(front)) - PROMPT_FILLER
+    property_question = PROPERTY_QUESTION.fullmatch(front)
+    if property_question:
+        subject, predicate = property_question.groups()
+        category = subject.rsplit(" ", 1)[-1]
+        if category in QUESTION_CATEGORIES:
+            prompt_terms.discard(category)
+        if not re.search(rf"\b(?:is|are) {re.escape(predicate)}\b", answer):
+            return False
+
+    answer_terms = set(WORD.findall(answer))
+    variants = {word[:-1] for word in answer_terms if len(word) > 3 and word.endswith(("s", "ed"))}
+    variants.update(word[:-2] for word in answer_terms if len(word) > 3 and word.endswith("ed"))
+    if "led" in answer_terms:
+        variants.add("lead")
+    if glossary_term is not None:
+        variants.add(glossary_term)
+    if front.startswith("why ") and not CAUSAL_LINK.search(answer):
+        return False
+    if front.startswith(("how much ", "how many ")) and not NUMBER.search(answer):
+        return False
+    return prompt_terms <= answer_terms | variants
+
+
 def evaluate_generated_card(
     *,
     front: str,
@@ -61,8 +98,9 @@ def evaluate_generated_card(
     sentences.add(source.rstrip("."))
     source_words = set(WORD.findall(source))
     topics = {word for word in WORD.findall(normalized_front) if len(word) > 1} & source_words
-    definitions = {normalize(GLOSSARY[term]).rstrip(".") for term in topics & GLOSSARY.keys()}
-    grounded_answers = sentences | definitions
+    definitions = {normalize(GLOSSARY[term]).rstrip("."): term for term in topics & GLOSSARY.keys()}
+    grounded_answers = sentences | definitions.keys()
+    star_prompt = STAR_PROMPT.fullmatch(normalized_front)
     failures: dict[str, str] = {}
     ambiguity_warning = kind in {"cloze", "es_en"} and not accepted_answers
     uncertainty = ["Offline checks cover a limited set of contradictions and use lexical evidence."]
@@ -81,8 +119,17 @@ def evaluate_generated_card(
         words = WORD.findall(URL.sub("", value))
         practice = PRACTICE.fullmatch(evidence) if label == "back" else None
         scaffold = (
-            kind == "interview_phrase" and practice is not None and practice[1] in topics
-        ) or (label == "back" and kind == "behavioral" and evidence == STAR and bool(topics))
+            kind == "interview_phrase"
+            and practice is not None
+            and practice[1] in topics
+            and normalized_front == f"how would you discuss your experience with {practice[1]}?"
+        ) or (
+            label == "back"
+            and kind == "behavioral"
+            and evidence == STAR
+            and star_prompt is not None
+            and star_prompt[1] in topics
+        )
 
         min_words = 1 if is_answer and kind == "cloze" else 2
         max_length = MAX_LISTENING_CHARS if label == "back" and kind == "listening" else 5000
@@ -125,6 +172,18 @@ def evaluate_generated_card(
             failures.setdefault(
                 "source_grounding", f"{label} needs wording supported by the source."
             )
+        if (
+            is_answer
+            and kind != "cloze"
+            and not scaffold
+            and not any(
+                sentence_answers_prompt(
+                    normalized_front, normalize(sentence), definitions.get(evidence)
+                )
+                for sentence in SENTENCE_END.split(raw)
+            )
+        ):
+            failures.setdefault("ambiguity", f"{label} does not answer the prompt.")
         if label != "front" and evidence in definitions and evidence not in sentences:
             warning = "The answer relies on a built-in glossary definition."
             if warning not in uncertainty:
