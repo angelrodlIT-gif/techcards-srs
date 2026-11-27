@@ -1,4 +1,5 @@
 from io import BytesIO
+from time import monotonic, sleep
 from unittest.mock import Mock
 
 import pytest
@@ -24,7 +25,10 @@ SENTENCE = "A DNS resolver caches the configured VPC CIDR block and serves SQL t
 def isolated_recordings(monkeypatch):
     store = pronunciation.PronunciationRecordingStore()
     monkeypatch.setattr(main, "pronunciation_recordings", store)
-    return store
+    try:
+        yield store
+    finally:
+        store.clear()
 
 
 @pytest.fixture
@@ -236,7 +240,9 @@ def test_card_eligibility_and_listening_audio_unchanged(client, polly):
         )
 
     # Missing card returns 404 (and DELETE purges any stale entry first)
-    main.pronunciation_recordings.put(999, deck_id, "stale", "audio/webm", b"stale")
+    main.pronunciation_recordings.put(
+        999, deck_id, "pronunciation", "stale", "audio/webm", b"stale"
+    )
     assert client.post("/study/999/pronunciation/audio", headers=POLLY_HEADERS).status_code == 404
     assert (
         client.post(
@@ -254,7 +260,7 @@ def test_card_eligibility_and_listening_audio_unchanged(client, polly):
         == 404
     )
     assert client.delete("/study/999/pronunciation/recording", headers=LOOPBACK).status_code == 404
-    assert main.pronunciation_recordings.get(999, deck_id, "stale") is None
+    assert main.pronunciation_recordings.get(999, deck_id, "pronunciation", "stale") is None
 
 
 def test_microphone_denied_fallback_and_intelligibility_notes(client):
@@ -622,13 +628,24 @@ def test_recording_invalidation_on_card_deck_error_mutations_and_bulk_clear(clie
     )
     assert client.get(f"/study/{cid}/pronunciation/recording", headers=LOOPBACK).status_code == 404
 
-    # Direct store verification for deck_id and reference_text mismatches
-    main.pronunciation_recordings.put(cid, deck_b, "Edited sentence.", "audio/webm", b"direct")
-    assert main.pronunciation_recordings.get(cid, deck_a, "Edited sentence.") is None
-    assert main.pronunciation_recordings.get(cid, deck_b, "Edited sentence.") is None
-    main.pronunciation_recordings.put(cid, deck_b, "Edited sentence.", "audio/webm", b"direct")
-    assert main.pronunciation_recordings.get(cid, deck_b, "Different text.") is None
-    assert main.pronunciation_recordings.get(cid, deck_b, "Edited sentence.") is None
+    # Direct store verification for deck_id, kind, and reference_text mismatches
+    main.pronunciation_recordings.put(
+        cid, deck_b, "sentence", "Edited sentence.", "audio/webm", b"direct"
+    )
+    assert main.pronunciation_recordings.get(cid, deck_a, "sentence", "Edited sentence.") is None
+    assert main.pronunciation_recordings.get(cid, deck_b, "sentence", "Edited sentence.") is None
+    main.pronunciation_recordings.put(
+        cid, deck_b, "sentence", "Edited sentence.", "audio/webm", b"direct"
+    )
+    assert (
+        main.pronunciation_recordings.get(cid, deck_b, "pronunciation", "Edited sentence.") is None
+    )
+    assert main.pronunciation_recordings.get(cid, deck_b, "sentence", "Edited sentence.") is None
+    main.pronunciation_recordings.put(
+        cid, deck_b, "sentence", "Edited sentence.", "audio/webm", b"direct"
+    )
+    assert main.pronunciation_recordings.get(cid, deck_b, "sentence", "Different text.") is None
+    assert main.pronunciation_recordings.get(cid, deck_b, "sentence", "Edited sentence.") is None
 
     # DELETE /cards/{card_id} purges recording
     assert (
@@ -638,7 +655,7 @@ def test_recording_invalidation_on_card_deck_error_mutations_and_bulk_clear(clie
         == 201
     )
     assert client.delete(f"/cards/{cid}").status_code == 204
-    assert main.pronunciation_recordings.get(cid, deck_b, "Edited sentence.") is None
+    assert main.pronunciation_recordings.get(cid, deck_b, "sentence", "Edited sentence.") is None
 
     # DELETE /decks/{deck_id} purges recordings only in that deck
     c_a = create_card(client, deck_id=deck_a, back="Deck A card.").json()["id"]
@@ -656,7 +673,7 @@ def test_recording_invalidation_on_card_deck_error_mutations_and_bulk_clear(clie
         == 201
     )
     assert client.delete(f"/decks/{deck_a}").status_code == 204
-    assert main.pronunciation_recordings.get(c_a, deck_a, "Deck A card.") is None
+    assert main.pronunciation_recordings.get(c_a, deck_a, "pronunciation", "Deck A card.") is None
     assert client.get(f"/study/{c_b}/pronunciation/recording", headers=LOOPBACK).content == b"b"
 
     # DELETE /errors/{error_id}?delete_card=false keeps clip; delete_card=true purges clip
@@ -701,7 +718,7 @@ def test_recording_invalidation_on_card_deck_error_mutations_and_bulk_clear(clie
         == 201
     )
     assert client.delete(f"/errors/{err2['id']}", params={"delete_card": "true"}).status_code == 204
-    assert main.pronunciation_recordings.get(ec2, deck_b, ec2_back) is None
+    assert main.pronunciation_recordings.get(ec2, deck_b, "pronunciation", ec2_back) is None
 
     # Bulk clear removes all remaining recordings
     assert client.delete("/study/pronunciation/recordings", headers=LOOPBACK).status_code == 204
@@ -728,4 +745,176 @@ def test_recording_upload_revalidates_card_after_streaming_toctou(client, db_eng
         content=body_that_deletes_card_mid_stream(),
     )
     assert resp.status_code == 404
-    assert main.pronunciation_recordings.get(cid, card["deck_id"], card["back"]) is None
+    assert (
+        main.pronunciation_recordings.get(cid, card["deck_id"], card["kind"], card["back"]) is None
+    )
+    assert main.pronunciation_recordings.total_bytes == 0
+
+
+def test_recording_upload_rejects_card_edits_during_stream_and_put_window(
+    client, db_engine, isolated_recordings, monkeypatch
+):
+    deck_a = create_deck(client, "TOCTOU Deck A")
+    deck_b = create_deck(client, "TOCTOU Deck B")
+
+    # 1. Changing back mid-stream rejects upload with 409 and stores nothing
+    card_back = create_card(client, deck_id=deck_a, back="Original reference.").json()
+    cid_back = card_back["id"]
+
+    def body_that_edits_back():
+        yield b"part-1"
+        with Session(db_engine) as other_session:
+            row = other_session.get(Card, cid_back)
+            assert row is not None
+            row.back = "Mutated reference."
+            other_session.commit()
+        yield b"-part-2"
+
+    resp_back = client.post(
+        f"/study/{cid_back}/pronunciation/recording",
+        headers=RECORD_HEADERS,
+        content=body_that_edits_back(),
+    )
+    assert resp_back.status_code == 409
+    assert len(isolated_recordings._recordings) == 0
+    assert isolated_recordings.total_bytes == 0
+    assert (
+        client.get(f"/study/{cid_back}/pronunciation/recording", headers=LOOPBACK).status_code
+        == 404
+    )
+
+    # 2. Changing kind only (still pronunciation-eligible) mid-stream rejects upload with 409
+    card_kind = create_card(
+        client, deck_id=deck_a, kind="pronunciation", back="Same reference text."
+    ).json()
+    cid_kind = card_kind["id"]
+
+    def body_that_edits_kind():
+        yield b"part-1"
+        with Session(db_engine) as other_session:
+            row = other_session.get(Card, cid_kind)
+            assert row is not None
+            row.kind = "sentence"
+            other_session.commit()
+        yield b"-part-2"
+
+    resp_kind = client.post(
+        f"/study/{cid_kind}/pronunciation/recording",
+        headers=RECORD_HEADERS,
+        content=body_that_edits_kind(),
+    )
+    assert resp_kind.status_code == 409
+    assert len(isolated_recordings._recordings) == 0
+    assert isolated_recordings.total_bytes == 0
+    assert (
+        client.get(f"/study/{cid_kind}/pronunciation/recording", headers=LOOPBACK).status_code
+        == 404
+    )
+
+    # 3. Changing deck_id mid-stream rejects upload with 409
+    card_deck = create_card(client, deck_id=deck_a, back="Deck move reference.").json()
+    cid_deck = card_deck["id"]
+
+    def body_that_moves_deck():
+        yield b"part-1"
+        with Session(db_engine) as other_session:
+            row = other_session.get(Card, cid_deck)
+            assert row is not None
+            row.deck_id = deck_b
+            other_session.commit()
+        yield b"-part-2"
+
+    resp_deck = client.post(
+        f"/study/{cid_deck}/pronunciation/recording",
+        headers=RECORD_HEADERS,
+        content=body_that_moves_deck(),
+    )
+    assert resp_deck.status_code == 409
+    assert len(isolated_recordings._recordings) == 0
+    assert isolated_recordings.total_bytes == 0
+
+    # 4. Concurrent delete(card_id) in the window after fresh_card check and before store.put()
+    card_race = create_card(client, deck_id=deck_a, back="Race window check.").json()
+    cid_race = card_race["id"]
+    real_put = isolated_recordings.put
+
+    def put_after_concurrent_invalidation(*args, **kwargs):
+        isolated_recordings.delete(cid_race)
+        return real_put(*args, **kwargs)
+
+    monkeypatch.setattr(isolated_recordings, "put", put_after_concurrent_invalidation)
+    resp_race = client.post(
+        f"/study/{cid_race}/pronunciation/recording",
+        headers=RECORD_HEADERS,
+        content=b"stale-race-audio",
+    )
+    assert resp_race.status_code == 409
+    assert len(isolated_recordings._recordings) == 0
+    assert isolated_recordings.total_bytes == 0
+
+    # 5. Direct store upload_token invalidation across delete_deck and clear
+    monkeypatch.setattr(isolated_recordings, "put", real_put)
+    with isolated_recordings.track_upload(cid_race) as token:
+        isolated_recordings.bind_upload_deck(token, deck_a)
+        isolated_recordings.delete_deck(deck_a)
+        assert not isolated_recordings.put(
+            cid_race,
+            deck_a,
+            "pronunciation",
+            "Race window check.",
+            "audio/webm",
+            b"x",
+            upload_token=token,
+        )
+    with isolated_recordings.track_upload(cid_race) as token:
+        isolated_recordings.bind_upload_deck(token, deck_a)
+        isolated_recordings.clear()
+        assert not isolated_recordings.put(
+            cid_race,
+            deck_a,
+            "pronunciation",
+            "Race window check.",
+            "audio/webm",
+            b"x",
+            upload_token=token,
+        )
+    assert len(isolated_recordings._recordings) == 0
+    assert isolated_recordings.total_bytes == 0
+
+
+def test_idle_recording_expiration_purges_ram_without_requests(
+    client, isolated_recordings, monkeypatch
+):
+    monkeypatch.setattr(pronunciation, "RECORDING_TTL_SECONDS", 0.05)
+    deck_id = create_deck(client, "Idle TTL")
+    c1 = create_card(client, deck_id=deck_id, back="First idle clip.").json()["id"]
+    c2 = create_card(client, deck_id=deck_id, back="Second idle clip.").json()["id"]
+
+    payload1 = b"first-idle-audio-bytes"
+    payload2 = b"second-idle-audio-bytes"
+    assert (
+        client.post(
+            f"/study/{c1}/pronunciation/recording", headers=RECORD_HEADERS, content=payload1
+        ).status_code
+        == 201
+    )
+    sleep(0.03)
+    assert (
+        client.post(
+            f"/study/{c2}/pronunciation/recording", headers=RECORD_HEADERS, content=payload2
+        ).status_code
+        == 201
+    )
+    assert len(isolated_recordings._recordings) == 2
+    assert isolated_recordings._total_bytes == len(payload1) + len(payload2)
+
+    # Wait passively without issuing any GET/POST/DELETE request; background timer purges RAM.
+    deadline = monotonic() + 2.0
+    while monotonic() < deadline:
+        if len(isolated_recordings._recordings) == 0 and isolated_recordings._total_bytes == 0:
+            break
+        sleep(0.01)
+
+    assert len(isolated_recordings._recordings) == 0
+    assert isolated_recordings._total_bytes == 0
+    assert isolated_recordings._expiry_timer is None

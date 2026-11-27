@@ -1,7 +1,10 @@
 import re
 from collections import OrderedDict
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
 from hashlib import sha256
-from threading import Lock
+from threading import Lock, Timer
 from time import monotonic
 
 from app.schemas import Kind, PronunciationCompareOut, RecordingStatus
@@ -124,61 +127,170 @@ EVALUATION_DISCLAIMER = (
 )
 
 
+@dataclass(eq=False)
+class _UploadToken:
+    card_id: int
+    deck_id: int | None = None
+    invalidated: bool = False
+
+
 class PronunciationRecordingStore:
     def __init__(self) -> None:
         self._lock = Lock()
-        self._recordings: OrderedDict[int, tuple[float, int, bytes, str, bytes]] = OrderedDict()
+        self._recordings: OrderedDict[int, tuple[float, int, str, bytes, str, bytes]] = (
+            OrderedDict()
+        )
+        self._total_bytes = 0
+        self._active_uploads: set[_UploadToken] = set()
+        self._expiry_timer: Timer | None = None
+        self._expiry_deadline: float | None = None
+        self._timer_generation = 0
+
+    @property
+    def total_bytes(self) -> int:
+        with self._lock:
+            return self._total_bytes
+
+    def _remove_locked(self, card_id: int) -> None:
+        removed = self._recordings.pop(card_id, None)
+        if removed is not None:
+            self._total_bytes -= len(removed[5])
+
+    def _cancel_timer_locked(self) -> None:
+        self._timer_generation += 1
+        if self._expiry_timer is not None:
+            self._expiry_timer.cancel()
+            self._expiry_timer = None
+            self._expiry_deadline = None
+
+    def _schedule_expiry_locked(self, now: float, *, min_delay: float = 0.0) -> None:
+        if not self._recordings:
+            self._cancel_timer_locked()
+            return
+        next_expiry = min(entry[0] for entry in self._recordings.values())
+        if self._expiry_timer is not None and self._expiry_deadline == next_expiry:
+            return
+        self._cancel_timer_locked()
+        generation = self._timer_generation
+        delay = max(min_delay, next_expiry - now)
+        timer = Timer(delay, self._run_scheduled_purge, args=(generation,))
+        timer.daemon = True
+        self._expiry_timer = timer
+        self._expiry_deadline = next_expiry
+        timer.start()
+
+    def _run_scheduled_purge(self, generation: int) -> None:
+        with self._lock:
+            if generation != self._timer_generation:
+                return
+            self._expiry_timer = None
+            self._expiry_deadline = None
+            now = monotonic()
+            self._purge_expired(now)
+            self._schedule_expiry_locked(now, min_delay=0.001)
 
     def _purge_expired(self, now: float) -> None:
         for cid in [k for k, (expiry, *_) in self._recordings.items() if expiry <= now]:
-            del self._recordings[cid]
+            self._remove_locked(cid)
+
+    @contextmanager
+    def track_upload(self, card_id: int) -> Iterator[_UploadToken]:
+        token = _UploadToken(card_id=card_id)
+        with self._lock:
+            self._active_uploads.add(token)
+        try:
+            yield token
+        finally:
+            with self._lock:
+                self._active_uploads.discard(token)
+
+    def bind_upload_deck(self, token: _UploadToken, deck_id: int) -> None:
+        with self._lock:
+            token.deck_id = deck_id
 
     def put(
-        self, card_id: int, deck_id: int, reference_text: str, media_type: str, audio: bytes
-    ) -> None:
+        self,
+        card_id: int,
+        deck_id: int,
+        kind: str,
+        reference_text: str,
+        media_type: str,
+        audio: bytes,
+        *,
+        upload_token: _UploadToken | None = None,
+    ) -> bool:
         digest = sha256(reference_text.encode()).digest()
         with self._lock:
             now = monotonic()
             self._purge_expired(now)
+            if upload_token is not None and upload_token.invalidated:
+                self._schedule_expiry_locked(now)
+                return False
+            self._remove_locked(card_id)
             self._recordings[card_id] = (
                 now + RECORDING_TTL_SECONDS,
                 deck_id,
+                kind,
                 digest,
                 media_type,
                 audio,
             )
+            self._total_bytes += len(audio)
             self._recordings.move_to_end(card_id)
             while len(self._recordings) > MAX_RECORDINGS:
-                self._recordings.popitem(last=False)
+                _, evicted = self._recordings.popitem(last=False)
+                self._total_bytes -= len(evicted[5])
+            self._schedule_expiry_locked(now)
+            return True
 
-    def get(self, card_id: int, deck_id: int, reference_text: str) -> tuple[str, bytes] | None:
+    def get(
+        self, card_id: int, deck_id: int, kind: str, reference_text: str
+    ) -> tuple[str, bytes] | None:
         digest = sha256(reference_text.encode()).digest()
         with self._lock:
-            self._purge_expired(monotonic())
+            now = monotonic()
+            self._purge_expired(now)
             entry = self._recordings.get(card_id)
             if entry is None:
+                self._schedule_expiry_locked(now)
                 return None
-            _, stored_deck_id, stored_digest, media_type, audio = entry
-            if stored_deck_id != deck_id or stored_digest != digest:
-                del self._recordings[card_id]
+            _, stored_deck_id, stored_kind, stored_digest, media_type, audio = entry
+            if stored_deck_id != deck_id or stored_kind != kind or stored_digest != digest:
+                self._remove_locked(card_id)
+                self._schedule_expiry_locked(now)
                 return None
             self._recordings.move_to_end(card_id)
+            self._schedule_expiry_locked(now)
             return media_type, audio
 
     def delete(self, card_id: int) -> None:
         with self._lock:
-            self._purge_expired(monotonic())
-            self._recordings.pop(card_id, None)
+            now = monotonic()
+            self._purge_expired(now)
+            self._remove_locked(card_id)
+            for token in self._active_uploads:
+                if token.card_id == card_id:
+                    token.invalidated = True
+            self._schedule_expiry_locked(now)
 
     def delete_deck(self, deck_id: int) -> None:
         with self._lock:
-            self._purge_expired(monotonic())
+            now = monotonic()
+            self._purge_expired(now)
             for cid in [k for k, (_, d_id, *_) in self._recordings.items() if d_id == deck_id]:
-                del self._recordings[cid]
+                self._remove_locked(cid)
+            for token in self._active_uploads:
+                if token.deck_id is None or token.deck_id == deck_id:
+                    token.invalidated = True
+            self._schedule_expiry_locked(now)
 
     def clear(self) -> None:
         with self._lock:
             self._recordings.clear()
+            self._total_bytes = 0
+            for token in self._active_uploads:
+                token.invalidated = True
+            self._cancel_timer_locked()
 
 
 pronunciation_recordings = PronunciationRecordingStore()

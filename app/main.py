@@ -1,4 +1,5 @@
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime
 from typing import Annotated, Literal
 
@@ -76,7 +77,15 @@ def normalize_utc(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
-app = FastAPI(title="TechCards SRS", version="0.1.0")
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    try:
+        yield
+    finally:
+        pronunciation_recordings.clear()
+
+
+app = FastAPI(title="TechCards SRS", version="0.1.0", lifespan=lifespan)
 DB = Annotated[Session, Depends(get_db)]
 Generator = Annotated[CardGenerator, Depends(get_generator)]
 Clock = Annotated[Callable[[], datetime], Depends(get_clock)]
@@ -423,25 +432,40 @@ async def upload_pronunciation_recording(
     recording_consent: Annotated[Literal["true"], Header()],
 ):
     require_loopback(request, "Pronunciation practice requires a direct loopback connection")
-    require_pronunciation_card(db, card_id)
-    media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-    if media_type not in ALLOWED_RECORDING_TYPES:
-        raise HTTPException(415, "Unsupported recording media type")
-    chunks: list[bytes] = []
-    total = 0
-    async for chunk in request.stream():
-        total += len(chunk)
-        if total > MAX_RECORDING_BYTES:
-            raise HTTPException(413, "Recording exceeds 512 KiB limit")
-        chunks.append(chunk)
-    if total == 0:
-        raise HTTPException(422, "Recording audio must not be empty")
-    audio = b"".join(chunks)
-    db.expire_all()
-    card = require_pronunciation_card(db, card_id)
-    pronunciation_recordings.put(card.id, card.deck_id, card.back, media_type, audio)
+    with pronunciation_recordings.track_upload(card_id) as upload_token:
+        initial_card = require_pronunciation_card(db, card_id)
+        initial_state = (initial_card.deck_id, initial_card.kind, initial_card.back)
+        pronunciation_recordings.bind_upload_deck(upload_token, initial_card.deck_id)
+        media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if media_type not in ALLOWED_RECORDING_TYPES:
+            raise HTTPException(415, "Unsupported recording media type")
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in request.stream():
+            total += len(chunk)
+            if total > MAX_RECORDING_BYTES:
+                raise HTTPException(413, "Recording exceeds 512 KiB limit")
+            chunks.append(chunk)
+        if total == 0:
+            raise HTTPException(422, "Recording audio must not be empty")
+        audio = b"".join(chunks)
+        db.expire_all()
+        fresh_card = require_pronunciation_card(db, card_id)
+        if (fresh_card.deck_id, fresh_card.kind, fresh_card.back) != initial_state:
+            raise HTTPException(409, "Card changed during recording upload; retry recording")
+        stored = pronunciation_recordings.put(
+            fresh_card.id,
+            fresh_card.deck_id,
+            fresh_card.kind,
+            fresh_card.back,
+            media_type,
+            audio,
+            upload_token=upload_token,
+        )
+        if not stored:
+            raise HTTPException(409, "Card changed during recording upload; retry recording")
     return PronunciationRecordingOut(
-        card_id=card.id,
+        card_id=fresh_card.id,
         media_type=media_type,
         size_bytes=total,
         expires_in_seconds=RECORDING_TTL_SECONDS,
@@ -465,7 +489,7 @@ async def upload_pronunciation_recording(
 def get_pronunciation_recording(card_id: int, db: DB, request: Request):
     require_loopback(request, "Pronunciation practice requires a direct loopback connection")
     card = require_pronunciation_card(db, card_id)
-    stored = pronunciation_recordings.get(card.id, card.deck_id, card.back)
+    stored = pronunciation_recordings.get(card.id, card.deck_id, card.kind, card.back)
     if stored is None:
         raise HTTPException(404, "Recording not found")
     media_type, audio = stored
@@ -490,7 +514,9 @@ def compare_pronunciation(
     require_loopback(request, "Pronunciation practice requires a direct loopback connection")
     card = require_pronunciation_card(db, card_id)
     body = payload or PronunciationCompareInput()
-    has_recording = pronunciation_recordings.get(card.id, card.deck_id, card.back) is not None
+    has_recording = (
+        pronunciation_recordings.get(card.id, card.deck_id, card.kind, card.back) is not None
+    )
     if body.microphone_available:
         if not has_recording and body.spoken_transcript is None:
             raise HTTPException(

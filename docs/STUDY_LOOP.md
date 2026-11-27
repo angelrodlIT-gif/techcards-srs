@@ -85,12 +85,16 @@ connection (`127.0.0.1`, `::1`, or `localhost` without `Forwarded` or
 
 **Privacy, retention, and delete controls:** Learner recordings are held
 exclusively in worker RAM (never written to disk or PostgreSQL), bounded to 32
-clips of up to 512 KiB each with a 1-hour TTL and LRU eviction. Recordings are
-automatically invalidated when a card's `deck_id`, `kind`, or `back` changes, or
-when the card, deck, or linked error (`delete_card=true`) is deleted. Delete a
-single recording at any time with `DELETE /study/{card_id}/pronunciation/recording`
-(`204`) or clear all in-memory recordings with
-`DELETE /study/pronunciation/recordings` (`204`).
+clips of up to 512 KiB each with a 1-hour TTL and LRU eviction. A background
+expiration timer automatically purges expired clips from RAM once their 1-hour
+TTL elapses even while the worker is idle with no incoming requests, and worker
+shutdown clears all remaining clips. Recordings are automatically invalidated
+when a card's `deck_id`, `kind`, or `back` changes, or when the card, deck, or
+linked error (`delete_card=true`) is deleted; in-flight uploads whose card
+changes or is invalidated during upload are rejected (`409` or `404`) without
+storing stale audio. Delete a single recording at any time with
+`DELETE /study/{card_id}/pronunciation/recording` (`204`) or clear all
+in-memory recordings with `DELETE /study/pronunciation/recordings` (`204`).
 
 ## Read-only template catalog (`/templates`)
 
