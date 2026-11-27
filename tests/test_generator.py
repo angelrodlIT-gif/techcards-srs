@@ -1383,21 +1383,22 @@ def test_http_and_https_proxy_tunnel_enforces_deadline_before_tunnel_io(monkeypa
 
     created: list[SlowTunnelSocket] = []
 
-    def fake_connect_with_deadline(host, port, deadline, source_address=None):
+    def fake_connect_with_deadline(
+        host, port, deadline, source_address=None, *, require_loopback=False
+    ):
         sock = SlowTunnelSocket()
         created.append(sock)
         return sock
 
     monkeypatch.setattr("app.generator._connect_with_deadline", fake_connect_with_deadline)
 
-    # HTTP proxy tunnel times out during tunnel read (0.6s send + 0.6s recv > 1.0s).
+    # Plaintext HTTP connections reject proxy tunnels before opening any socket.
     http_conn = _DeadlineHTTPConnection("proxy.local", 3128, deadline=now + 1.0)
     http_conn.set_tunnel("api.openai.com", 80)
-    with pytest.raises(TimeoutError):
+    with pytest.raises(GeneratorConfigError) as http_exc:
         http_conn.connect()
-    assert len(created) == 1
-    assert created[0].timeouts == pytest.approx([1.0, 0.4])
-    assert created[0].closed is True
+    assert http_exc.value.status_code == 503
+    assert created == []
 
     # HTTPS proxy tunnel times out before wrap_socket is called.
     now = 1600.0
@@ -2234,3 +2235,299 @@ def test_direct_openai_compatible_generator_enforces_concurrency_limit(monkeypat
                 assert len(cards) == 1
     finally:
         release_generation.set()
+
+
+@pytest.mark.parametrize(
+    "resolved_infos",
+    [
+        [
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("192.0.2.1", 8080),
+            )
+        ],
+        [
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("127.0.0.1", 8080),
+            ),
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("192.0.2.1", 8080),
+            ),
+        ],
+        [
+            (
+                socket.AF_INET6,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("::1", 8080, 0, 0),
+            ),
+            (
+                socket.AF_INET6,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("2001:db8::1", 8080, 0, 0),
+            ),
+        ],
+    ],
+)
+def test_plaintext_http_localhost_rejects_non_loopback_resolved_ip_before_connect(
+    client, monkeypatch, resolved_infos
+):
+    connect_called = False
+    socket_created = False
+
+    def fake_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        return resolved_infos
+
+    class GuardSocket:
+        def __init__(self, *args, **kwargs) -> None:
+            nonlocal socket_created
+            socket_created = True
+
+        def settimeout(self, value: float) -> None:
+            pass
+
+        def connect(self, sa) -> None:
+            nonlocal connect_called
+            connect_called = True
+            raise AssertionError("socket.connect must not be called for non-loopback HTTP")
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr("app.generator.socket.getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr("app.generator.socket.socket", GuardSocket)
+
+    generator = OpenAICompatibleGenerator(
+        api_key="sk-loopback-guard-secret",
+        model="gpt-4o-mini",
+        base_url="http://localhost:8080/v1",
+        timeout_seconds=1.0,
+    )
+    with pytest.raises(GeneratorConfigError) as exc_info:
+        generator.generate("Python networking and DNS loopback safety", max_cards=2)
+    assert exc_info.value.status_code == 503
+    assert "loopback" in str(exc_info.value).lower()
+    assert socket_created is False
+    assert connect_called is False
+
+    did = _create_deck(client)
+    app.dependency_overrides[get_generator] = lambda: generator
+    res = client.post(
+        "/cards/generate",
+        json={"deck_id": did, "text": "Python networking and DNS loopback safety"},
+    )
+    assert res.status_code == 503
+    assert "loopback" in res.json()["detail"].lower()
+    assert "sk-loopback-guard-secret" not in res.text
+    assert client.get("/cards", params={"deck_id": did}).json() == []
+    assert socket_created is False
+    assert connect_called is False
+
+
+@pytest.mark.parametrize(
+    "chunk_suffix",
+    [
+        b"0\r\n",
+        b"0",
+        b"0\r\nX-Trailer: 1\r\n",
+        b"0\r\nX-Trailer: 1",
+    ],
+)
+def test_truncated_chunked_response_without_final_blank_line_returns_502_and_persists_no_cards(
+    client, chunk_suffix
+):
+    valid_body = _chat_completion_bytes(
+        {
+            "cards": [
+                {
+                    "front": "Explain HTTP chunked framing termination.",
+                    "back": "Chunked transfer ends with a zero chunk and a final CRLF.",
+                    "kind": "vocabulary",
+                }
+            ]
+        }
+    )
+    chunk_frame = f"{len(valid_body):x}\r\n".encode() + valid_body + b"\r\n" + chunk_suffix
+    raw_http = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" + chunk_frame
+
+    class TruncatedChunkedSocket:
+        def __init__(self, payload: bytes) -> None:
+            self._payload = payload
+            self._offset = 0
+
+        def settimeout(self, value: float) -> None:
+            pass
+
+        def recv_into(self, buffer, nbytes: int = 0) -> int:
+            limit = nbytes if nbytes else len(buffer)
+            size = min(limit, len(self._payload) - self._offset)
+            if size <= 0:
+                return 0
+            buffer[:size] = self._payload[self._offset : self._offset + size]
+            self._offset += size
+            return size
+
+        def makefile(self, mode: str = "rb", buffering: int | None = None):
+            return io.BufferedReader(socket.SocketIO(self, "r"))
+
+        def _decref_socketios(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    def truncated_chunked_opener(request, timeout):
+        response = http.client.HTTPResponse(TruncatedChunkedSocket(raw_http))
+        response.begin()
+        return response
+
+    generator = OpenAICompatibleGenerator(
+        api_key="sk-chunked-eof-secret",
+        model="gpt-4o-mini",
+        opener=truncated_chunked_opener,
+    )
+    with pytest.raises(GeneratorUpstreamError) as exc_info:
+        generator.generate("HTTP chunked transfer framing verification", max_cards=2)
+    assert exc_info.value.status_code == 502
+    assert "incomplete" in str(exc_info.value).lower()
+
+    did = _create_deck(client)
+    app.dependency_overrides[get_generator] = lambda: OpenAICompatibleGenerator(
+        api_key="sk-chunked-eof-secret",
+        model="gpt-4o-mini",
+        opener=truncated_chunked_opener,
+    )
+    res = client.post(
+        "/cards/generate",
+        json={"deck_id": did, "text": "HTTP chunked transfer framing verification"},
+    )
+    assert res.status_code == 502
+    assert "incomplete" in res.json()["detail"].lower()
+    assert "sk-chunked-eof-secret" not in res.text
+    assert client.get("/cards", params={"deck_id": did}).json() == []
+
+
+def test_truncated_chunked_response_over_real_loopback_http_returns_502(client):
+    valid_body = _chat_completion_bytes(
+        {
+            "cards": [
+                {
+                    "front": "What terminates an HTTP/1.1 chunked body?",
+                    "back": "A zero-length chunk followed by optional trailers and a blank line.",
+                    "kind": "vocabulary",
+                }
+            ]
+        }
+    )
+    raw_http = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"Connection: close\r\n"
+        b"\r\n" + f"{len(valid_body):x}\r\n".encode() + valid_body + b"\r\n0\r\n"
+    )
+
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_sock.bind(("127.0.0.1", 0))
+    port = server_sock.getsockname()[1]
+    server_sock.listen(1)
+
+    def serve_once() -> None:
+        try:
+            conn, _ = server_sock.accept()
+            with conn:
+                conn.settimeout(2.0)
+                conn.recv(4096)
+                conn.sendall(raw_http)
+        finally:
+            server_sock.close()
+
+    server_thread = threading.Thread(target=serve_once, daemon=True)
+    server_thread.start()
+    try:
+        did = _create_deck(client)
+        app.dependency_overrides[get_generator] = lambda: OpenAICompatibleGenerator(
+            api_key="sk-live-chunked-eof-secret",
+            model="gpt-4o-mini",
+            base_url=f"http://127.0.0.1:{port}/v1",
+            timeout_seconds=2.0,
+        )
+        res = client.post(
+            "/cards/generate",
+            json={"deck_id": did, "text": "HTTP chunked transfer over loopback socket"},
+        )
+        assert res.status_code == 502
+        assert "incomplete" in res.json()["detail"].lower()
+        assert "sk-live-chunked-eof-secret" not in res.text
+        assert client.get("/cards", params={"deck_id": did}).json() == []
+    finally:
+        server_thread.join(timeout=2.0)
+
+
+def test_mock_generator_is_unaffected_by_hosted_concurrency_limit(tmp_path, monkeypatch):
+    exhausted_semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_GENERATIONS)
+    for _ in range(MAX_CONCURRENT_GENERATIONS):
+        assert exhausted_semaphore.acquire(blocking=False)
+    monkeypatch.setattr("app.generator._GENERATION_SEMAPHORE", exhausted_semaphore)
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'mock_concurrent.db'}",
+        connect_args={"check_same_thread": False, "timeout": 10},
+        poolclass=QueuePool,
+        pool_size=8,
+        max_overflow=8,
+    )
+
+    @event.listens_for(engine, "connect")
+    def enable_sqlite_pragmas(connection, _):
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA journal_mode=WAL")
+
+    Base.metadata.create_all(engine)
+
+    def override_db():
+        with Session(engine) as session:
+            yield session
+
+    app.dependency_overrides[get_db] = override_db
+    app.dependency_overrides[get_generator] = lambda: MockGenerator()
+    try:
+        with TestClient(app, client=("127.0.0.1", 50000)) as mock_client:
+            did = _create_deck(mock_client)
+            payload = {
+                "deck_id": did,
+                "text": "AWS Python Docker PostgreSQL Linux monitoring",
+                "max_cards": 2,
+            }
+            # Even with all hosted generation slots occupied, >MAX_CONCURRENT_GENERATIONS
+            # concurrent MockGenerator requests must all succeed with 201.
+            total_requests = MAX_CONCURRENT_GENERATIONS + 3
+            with concurrent.futures.ThreadPoolExecutor(max_workers=total_requests) as executor:
+                futures = [
+                    executor.submit(mock_client.post, "/cards/generate", json=payload)
+                    for _ in range(total_requests)
+                ]
+                responses = [future.result(timeout=5.0) for future in futures]
+            assert [res.status_code for res in responses] == [201] * total_requests
+            assert all(len(res.json()) == 2 for res in responses)
+    finally:
+        for _ in range(MAX_CONCURRENT_GENERATIONS):
+            exhausted_semaphore.release()
+        app.dependency_overrides.clear()
+        Base.metadata.drop_all(engine)
+        engine.dispose()

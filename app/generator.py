@@ -4,6 +4,7 @@ import contextlib
 import errno
 import http.client
 import io
+import ipaddress
 import json
 import math
 import re
@@ -11,6 +12,7 @@ import socket
 import sys
 import threading
 import time
+import types
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterator, Mapping
@@ -244,8 +246,25 @@ def _connect_with_deadline(
     port: int,
     deadline: float,
     source_address: Any = None,
+    *,
+    require_loopback: bool = False,
 ) -> socket.socket:
     infos = _resolve_with_deadline(host, port, deadline)
+    if require_loopback:
+        for _af, _socktype, _proto, _canonname, sa in infos:
+            try:
+                raw_ip = str(sa[0]).split("%", 1)[0]
+                addr = ipaddress.ip_address(raw_ip)
+            except (IndexError, TypeError, ValueError) as exc:
+                raise GeneratorConfigError(
+                    "Plaintext HTTP GENERATOR_BASE_URL must resolve exclusively "
+                    "to loopback IP addresses."
+                ) from exc
+            if not addr.is_loopback:
+                raise GeneratorConfigError(
+                    "Plaintext HTTP GENERATOR_BASE_URL must resolve exclusively "
+                    "to loopback IP addresses."
+                )
     last_err: OSError | None = None
     for af, socktype, proto, _canonname, sa in infos:
         remaining = deadline - time.monotonic()
@@ -386,32 +405,70 @@ class _DeadlineSocket:
         return getattr(self._sock, name)
 
 
+class _StrictHTTPResponse(http.client.HTTPResponse):
+    def _read_next_chunk_size(self) -> int:
+        line = self.fp.readline(http.client._MAXLINE + 1)
+        if len(line) > http.client._MAXLINE:
+            raise http.client.LineTooLong("chunk size")
+        if not line.endswith(b"\n"):
+            self._close_conn()
+            raise http.client.IncompleteRead(b"")
+        i = line.find(b";")
+        if i >= 0:
+            line = line[:i]
+        try:
+            return int(line, 16)
+        except ValueError:
+            self._close_conn()
+            raise
+
+    def _read_and_discard_trailer(self) -> None:
+        trailers_read = 0
+        while True:
+            line = self.fp.readline(http.client._MAXLINE + 1)
+            if len(line) > http.client._MAXLINE:
+                raise http.client.LineTooLong("trailer line")
+            if not line or not line.endswith(b"\n"):
+                self._close_conn()
+                raise http.client.IncompleteRead(b"")
+            if line in (b"\r\n", b"\n"):
+                break
+            trailers_read += 1
+            if trailers_read > http.client._MAXHEADERS:
+                raise http.client.HTTPException(f"got more than {http.client._MAXHEADERS} trailers")
+
+
 class _DeadlineHTTPConnection(http.client.HTTPConnection):
+    response_class = _StrictHTTPResponse
+
     def __init__(self, *args: Any, deadline: float, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._deadline = deadline
 
     def connect(self) -> None:
+        if self._tunnel_host:
+            raise GeneratorConfigError(
+                "Plaintext HTTP GENERATOR_BASE_URL cannot use an HTTP proxy tunnel."
+            )
         sys.audit("http.client.connect", self, self.host, self.port)
-        raw_sock = _connect_with_deadline(self.host, self.port, self._deadline, self.source_address)
+        raw_sock = _connect_with_deadline(
+            self.host,
+            self.port,
+            self._deadline,
+            self.source_address,
+            require_loopback=True,
+        )
         try:
             _set_tcp_nodelay(raw_sock)
         except BaseException:
             raw_sock.close()
             raise
         self.sock = _DeadlineSocket(raw_sock, self._deadline)
-        if self._tunnel_host:
-            try:
-                self._tunnel()
-            except BaseException:
-                self.close()
-                raise
-            if time.monotonic() > self._deadline:
-                self.close()
-                raise TimeoutError("timed out")
 
 
 class _DeadlineHTTPSConnection(http.client.HTTPSConnection):
+    response_class = _StrictHTTPResponse
+
     def __init__(self, *args: Any, deadline: float, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._deadline = deadline
@@ -499,6 +556,15 @@ def _default_urlopen(
 
 
 def _ensure_response_deadline_socket(response: Any, deadline: float) -> None:
+    if isinstance(response, http.client.HTTPResponse) and not isinstance(
+        response, _StrictHTTPResponse
+    ):
+        response._read_next_chunk_size = types.MethodType(
+            _StrictHTTPResponse._read_next_chunk_size, response
+        )
+        response._read_and_discard_trailer = types.MethodType(
+            _StrictHTTPResponse._read_and_discard_trailer, response
+        )
     fp = getattr(response, "fp", None)
     raw = getattr(fp, "raw", None)
     sock = getattr(raw, "_sock", None)
@@ -826,6 +892,10 @@ class OpenAICompatibleGenerator:
                     ) from exc
                 raise GeneratorUpstreamError(
                     "AI generator provider network request failed."
+                ) from exc
+            except http.client.IncompleteRead as exc:
+                raise GeneratorUpstreamError(
+                    "AI generator provider returned an incomplete response."
                 ) from exc
             except (http.client.HTTPException, OSError) as exc:
                 raise GeneratorUpstreamError(

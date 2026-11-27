@@ -14,7 +14,6 @@ from app.generator import (
     CardGenerator,
     GeneratorError,
     GeneratorUpstreamError,
-    generation_slot,
     get_generator,
 )
 from app.learning import LearningSummary, summarize_learning
@@ -153,11 +152,10 @@ def due_cards(
 # Register this static path before /cards/{card_id}.
 @app.post("/cards/generate", response_model=list[CardOut], status_code=201)
 def generate_cards(payload: GenerateInput, db: DB, generator: Generator, clock: Clock):
-    with generation_slot():
-        require(db, Deck, payload.deck_id)
-        # Release the read transaction and pooled connection before the outbound call.
-        db.rollback()
-        generated = generator.generate(payload.text, payload.max_cards)
+    require(db, Deck, payload.deck_id)
+    # Release the read transaction and pooled connection before the outbound call.
+    db.rollback()
+    generated = generator.generate(payload.text, payload.max_cards)
     if not generated:
         raise GeneratorUpstreamError("Generator returned no cards.")
     today = normalize_utc(clock()).date()
