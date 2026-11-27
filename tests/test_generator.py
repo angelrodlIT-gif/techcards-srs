@@ -2537,3 +2537,157 @@ def test_mock_generator_is_unaffected_by_hosted_concurrency_limit(tmp_path, monk
         app.dependency_overrides.clear()
         Base.metadata.drop_all(engine)
         engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "raw_transfer_encoding_headers",
+    [
+        b"Transfer-Encoding: gzip, chunked\r\n",
+        b"Transfer-Encoding: chunked, identity\r\n",
+        b"Transfer-Encoding: gzip\r\n",
+        b"Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n",
+    ],
+)
+def test_unsupported_or_combined_transfer_encoding_returns_502_without_persisting(
+    client, raw_transfer_encoding_headers
+):
+    valid_body = _chat_completion_bytes(
+        {
+            "cards": [
+                {
+                    "front": "Explain HTTP transfer-coding validation.",
+                    "back": "Unsupported transfer-codings must fail closed before reading.",
+                    "kind": "vocabulary",
+                }
+            ]
+        }
+    )
+    raw_http = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: application/json\r\n"
+        + raw_transfer_encoding_headers
+        + b"Content-Length: 999999\r\n"
+        + b"\r\n"
+        + valid_body
+    )
+
+    class RawResponseSocket:
+        def __init__(self, payload: bytes) -> None:
+            self._payload = payload
+            self._offset = 0
+
+        def settimeout(self, value: float) -> None:
+            pass
+
+        def recv_into(self, buffer, nbytes: int = 0) -> int:
+            limit = nbytes if nbytes else len(buffer)
+            size = min(limit, len(self._payload) - self._offset)
+            if size <= 0:
+                return 0
+            buffer[:size] = self._payload[self._offset : self._offset + size]
+            self._offset += size
+            return size
+
+        def makefile(self, mode: str = "rb", buffering: int | None = None):
+            return io.BufferedReader(socket.SocketIO(self, "r"))
+
+        def _decref_socketios(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    def bad_te_opener(request, timeout):
+        response = http.client.HTTPResponse(RawResponseSocket(raw_http))
+        response.begin()
+        return response
+
+    did = _create_deck(client)
+    app.dependency_overrides[get_generator] = lambda: OpenAICompatibleGenerator(
+        api_key="sk-bad-te-secret",
+        model="gpt-4o-mini",
+        opener=bad_te_opener,
+    )
+    res = client.post(
+        "/cards/generate",
+        json={"deck_id": did, "text": "HTTP Transfer-Encoding framing validation"},
+    )
+    assert res.status_code == 502
+    assert "transfer-encoding" in res.json()["detail"].lower()
+    assert "sk-bad-te-secret" not in res.text
+    assert client.get("/cards", params={"deck_id": did}).json() == []
+
+
+@pytest.mark.parametrize(
+    "bad_chunk_size_line",
+    [
+        b"-5\r\n",
+        b"+5\r\n",
+        b"0x5\r\n",
+        b"1_0\r\n",
+        b"\r\n",
+    ],
+)
+def test_signed_or_non_hex_chunk_size_returns_502_never_500(client, bad_chunk_size_line):
+    valid_body = _chat_completion_bytes(
+        {
+            "cards": [
+                {
+                    "front": "Explain RFC 9112 chunk-size grammar.",
+                    "back": "Chunk size must be one or more unsigned hexadecimal digits.",
+                    "kind": "vocabulary",
+                }
+            ]
+        }
+    )
+    raw_http = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"\r\n" + bad_chunk_size_line + valid_body + b"\r\n0\r\n\r\n"
+    )
+
+    class BadChunkSizeSocket:
+        def __init__(self, payload: bytes) -> None:
+            self._payload = payload
+            self._offset = 0
+
+        def settimeout(self, value: float) -> None:
+            pass
+
+        def recv_into(self, buffer, nbytes: int = 0) -> int:
+            limit = nbytes if nbytes else len(buffer)
+            size = min(limit, len(self._payload) - self._offset)
+            if size <= 0:
+                return 0
+            buffer[:size] = self._payload[self._offset : self._offset + size]
+            self._offset += size
+            return size
+
+        def makefile(self, mode: str = "rb", buffering: int | None = None):
+            return io.BufferedReader(socket.SocketIO(self, "r"))
+
+        def _decref_socketios(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    def bad_chunk_opener(request, timeout):
+        response = http.client.HTTPResponse(BadChunkSizeSocket(raw_http))
+        response.begin()
+        return response
+
+    did = _create_deck(client)
+    app.dependency_overrides[get_generator] = lambda: OpenAICompatibleGenerator(
+        api_key="sk-bad-chunk-size-secret",
+        model="gpt-4o-mini",
+        opener=bad_chunk_opener,
+    )
+    res = client.post(
+        "/cards/generate",
+        json={"deck_id": did, "text": "HTTP chunk-size hex validation"},
+    )
+    assert res.status_code == 502
+    assert "sk-bad-chunk-size-secret" not in res.text
+    assert client.get("/cards", params={"deck_id": did}).json() == []

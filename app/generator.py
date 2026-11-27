@@ -416,8 +416,12 @@ class _StrictHTTPResponse(http.client.HTTPResponse):
         i = line.find(b";")
         if i >= 0:
             line = line[:i]
+        token = line.strip()
+        if not token or not all(c in b"0123456789abcdefABCDEF" for c in token):
+            self._close_conn()
+            raise ValueError("invalid chunk size")
         try:
-            return int(line, 16)
+            return int(token, 16)
         except ValueError:
             self._close_conn()
             raise
@@ -602,13 +606,16 @@ def _header_values(headers: Any, name: str) -> list[str]:
 
 
 def _is_chunked_transfer_encoding(response: Any, headers: Any) -> bool:
-    if getattr(response, "chunked", False):
-        return True
-    for raw in _header_values(headers, "transfer-encoding"):
-        tokens = [part.strip().lower() for part in raw.split(",")]
-        if "chunked" in tokens:
-            return True
-    return False
+    chunked_flag = getattr(response, "chunked", None)
+    raw_values = _header_values(headers, "transfer-encoding")
+    if not raw_values:
+        return chunked_flag is True
+    normalized = [raw.strip().lower() for raw in raw_values]
+    if normalized != ["chunked"] or chunked_flag is not True:
+        raise GeneratorUpstreamError(
+            "AI generator provider returned an unsupported Transfer-Encoding header."
+        )
+    return True
 
 
 def _expected_content_length(response: Any) -> int | None:
@@ -897,7 +904,7 @@ class OpenAICompatibleGenerator:
                 raise GeneratorUpstreamError(
                     "AI generator provider returned an incomplete response."
                 ) from exc
-            except (http.client.HTTPException, OSError) as exc:
+            except (http.client.HTTPException, OSError, ValueError) as exc:
                 raise GeneratorUpstreamError(
                     "AI generator provider network request failed."
                 ) from exc
