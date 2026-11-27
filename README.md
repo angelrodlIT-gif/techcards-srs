@@ -103,11 +103,14 @@ published host port. If running Python on the host with a different port, also u
 set `POSTGRES_HOST_PORT=5540` and use `localhost:5540` in `DATABASE_URL`. For special-character passwords provide a properly
 URL-encoded database URL when configuring a custom environment.
 
-`GENERATOR_PROVIDER=mock` is the only implemented setting; unknown providers fail validation.
-`CardGenerator` in `app/generator.py` is the provider protocol. Add an adapter implementing
-`generate(text, max_cards)`, then select it in `get_generator`. Tests demonstrate replacing
-that dependency. Future hosted adapters must add timeouts, explicit opt-in and structured
-output/error handling; no network fallback or hidden data upload exists now.
+`GENERATOR_PROVIDER=mock` is the default offline deterministic provider (no API keys or network calls).
+`GENERATOR_PROVIDER=openai_compatible` is an explicit opt-in HTTP JSON adapter configured via
+environment variables (`GENERATOR_API_KEY`, `GENERATOR_MODEL`, `GENERATOR_BASE_URL`,
+`GENERATOR_TIMEOUT_SECONDS`, `GENERATOR_MAX_INPUT_CHARS`); misconfiguration or upstream failure
+returns `503`/`504`/`502` with no silent fallback to `mock`. Unknown providers fail validation.
+See [Opt-in AI generator](docs/API_RUNBOOK.md#opt-in-ai-generator-generator_provideropenai_compatible)
+for cost, privacy, and error semantics. `CardGenerator` in `app/generator.py` remains the
+injectable provider protocol.
 
 ## Project map and troubleshooting
 

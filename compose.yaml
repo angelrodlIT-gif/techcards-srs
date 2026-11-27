@@ -29,7 +29,13 @@ services:
     build:
       context: .
       target: runtime
-    environment: *app_environment
+    environment:
+      <<: *app_environment
+      GENERATOR_API_KEY: ${GENERATOR_API_KEY:-}
+      GENERATOR_MODEL: ${GENERATOR_MODEL:-}
+      GENERATOR_BASE_URL: ${GENERATOR_BASE_URL:-https://api.openai.com/v1}
+      GENERATOR_TIMEOUT_SECONDS: ${GENERATOR_TIMEOUT_SECONDS:-30}
+      GENERATOR_MAX_INPUT_CHARS: ${GENERATOR_MAX_INPUT_CHARS:-8000}
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:
