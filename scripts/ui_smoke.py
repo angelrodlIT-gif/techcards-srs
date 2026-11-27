@@ -2,13 +2,18 @@
 
 Run without adding Playwright to project dependencies:
     uv run --no-project --with playwright python scripts/ui_smoke.py --base http://127.0.0.1:8004
+
+By default, interactive grading runs in Demo mode (`?data=demo`) so running this
+smoke test never mutates real SM-2 study schedules.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
+from urllib.request import urlopen
 
 from playwright.sync_api import (
     Browser,
@@ -24,6 +29,12 @@ VIEWPORTS = (
     ("desktop", 1280, 800),
     ("mobile", 390, 844),
 )
+
+
+def fetch_review_count(base: str) -> int:
+    with urlopen(f"{base}/analytics/learning", timeout=10) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    return int(data["reviews"]["recall"]["denominator"])
 
 
 def assert_no_horizontal_overflow(page: Page, context: str) -> None:
@@ -47,19 +58,21 @@ def click_nav(page: Page, view: str, is_mobile: bool) -> None:
     page.locator(selector).click()
 
 
-def run_viewport_smoke(page: Page, base: str, name: str, width: int, height: int) -> None:
+def run_viewport_smoke(
+    page: Page, base: str, name: str, width: int, height: int, *, live_grade: bool = False
+) -> None:
     is_mobile = width < 960
     page.set_viewport_size({"width": width, "height": height})
 
-    # 1. Start at /ui (redirect -> /ui/) and verify home view
+    # 1. Start at /ui (redirect -> /ui/) and verify home view (read-only on real API)
     page.goto(f"{base}/ui", wait_until="networkidle")
     if not page.url.rstrip("/").endswith("/ui"):
         raise AssertionError(f"Expected redirect to /ui/, got {page.url}")
     page.locator(".cockpit-hero").wait_for(state="visible", timeout=10000)
     assert_no_horizontal_overflow(page, f"{name}:dashboard")
 
-    # Open first deck inspector & verify Edit Card modal opens cleanly
-    inspect_btn = page.locator(".deck-tile button", has_text="Ver tarjetas").first
+    # Open first deck inspector & verify Edit Card modal opens cleanly (without submitting)
+    inspect_btn = page.locator(".deck-tile button", has_text="Tarjetas").first
     if inspect_btn.count() > 0:
         inspect_btn.click()
         modal = page.locator("#modal-backdrop")
@@ -94,7 +107,7 @@ def run_viewport_smoke(page: Page, base: str, name: str, width: int, height: int
     page.keyboard.press("Escape")
     palette.wait_for(state="hidden", timeout=5000)
 
-    # 3. Errors board (and verify draft edit modal opens cleanly if a draft exists)
+    # 3. Errors board (verify draft edit modal opens cleanly without submitting)
     click_nav(page, "errors", is_mobile)
     page.get_by_role("heading", name="Tablero de errores").wait_for(state="visible", timeout=5000)
     assert_no_horizontal_overflow(page, f"{name}:errors")
@@ -115,21 +128,34 @@ def run_viewport_smoke(page: Page, base: str, name: str, width: int, height: int
     )
     assert_no_horizontal_overflow(page, f"{name}:analytics")
 
-    # 5. Focus mode (Space to reveal, 0-5 to grade, Esc to return to dashboard)
+    # 5. Focus mode initial render on live view (read-only), then grade in Demo by default
     click_nav(page, "study", is_mobile)
     page.locator(".focus-shell").wait_for(state="visible", timeout=5000)
     page.locator("#reveal-btn, .focus-shell .empty-state").first.wait_for(
         state="visible", timeout=5000
     )
-    assert_no_horizontal_overflow(page, f"{name}:study-initial")
+    assert_no_horizontal_overflow(page, f"{name}:study-live-initial")
 
     reveal_btn = page.locator("#reveal-btn")
-    if reveal_btn.count() == 0:
-        # Fallback to read-only demo dataset if the target DB has no due cards left
+    if not live_grade or reveal_btn.count() == 0:
         page.goto(f"{base}/ui/?data=demo", wait_until="networkidle")
+        # Verify switching out of Demo invalidates open Demo dialogs immediately
+        if not is_mobile:
+            page.locator(".deck-tile button", has_text="Tarjetas").first.click()
+            modal = page.locator("#modal-backdrop")
+            modal.wait_for(state="visible", timeout=5000)
+            modal.locator("button", has_text="Eliminar mazo").click()
+            page.keyboard.press("Control+k")
+            palette.wait_for(state="visible", timeout=5000)
+            cmd_input.fill("Volver a API real")
+            cmd_input.press("Enter")
+            modal.wait_for(state="hidden", timeout=5000)
+            page.goto(f"{base}/ui/?data=demo", wait_until="networkidle")
+
         click_nav(page, "study", is_mobile)
         page.locator(".focus-shell").wait_for(state="visible", timeout=5000)
         reveal_btn.wait_for(state="visible", timeout=5000)
+        assert_no_horizontal_overflow(page, f"{name}:study-demo-initial")
 
     # Blur any focused button so Space triggers the keyboard shortcut handler cleanly
     page.evaluate("() => document.activeElement?.blur()")
@@ -163,9 +189,15 @@ def main() -> int:
     parser.add_argument(
         "--base", default="http://127.0.0.1:8004", help="Base URL of the API server"
     )
+    parser.add_argument(
+        "--live-grade",
+        action="store_true",
+        help="Grade real cards instead of switching to Demo mode for the Focus Mode grading step",
+    )
     args = parser.parse_args()
     base = args.base.rstrip("/")
 
+    reviews_before = fetch_review_count(base)
     page_errors: list[str] = []
     console_errors: list[str] = []
 
@@ -185,10 +217,18 @@ def main() -> int:
             raise AssertionError(f"Expected /propuesta3 redirect to /ui/, got {page.url}")
 
         for name, width, height in VIEWPORTS:
-            run_viewport_smoke(page, base, name, width, height)
+            run_viewport_smoke(page, base, name, width, height, live_grade=args.live_grade)
             print(f"[ok] {name} ({width}x{height}): home, Ctrl+K, templates, errors, focus mode")
 
         browser.close()
+
+    if not args.live_grade:
+        reviews_after = fetch_review_count(base)
+        if reviews_after != reviews_before:
+            raise AssertionError(
+                f"Smoke test mutated real reviews without --live-grade: "
+                f"{reviews_before} -> {reviews_after}"
+            )
 
     if page_errors or console_errors:
         print(f"Page errors: {page_errors}", file=sys.stderr)

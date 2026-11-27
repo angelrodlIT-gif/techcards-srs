@@ -323,6 +323,11 @@ function computeDemoDeckStats(data) {
 }
 
 function loadDemoDataset(variant = "demo") {
+  dataModeEpoch += 1;
+  studyRequestSeq += 1;
+  modal.close({ immediate: true });
+  clearStudyAudio();
+
   state.demoMode = true;
   state.demoVariant = variant;
   state.apiStatus = "demo";
@@ -379,6 +384,8 @@ function syncUrlDemoParam(mode) {
    ========================================================================== */
 
 let heatmapSeq = 0;
+let dataModeEpoch = 0;
+let studyRequestSeq = 0;
 
 async function refreshDeckStats(decks) {
   const stats = {};
@@ -524,6 +531,7 @@ async function refreshAll() {
       state.selectedDeckId = state.decks[0]?.id || "";
     }
     await refreshDeckStats(state.decks);
+    if (state.demoMode) return;
   } else {
     state.loadError = decksRes.error;
   }
@@ -551,9 +559,13 @@ function clearStudyAudio() {
 }
 
 async function loadNextStudyCard() {
+  studyRequestSeq += 1;
+  const seq = studyRequestSeq;
   clearStudyAudio();
   const study = state.study;
   study.reveal = null;
+  study.revealing = false;
+  study.grading = false;
   study.error = "";
 
   if (!study.deckId) {
@@ -597,6 +609,7 @@ async function loadNextStudyCard() {
     kind: study.filterKind,
     remediationOnly: study.remediationOnly,
   });
+  if (seq !== studyRequestSeq || state.study !== study || state.demoMode) return;
   study.loading = false;
   if (res.status === 204) {
     study.card = null;
@@ -833,6 +846,10 @@ const actions = {
           : "Modo Datos demo activo (solo lectura, no escribe en API)."
       );
     } else {
+      dataModeEpoch += 1;
+      studyRequestSeq += 1;
+      modal.close({ immediate: true });
+      clearStudyAudio();
       state.demoMode = false;
       state.demoData = null;
       state.loadingInitial = true;
@@ -882,7 +899,7 @@ const actions = {
 
   async revealStudyCard() {
     const study = state.study;
-    if (!study.card || study.reveal || study.revealing) return;
+    if (!study.card || study.reveal || study.revealing || study.loading || study.grading) return;
 
     if (state.demoMode) {
       const full = state.demoData.cards.find((c) => c.id === study.card.card_id);
@@ -899,13 +916,23 @@ const actions = {
       return;
     }
 
+    const seq = studyRequestSeq;
+    const cardId = study.card.card_id;
     study.revealing = true;
     render();
-    const res = await api.studyReveal(study.card.card_id);
+    const res = await api.studyReveal(cardId);
+    if (
+      seq !== studyRequestSeq ||
+      state.study !== study ||
+      state.demoMode ||
+      study.card?.card_id !== cardId
+    ) {
+      return;
+    }
     study.revealing = false;
-    if (res.ok) {
+    if (res.ok && res.data?.card_id === cardId) {
       study.reveal = res.data;
-    } else {
+    } else if (!res.ok) {
       toast.show(res.error, { tone: "error" });
     }
     render();
@@ -913,16 +940,26 @@ const actions = {
 
   async loadListeningAudio() {
     const study = state.study;
-    if (!study.card || study.audioLoading) return;
+    if (!study.card || study.audioLoading || study.loading) return;
     if (state.demoMode) {
       study.audioError = "Audio Polly deshabilitado en Datos demo. Revela la tarjeta para ver la transcripción.";
       render();
       return;
     }
+    const seq = studyRequestSeq;
+    const cardId = study.card.card_id;
     study.audioLoading = true;
     study.audioError = "";
     render();
-    const res = await api.studyAudio(study.card.card_id);
+    const res = await api.studyAudio(cardId);
+    if (
+      seq !== studyRequestSeq ||
+      state.study !== study ||
+      state.demoMode ||
+      study.card?.card_id !== cardId
+    ) {
+      return;
+    }
     study.audioLoading = false;
     if (res.ok && res.blob) {
       if (study.audioUrl) URL.revokeObjectURL(study.audioUrl);
@@ -938,7 +975,16 @@ const actions = {
 
   async gradeStudyCard(quality) {
     const study = state.study;
-    if (!study.card || !study.reveal || study.grading) return;
+    if (
+      !study.card ||
+      !study.reveal ||
+      study.reveal.card_id !== study.card.card_id ||
+      study.grading ||
+      study.loading ||
+      study.revealing
+    ) {
+      return;
+    }
     const cardSnapshot = study.card;
 
     if (state.demoMode) {
@@ -965,9 +1011,19 @@ const actions = {
       return;
     }
 
+    const seq = studyRequestSeq;
+    const openedEpoch = dataModeEpoch;
     study.grading = true;
     render();
     const res = await api.studyGrade(cardSnapshot.card_id, quality);
+    if (
+      seq !== studyRequestSeq ||
+      openedEpoch !== dataModeEpoch ||
+      state.study !== study ||
+      state.demoMode
+    ) {
+      return;
+    }
     study.grading = false;
     if (!res.ok) {
       toast.show(res.error, { tone: "error" });
@@ -999,11 +1055,13 @@ const actions = {
 
   // Deck modals & CRUD
   openNewDeckModal() {
+    const openedEpoch = dataModeEpoch;
     modal.open({
       title: "Nuevo mazo",
       content: buildDeckModalContent({
         onCancel: modal.close,
         onSubmit: async (payload) => {
+          if (openedEpoch !== dataModeEpoch) return;
           if (state.demoMode) {
             const created = { id: nextDemoId(), ...payload };
             state.demoData.decks.push(created);
@@ -1016,6 +1074,7 @@ const actions = {
             return;
           }
           const res = await api.createDeck(payload);
+          if (openedEpoch !== dataModeEpoch) return;
           if (!res.ok) {
             toast.show(res.error, { tone: "error" });
             return;
@@ -1030,12 +1089,14 @@ const actions = {
   },
 
   openEditDeckModal(deck) {
+    const openedEpoch = dataModeEpoch;
     modal.open({
       title: "Editar mazo",
       content: buildDeckModalContent({
         deck,
         onCancel: modal.close,
         onSubmit: async (payload) => {
+          if (openedEpoch !== dataModeEpoch) return;
           if (state.demoMode) {
             deck.name = payload.name;
             deck.description = payload.description;
@@ -1045,6 +1106,7 @@ const actions = {
             return;
           }
           const res = await api.updateDeck(deck.id, payload);
+          if (openedEpoch !== dataModeEpoch) return;
           if (!res.ok) {
             toast.show(res.error, { tone: "error" });
             return;
@@ -1058,6 +1120,7 @@ const actions = {
   },
 
   openDeckInspector(deckId) {
+    const openedEpoch = dataModeEpoch;
     const deck = state.decks.find((d) => d.id === deckId);
     if (!deck) return;
     const stats = state.deckStats[deckId] || { total: 0, due: 0, mastered: 0, cards: [] };
@@ -1069,13 +1132,17 @@ const actions = {
         deck,
         cards: stats.cards || [],
         stats,
-        onStudy: actions.startStudy,
+        onStudy: (id) => {
+          if (openedEpoch !== dataModeEpoch) return;
+          actions.startStudy(id);
+        },
         onClose: modal.close,
         onEditDeck: (d) => {
-          modal.close();
-          window.setTimeout(() => actions.openEditDeckModal(d), 180);
+          if (openedEpoch !== dataModeEpoch) return;
+          actions.openEditDeckModal(d);
         },
         onDeleteDeck: (d) => {
+          if (openedEpoch !== dataModeEpoch) return;
           modal.open({
             title: "Eliminar mazo",
             content: h(
@@ -1095,6 +1162,7 @@ const actions = {
                     type: "button",
                     className: "btn btn-danger",
                     onClick: async () => {
+                      if (openedEpoch !== dataModeEpoch) return;
                       if (state.demoMode) {
                         state.demoData.decks = state.demoData.decks.filter((x) => x.id !== d.id);
                         state.demoData.cards = state.demoData.cards.filter((c) => c.deck_id !== d.id);
@@ -1106,6 +1174,7 @@ const actions = {
                         return;
                       }
                       const res = await api.deleteDeck(d.id);
+                      if (openedEpoch !== dataModeEpoch) return;
                       if (!res.ok) {
                         toast.show(res.error, { tone: "error" });
                         return;
@@ -1122,9 +1191,11 @@ const actions = {
           });
         },
         onEditCard: (card) => {
+          if (openedEpoch !== dataModeEpoch) return;
           actions.openEditCardModal(deckId, card);
         },
         onDeleteCard: async (cardId) => {
+          if (openedEpoch !== dataModeEpoch) return;
           if (state.demoMode) {
             state.demoData.cards = state.demoData.cards.filter((c) => c.id !== cardId);
             state.deckStats = computeDemoDeckStats(state.demoData);
@@ -1134,12 +1205,14 @@ const actions = {
             return;
           }
           const res = await api.deleteCard(cardId);
+          if (openedEpoch !== dataModeEpoch) return;
           if (!res.ok) {
             toast.show(res.error, { tone: "error" });
             return;
           }
           toast.show("Tarjeta eliminada.", { tone: "success" });
           await refreshDeckStats(state.decks);
+          if (openedEpoch !== dataModeEpoch) return;
           actions.openDeckInspector(deckId);
           render();
         },
@@ -1148,13 +1221,18 @@ const actions = {
   },
 
   openEditCardModal(returnDeckId, card) {
+    const openedEpoch = dataModeEpoch;
     modal.open({
       title: `Editar tarjeta #${card.id}`,
       content: buildEditCardModalContent({
         card,
         decks: state.decks,
-        onCancel: () => actions.openDeckInspector(returnDeckId),
+        onCancel: () => {
+          if (openedEpoch !== dataModeEpoch) return;
+          actions.openDeckInspector(returnDeckId);
+        },
         onSubmit: async (payload) => {
+          if (openedEpoch !== dataModeEpoch) return;
           if (state.demoMode) {
             const target = state.demoData.cards.find((c) => c.id === card.id);
             if (target) Object.assign(target, payload);
@@ -1165,12 +1243,14 @@ const actions = {
             return;
           }
           const res = await api.updateCard(card.id, payload);
+          if (openedEpoch !== dataModeEpoch) return;
           if (!res.ok) {
             toast.show(res.error, { tone: "error" });
             return;
           }
           toast.show("Tarjeta actualizada.", { tone: "success" });
           await refreshDeckStats(state.decks);
+          if (openedEpoch !== dataModeEpoch) return;
           actions.openDeckInspector(res.data.deck_id || returnDeckId);
           render();
         },
@@ -1217,6 +1297,7 @@ const actions = {
       tone: "success",
     });
     await refreshDeckStats(state.decks);
+    if (state.demoMode) return false;
     render();
     return true;
   },
@@ -1246,6 +1327,7 @@ const actions = {
     }
     toast.show("Tarjeta creada y programada para hoy.", { tone: "success" });
     await refreshDeckStats(state.decks);
+    if (state.demoMode) return false;
     render();
     return true;
   },
@@ -1289,6 +1371,7 @@ const actions = {
     state.addedTemplateIds.add(templateId);
     toast.show("Plantilla añadida al mazo.", { tone: "success" });
     await refreshDeckStats(state.decks);
+    if (state.demoMode) return;
     render();
   },
 
@@ -1320,6 +1403,7 @@ const actions = {
   },
 
   openApproveSourceModal(source) {
+    const openedEpoch = dataModeEpoch;
     modal.open({
       title: "Aprobar fuente a tarjeta",
       content: buildApproveSourceModalContent({
@@ -1328,6 +1412,7 @@ const actions = {
         selectedDeckId: state.selectedDeckId,
         onCancel: modal.close,
         onApprove: async (payload) => {
+          if (openedEpoch !== dataModeEpoch) return;
           if (state.demoMode) {
             source.status = "approved";
             state.demoData.cards.unshift({
@@ -1348,6 +1433,7 @@ const actions = {
             return;
           }
           const res = await api.approveSource(source.id, payload);
+          if (openedEpoch !== dataModeEpoch) return;
           if (!res.ok) {
             toast.show(res.error, { tone: "error" });
             if (res.status === 409) await loadSources();
@@ -1363,12 +1449,14 @@ const actions = {
   },
 
   openEditSourceModal(source) {
+    const openedEpoch = dataModeEpoch;
     modal.open({
       title: `Editar fuente #${source.id}`,
       content: buildEditSourceModalContent({
         source,
         onCancel: modal.close,
         onSubmit: async (payload) => {
+          if (openedEpoch !== dataModeEpoch) return;
           if (state.demoMode) {
             source.label = payload.label;
             source.url = payload.url;
@@ -1380,6 +1468,7 @@ const actions = {
             return;
           }
           const res = await api.updateSource(source.id, payload);
+          if (openedEpoch !== dataModeEpoch) return;
           if (!res.ok) {
             toast.show(res.error, { tone: "error" });
             if (res.status === 409) await loadSources();
@@ -1430,12 +1519,14 @@ const actions = {
 
   // Errors Kanban
   openCaptureErrorModal(prefill = {}) {
+    const openedEpoch = dataModeEpoch;
     modal.open({
       title: "Registrar error de entrevista",
       content: buildCaptureErrorModalContent({
         prefill,
         onCancel: modal.close,
         onSuggest: async (payload) => {
+          if (openedEpoch !== dataModeEpoch) return;
           if (state.demoMode) {
             state.demoData.errors.unshift({
               id: nextDemoId(),
@@ -1455,6 +1546,7 @@ const actions = {
             return;
           }
           const res = await api.suggestError(payload);
+          if (openedEpoch !== dataModeEpoch) return;
           if (!res.ok) {
             toast.show(res.error, { tone: "error" });
             return;
@@ -1464,6 +1556,7 @@ const actions = {
           await loadErrors();
         },
         onManual: async (payload) => {
+          if (openedEpoch !== dataModeEpoch) return;
           if (state.demoMode) {
             state.demoData.errors.unshift({
               id: nextDemoId(),
@@ -1478,6 +1571,7 @@ const actions = {
             return;
           }
           const res = await api.createError(payload);
+          if (openedEpoch !== dataModeEpoch) return;
           if (!res.ok) {
             toast.show(res.error, { tone: "error" });
             return;
@@ -1491,6 +1585,7 @@ const actions = {
   },
 
   openApproveErrorModal(errorItem) {
+    const openedEpoch = dataModeEpoch;
     modal.open({
       title: `Aprobar ERR-${errorItem.id}`,
       content: buildApproveErrorModalContent({
@@ -1499,6 +1594,7 @@ const actions = {
         selectedDeckId: state.selectedDeckId,
         onCancel: modal.close,
         onApprove: async (payload) => {
+          if (openedEpoch !== dataModeEpoch) return;
           if (state.demoMode) {
             const newCardId = nextDemoId();
             errorItem.status = "approved";
@@ -1521,6 +1617,7 @@ const actions = {
             return;
           }
           const res = await api.approveError(errorItem.id, payload);
+          if (openedEpoch !== dataModeEpoch) return;
           if (!res.ok) {
             toast.show(res.error, { tone: "error" });
             if (res.status === 409) await loadErrors();
@@ -1536,12 +1633,14 @@ const actions = {
   },
 
   openEditErrorModal(errorItem) {
+    const openedEpoch = dataModeEpoch;
     modal.open({
       title: `Editar ERR-${errorItem.id}`,
       content: buildEditErrorModalContent({
         errorItem,
         onCancel: modal.close,
         onSubmit: async (payload) => {
+          if (openedEpoch !== dataModeEpoch) return;
           if (state.demoMode) {
             errorItem.attempted = payload.attempted;
             errorItem.corrected = payload.corrected;
@@ -1552,6 +1651,7 @@ const actions = {
             return;
           }
           const res = await api.updateError(errorItem.id, payload);
+          if (openedEpoch !== dataModeEpoch) return;
           if (!res.ok) {
             toast.show(res.error, { tone: "error" });
             if (res.status === 409) await loadErrors();
@@ -1584,6 +1684,7 @@ const actions = {
   },
 
   openDeleteErrorModal(err) {
+    const openedEpoch = dataModeEpoch;
     const deleteCardCheckbox = h("input", { type: "checkbox" });
     modal.open({
       title: `Eliminar ERR-${err.id}`,
@@ -1612,6 +1713,7 @@ const actions = {
               type: "button",
               className: "btn btn-danger",
               onClick: async () => {
+                if (openedEpoch !== dataModeEpoch) return;
                 const delCard = Boolean(deleteCardCheckbox.checked);
                 if (state.demoMode) {
                   state.demoData.errors = state.demoData.errors.filter((e) => e.id !== err.id);
@@ -1626,6 +1728,7 @@ const actions = {
                   return;
                 }
                 const res = await api.deleteError(err.id, delCard);
+                if (openedEpoch !== dataModeEpoch) return;
                 if (!res.ok) {
                   toast.show(res.error, { tone: "error" });
                   return;
@@ -1757,12 +1860,27 @@ document.addEventListener("keydown", (e) => {
       actions.navigate("dashboard");
       return;
     }
-    if (e.code === "Space" && state.study.card && !state.study.reveal) {
+    if (
+      e.code === "Space" &&
+      state.study.card &&
+      !state.study.reveal &&
+      !state.study.loading &&
+      !state.study.revealing &&
+      !state.study.grading
+    ) {
       e.preventDefault();
       actions.revealStudyCard();
       return;
     }
-    if (/^[0-5]$/.test(e.key) && state.study.card && state.study.reveal && !state.study.grading) {
+    if (
+      /^[0-5]$/.test(e.key) &&
+      state.study.card &&
+      state.study.reveal &&
+      state.study.reveal.card_id === state.study.card.card_id &&
+      !state.study.grading &&
+      !state.study.loading &&
+      !state.study.revealing
+    ) {
       e.preventDefault();
       actions.gradeStudyCard(Number(e.key));
     }

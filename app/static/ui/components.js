@@ -641,11 +641,16 @@ export function createToastManager(container) {
 export function createModalManager({ backdrop, panel, titleEl, bodyEl, closeBtn }) {
   let lastFocused = null;
   let onCloseCallback = null;
+  let closeTimer = null;
 
-  function close() {
+  function close({ immediate = false } = {}) {
+    if (closeTimer !== null) {
+      window.clearTimeout(closeTimer);
+      closeTimer = null;
+    }
     if (backdrop.hidden) return;
-    backdrop.dataset.state = "closing";
     const finish = () => {
+      closeTimer = null;
       backdrop.hidden = true;
       backdrop.dataset.state = "";
       bodyEl.replaceChildren();
@@ -659,12 +664,19 @@ export function createModalManager({ backdrop, panel, titleEl, bodyEl, closeBtn 
         cb();
       }
     };
-    const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    if (reduced) finish();
-    else window.setTimeout(finish, 170);
+    if (immediate || window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      finish();
+    } else {
+      backdrop.dataset.state = "closing";
+      closeTimer = window.setTimeout(finish, 170);
+    }
   }
 
   function open({ title, content, onClose = null, wide = false }) {
+    if (closeTimer !== null) {
+      window.clearTimeout(closeTimer);
+      closeTimer = null;
+    }
     lastFocused = document.activeElement;
     onCloseCallback = onClose;
     titleEl.textContent = title;

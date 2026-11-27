@@ -105,6 +105,9 @@ def test_ui_has_no_external_cdns_and_preserves_mobile_and_id_safeguards(client):
         "openEditCardModal",
         "openEditSourceModal",
         "openEditErrorModal",
+        "dataModeEpoch",
+        "studyRequestSeq",
+        "study.reveal.card_id !== study.card.card_id",
     ):
         assert handler in app_js
 

@@ -552,7 +552,7 @@ export function renderStudyView(ctx) {
     });
   } else {
     const card = study.card;
-    const isRevealed = Boolean(study.reveal);
+    const isRevealed = Boolean(study.reveal && card && study.reveal.card_id === card.card_id);
 
     const cardEl = h(
       "article",
