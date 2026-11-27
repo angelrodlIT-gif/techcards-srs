@@ -437,7 +437,22 @@ async def upload_pronunciation_recording(
         raise HTTPException(422, "Recording audio must not be empty")
     if await run_in_threadpool(snapshot) != initial:
         raise HTTPException(409, "Card changed during recording upload; retry recording")
-    recordings.put(initial, media_type, bytes(audio))
+
+    def store_if_current() -> None:
+        try:
+            # Lock the matching revision through the cache write on both PostgreSQL and SQLite.
+            result = db.execute(
+                update(Card)
+                .where(Card.id == initial[0], Card.pronunciation_revision == initial[1])
+                .values(pronunciation_revision=Card.pronunciation_revision)
+            )
+            if result.rowcount != 1:
+                raise HTTPException(409, "Card changed during recording upload; retry recording")
+            recordings.put(initial, media_type, bytes(audio))
+        finally:
+            db.rollback()
+
+    await run_in_threadpool(store_if_current)
     return PronunciationRecordingOut(
         card_id=card_id, media_type=media_type, size_bytes=len(audio), expires_in_seconds=TTL
     )

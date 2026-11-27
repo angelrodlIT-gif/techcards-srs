@@ -158,3 +158,48 @@ def test_edit_preserves_upload_completed_after_reference_commit(client, monkeypa
             uploaded.set()
         assert edit.result(timeout=5).status_code == 200
     assert client.get(recording).content == b"valid"
+
+
+def test_stale_upload_cannot_evict_recreated_cards_recording(client, db_engine, monkeypatch):
+    import app.main as api
+    from app.pronunciation import MAX_CLIPS
+
+    if db_engine.dialect.name != "sqlite":
+        pytest.skip("Tests SQLite row ID reuse")
+    deck = client.post("/decks", json={"name": "Practice"}).json()
+    payload = {"deck_id": deck["id"], "front": "Repeat", "back": "Reference"}
+    card = client.post("/cards", json=payload).json()
+    card_url = f"/cards/{card['id']}"
+    recording = f"/study/{card['id']}/pronunciation/recording"
+    validated, resume = Event(), Event()
+    original = api.run_in_threadpool
+    calls = 0
+
+    async def pause_after_validation(func, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        is_second_validation = calls == 2
+        result = await original(func, *args, **kwargs)
+        if is_second_validation:
+            validated.set()
+            assert await asyncio.to_thread(resume.wait, 10)
+        return result
+
+    monkeypatch.setattr(api, "run_in_threadpool", pause_after_validation)
+    with ThreadPoolExecutor(max_workers=1) as jobs:
+        stale = jobs.submit(client.post, recording, content=b"stale", headers=HEADERS)
+        try:
+            assert validated.wait(5)
+            assert client.delete(card_url).status_code == 204
+            assert client.post("/cards", json=payload).json()["id"] == card["id"]
+            assert client.post(recording, content=b"new", headers=HEADERS).status_code == 201
+            assert client.get(recording).content == b"new"
+            for _ in range(MAX_CLIPS - 1):
+                other = client.post("/cards", json=payload).json()
+                path = f"/study/{other['id']}/pronunciation/recording"
+                assert client.post(path, content=b"other", headers=HEADERS).status_code == 201
+        finally:
+            resume.set()
+        rejected = stale.result(timeout=5)
+    replay = client.get(recording)
+    assert (rejected.status_code, replay.status_code, replay.content) == (409, 200, b"new")
