@@ -27,7 +27,10 @@ Text = Annotated[
     str, StringConstraints(strip_whitespace=True, min_length=1, max_length=5000), NoNul
 ]
 Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120)]
-SourceLabel = Annotated[str, StringConstraints(min_length=1, max_length=255)]
+SourceLabel = Annotated[str, StringConstraints(min_length=1, max_length=255), NoNul]
+SourceText = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=10, max_length=20000), NoNul
+]
 RequiredSourceLabel = Annotated[
     str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255), NoNul
 ]
@@ -47,6 +50,8 @@ SourceStatus = Literal["draft", "approved", "discarded"]
 ErrorStatus = SourceStatus
 ErrorCategory = Literal["technical", "star"]
 TemplateCategory = Literal["star", "networking"]
+CheckStatus = Literal["pass", "warn", "fail"]
+EvaluationStatus = Literal["draft", "rejected"]
 
 
 def normalize_source_url(raw: str) -> tuple[str, str]:
@@ -180,6 +185,56 @@ class GenerateInput(BaseModel):
     deck_id: int = Field(gt=0)
     text: Annotated[str, StringConstraints(strip_whitespace=True, min_length=10, max_length=20000)]
     max_cards: int = Field(default=6, ge=1, le=20)
+
+
+class GeneratePreviewInput(BaseModel):
+    deck_id: int = Field(gt=0)
+    text: SourceText
+    max_cards: int = Field(default=6, ge=1, le=20)
+    source_label: SourceLabel | None = None
+
+    @field_validator("source_label", mode="before")
+    @classmethod
+    def normalize_source_label(cls, value: object) -> object:
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped or None
+        return value
+
+
+class CardEvaluationChecks(BaseModel):
+    english_usefulness: CheckStatus
+    technical_accuracy: CheckStatus
+    ambiguity: CheckStatus
+    source_grounding: CheckStatus
+
+
+class CardEvaluationOut(BaseModel):
+    status: EvaluationStatus
+    ready_for_review: bool
+    checks: CardEvaluationChecks
+    uncertainty: list[str]
+    rejection_reasons: list[str]
+
+
+class GeneratedCardDraftOut(BaseModel):
+    deck_id: int
+    front: str
+    back: str
+    kind: Kind
+    source_label: str | None = None
+    accepted_answers: list[str] = Field(default_factory=list)
+    explanation: str | None = None
+    evaluation: CardEvaluationOut
+
+
+class GeneratedCardApproveInput(CardInput):
+    source_text: SourceText
+
+
+class GeneratedCardApproveOut(BaseModel):
+    card: CardOut
+    evaluation: CardEvaluationOut
 
 
 class ReviewInput(BaseModel):

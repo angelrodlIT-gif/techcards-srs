@@ -218,6 +218,50 @@ never echo `GENERATOR_API_KEY` or `Authorization` headers):
   incomplete/truncated response, or malformed/empty/out-of-bounds structured
   output.
 
+#### Preview, evaluate, and approve generated cards (`POST /cards/generate/preview` and `POST /cards/generate/approve`)
+
+To evaluate generated drafts before adding them to your review queue, preview
+them first (returns `200 OK`, persists **zero** cards):
+
+```console
+curl -i -X POST http://127.0.0.1:8000/cards/generate/preview \
+  -H "Content-Type: application/json" \
+  -d '{
+    "deck_id": 1,
+    "text": "Cloud support role using AWS, Linux, Python and troubleshooting.",
+    "max_cards": 4,
+    "source_label": "vacancy:cloud-support"
+  }'
+```
+
+Each returned item contains the editable draft fields plus `evaluation`
+(`status`: `"draft"` or `"rejected"`, `ready_for_review`, categorical `checks`
+for `english_usefulness`, `technical_accuracy`, `ambiguity`, and
+`source_grounding`, `uncertainty`, and `rejection_reasons`).
+
+After reviewing or editing a draft, approve and persist it with
+`POST /cards/generate/approve` (returns `201 Created` when `ready_for_review` is
+`true`, or `422 Unprocessable Entity` with zero persisted rows when any check
+fails):
+
+```console
+curl -i -X POST http://127.0.0.1:8000/cards/generate/approve \
+  -H "Content-Type: application/json" \
+  -d '{
+    "deck_id": 1,
+    "front": "Explain '\''aws'\'' in technical English.",
+    "back": "Amazon Web Services: a cloud platform offering compute, storage and networking.",
+    "kind": "vocabulary",
+    "source_label": "vacancy:cloud-support",
+    "accepted_answers": ["AWS cloud platform"],
+    "explanation": "AWS provides cloud compute, storage, and networking services.",
+    "source_text": "Cloud support role using AWS, Linux, Python and troubleshooting."
+  }'
+```
+
+See [Generated Card Evaluation](CARD_EVALUATION.md) for check definitions,
+reviewed fixtures, and offline limitations.
+
 ### 3. List cards due today (`GET /decks/{deck_id}/due`)
 
 ```console
@@ -408,5 +452,8 @@ accounts, no authorization checks, no rate limiting, and no TLS**:
 - **Manual source-to-card curation:** See [Source curation](SOURCES.md) for
   `/sources` draft/edit/approve/discard workflows, URL normalization and `409`
   duplicate handling, privacy warnings, and non-cascading source deletion.
+- **Generated card evaluation:** See [Generated Card Evaluation](CARD_EVALUATION.md)
+  for `POST /cards/generate/preview` (no persistence), `POST /cards/generate/approve`
+  (categorical evaluation gate), reviewed fixtures, and offline limitations.
 - **Interview remediation loop & consent/retention:** See [Study Loop, Templates, and Error Log](STUDY_LOOP.md)
   for `POST /errors/suggest` (requires explicit strict `consent: true`, offline heuristics only, creates a `draft` without auto-creating cards), `POST /errors/{id}/approve` (defaults STAR suggestions to `behavioral`), `GET /study/next?deck_id=<id>&remediation_only=true&kind=<kind>`, `GET /errors/export` (portable JSON snapshot preserving original answers and linked cards), and `DELETE /errors/{id}` (default preserves linked card; `?delete_card=true` atomically hard-deletes both error and linked card). Submitted interview text stays strictly in local loopback PostgreSQL until deleted—never submit confidential, client, or NDA text.

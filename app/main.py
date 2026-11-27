@@ -10,6 +10,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, contains_eager, joinedload, selectinload
 
 from app.db import get_db
+from app.evaluation import evaluate_generated_card
 from app.generator import (
     CardGenerator,
     GeneratorError,
@@ -36,7 +37,11 @@ from app.schemas import (
     ErrorStatus,
     ErrorSuggestionInput,
     ErrorSuggestionOut,
+    GeneratedCardApproveInput,
+    GeneratedCardApproveOut,
+    GeneratedCardDraftOut,
     GenerateInput,
+    GeneratePreviewInput,
     Kind,
     ReviewInput,
     ReviewOut,
@@ -182,6 +187,69 @@ def generate_cards(payload: GenerateInput, db: DB, generator: Generator, clock: 
     for card in cards:
         db.refresh(card)
     return cards
+
+
+@app.post("/cards/generate/preview", response_model=list[GeneratedCardDraftOut])
+def preview_generated_cards(payload: GeneratePreviewInput, db: DB, generator: Generator):
+    require(db, Deck, payload.deck_id)
+    # Release the read transaction and pooled connection before the outbound call.
+    db.rollback()
+    generated = generator.generate(payload.text, payload.max_cards)
+    if not generated:
+        raise GeneratorUpstreamError("Generator returned no cards.")
+    require(db, Deck, payload.deck_id)
+    drafts: list[GeneratedCardDraftOut] = []
+    for card in generated[: payload.max_cards]:
+        if not isinstance(card.front, str) or not isinstance(card.back, str):
+            raise GeneratorUpstreamError("Generator returned invalid card output.")
+        evaluation = evaluate_generated_card(
+            front=card.front,
+            back=card.back,
+            kind=card.kind,
+            source_text=payload.text,
+        )
+        try:
+            drafts.append(
+                GeneratedCardDraftOut(
+                    deck_id=payload.deck_id,
+                    front=card.front,
+                    back=card.back,
+                    kind=card.kind,
+                    source_label=payload.source_label,
+                    evaluation=evaluation,
+                )
+            )
+        except ValidationError as exc:
+            raise GeneratorUpstreamError("Generator returned invalid card output.") from exc
+    return drafts
+
+
+@app.post("/cards/generate/approve", response_model=GeneratedCardApproveOut, status_code=201)
+def approve_generated_card(payload: GeneratedCardApproveInput, db: DB, clock: Clock):
+    require(db, Deck, payload.deck_id)
+    evaluation = evaluate_generated_card(
+        front=payload.front,
+        back=payload.back,
+        kind=payload.kind,
+        source_text=payload.source_text,
+        accepted_answers=payload.accepted_answers,
+        explanation=payload.explanation,
+    )
+    if not evaluation.ready_for_review:
+        raise HTTPException(422, "; ".join(evaluation.rejection_reasons))
+    today = normalize_utc(clock()).date()
+    card = Card(**payload.model_dump(exclude={"source_text"}), due_date=today)
+    db.add(card)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(404, "Deck not found") from exc
+    db.refresh(card)
+    return GeneratedCardApproveOut(
+        card=CardOut.model_validate(card),
+        evaluation=evaluation,
+    )
 
 
 @app.post("/cards", response_model=CardOut, status_code=201)
