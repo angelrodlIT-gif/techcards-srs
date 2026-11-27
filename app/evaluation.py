@@ -56,9 +56,40 @@ FIRST_PERSON_CLAIM_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
-GENERIC_PRACTICE_CLAIM_RE = re.compile(
-    r"^(?:i|we)(?:\s+have)?\s+worked\s+with$",
+PRACTICE_CLAIM_CLAUSE_RE = re.compile(
+    r"^(?:i|we)(?:\s+have)?\s+worked\s+with\s+"
+    r"([a-z0-9_./+-]+(?:\s+[a-z0-9_./+-]+){0,2})\s+to\s+"
+    r"\[[a-z][a-z0-9 _/-]{0,60}\]$",
     re.IGNORECASE,
+)
+DIRECTIONAL_BINDING_RE = re.compile(
+    r"\b(from|to|into|by|under|below|over|above|at)\s+"
+    r"(?:(?:a|an|the)\s+)?"
+    r"(\$?\d+(?:,\d+)*(?:\.\d+)?[a-z%]*|[a-z][a-z0-9_-]*)",
+    re.IGNORECASE,
+)
+SCAFFOLD_TEMPLATE_TOKENS: frozenset[str] = frozenset(
+    {
+        "practice",
+        "worked",
+        "work",
+        "working",
+        "task",
+        "truthful",
+        "example",
+        "explain",
+        "contribution",
+        "star",
+        "describe",
+        "situation",
+        "action",
+        "result",
+        "choose",
+        "real",
+        "experience",
+        "invent",
+        "outcome",
+    }
 )
 
 TECHNICAL_CONTRADICTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
@@ -318,6 +349,26 @@ def _content_tokens(text: str) -> set[str]:
     }
 
 
+def _ordered_content_tokens(text: str) -> list[str]:
+    return [
+        tok.lower()
+        for tok in CONTENT_TOKEN_RE.findall(_strip_urls(text))
+        if len(tok) >= 2 and tok.lower() not in STOPWORDS
+    ]
+
+
+def _is_subsequence(needle: list[str], haystack: list[str]) -> bool:
+    it = iter(haystack)
+    return all(item in it for item in needle)
+
+
+def _directional_bindings(text: str) -> set[tuple[str, str]]:
+    return {
+        (match.group(1).lower(), match.group(2).lower())
+        for match in DIRECTIONAL_BINDING_RE.finditer(_norm_space(text))
+    }
+
+
 def _normalize_metric(raw: str) -> str:
     collapsed = " ".join(raw.strip().lower().split())
     collapsed = re.sub(r"^\$\s+", "$", collapsed)
@@ -335,20 +386,38 @@ def _clauses(text: str) -> list[str]:
     return [part.strip() for part in CLAUSE_SPLIT_RE.split(stripped) if part.strip()]
 
 
-def _is_practice_scaffold_back(back_text: str, kind: Kind) -> bool:
-    return kind in ("behavioral", "interview_phrase") and (
-        bool(SCAFFOLD_HINT_RE.search(back_text))
-        or back_text.strip().lower().startswith("practice:")
-    )
-
-
-def _is_exempt_practice_back(back_text: str, kind: Kind) -> bool:
-    if not _is_practice_scaffold_back(back_text, kind):
+def _is_practice_scaffold_back(back_text: str, kind: Kind, source_tokens: set[str]) -> bool:
+    if kind not in ("behavioral", "interview_phrase"):
         return False
-    claims = FIRST_PERSON_CLAIM_RE.findall(back_text)
-    return bool(claims) and all(
-        GENERIC_PRACTICE_CLAIM_RE.fullmatch(_norm_space(claim)) for claim in claims
+    if not SCAFFOLD_HINT_RE.search(back_text):
+        return False
+    non_scaffold_tokens = (
+        _content_tokens(PLACEHOLDER_RE.sub(" ", back_text)) - SCAFFOLD_TEMPLATE_TOKENS
     )
+    return non_scaffold_tokens.issubset(source_tokens)
+
+
+def _is_exempt_practice_back(back_text: str, kind: Kind, source_tokens: set[str]) -> bool:
+    if not _is_practice_scaffold_back(back_text, kind, source_tokens):
+        return False
+    if not PLACEHOLDER_RE.search(back_text):
+        return False
+    claim_clauses = [
+        clause for clause in _clauses(back_text) if FIRST_PERSON_CLAIM_RE.search(clause)
+    ]
+    if not claim_clauses:
+        return False
+    for clause in claim_clauses:
+        match = PRACTICE_CLAIM_CLAUSE_RE.fullmatch(_norm_space(clause))
+        if match is None:
+            return False
+        topic = match.group(1)
+        if "to" in topic.lower().split():
+            return False
+        topic_tokens = _content_tokens(topic)
+        if not topic_tokens or not topic_tokens.issubset(source_tokens):
+            return False
+    return True
 
 
 def _claim_clause_supported(card_clause: str, source_clauses: list[str]) -> bool:
@@ -356,7 +425,9 @@ def _claim_clause_supported(card_clause: str, source_clauses: list[str]) -> bool
     if not claim_phrases:
         return True
     card_tokens = _content_tokens(card_clause)
-    card_numbers = set(CLAUSE_NUMBER_RE.findall(card_clause))
+    ordered_card_tokens = _ordered_content_tokens(card_clause)
+    card_numbers = CLAUSE_NUMBER_RE.findall(card_clause)
+    card_bindings = _directional_bindings(card_clause)
 
     for source_clause in source_clauses:
         norm_source = _norm_space(source_clause)
@@ -364,8 +435,11 @@ def _claim_clause_supported(card_clause: str, source_clauses: list[str]) -> bool
             continue
         if not card_tokens.issubset(_content_tokens(source_clause)):
             continue
-        source_numbers = set(CLAUSE_NUMBER_RE.findall(source_clause))
-        if not card_numbers.issubset(source_numbers):
+        if not _is_subsequence(ordered_card_tokens, _ordered_content_tokens(source_clause)):
+            continue
+        if not _is_subsequence(card_numbers, CLAUSE_NUMBER_RE.findall(source_clause)):
+            continue
+        if not card_bindings.issubset(_directional_bindings(source_clause)):
             continue
         return True
     return False
@@ -410,8 +484,9 @@ def evaluate_generated_card(
     front_words = _words(cleaned_front)
     back_words = _words(cleaned_back)
 
+    source_tokens = _content_tokens(source_text)
     has_placeholder = any(bool(PLACEHOLDER_RE.search(part)) for part in all_cleaned_fields if part)
-    is_practice_scaffold = _is_practice_scaffold_back(cleaned_back, kind)
+    is_practice_scaffold = _is_practice_scaffold_back(cleaned_back, kind, source_tokens)
 
     # 1. english_usefulness
     if any("\x00" in part for part in raw_fields):
@@ -511,7 +586,7 @@ def evaluate_generated_card(
     for field_name, part in named_fields:
         if not part:
             continue
-        if field_name == "back" and _is_exempt_practice_back(part, kind):
+        if field_name == "back" and _is_exempt_practice_back(part, kind, source_tokens):
             continue
         if not FIRST_PERSON_CLAIM_RE.search(part):
             continue
@@ -598,7 +673,6 @@ def evaluate_generated_card(
             "Card uses generic fallback topic text instead of terms grounded in source_text.",
         )
 
-    source_tokens = _content_tokens(source_text)
     allowed_tokens, glossary_tokens = _allowed_answer_tokens(source_tokens)
     front_tokens = _content_tokens(cleaned_front)
     back_tokens = _content_tokens(cleaned_back)
@@ -764,7 +838,7 @@ EVALUATION_FIXTURES: tuple[EvaluationFixture, ...] = (
                 expected_status="rejected",
                 expected_checks={
                     "english_usefulness": "pass",
-                    "technical_accuracy": "pass",
+                    "technical_accuracy": "fail",
                     "ambiguity": "warn",
                     "source_grounding": "fail",
                 },

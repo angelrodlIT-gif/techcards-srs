@@ -750,3 +750,130 @@ def test_preview_rejects_nul_bytes_in_text_or_source_label(client):
     ):
         resp = client.post("/cards/generate/preview", json=payload)
         assert resp.status_code == 422
+
+
+# --- Sol Round 1 regressions: reversed claims & practice exemption abuse ---
+
+
+def test_reversed_metric_and_directional_claims_rejected(client, db_engine):
+    did = create_deck(client)
+    source_text = "I reduced AWS latency from 200ms to 100ms."
+
+    valid = evaluate_generated_card(
+        front="How did you improve AWS latency?",
+        back="I reduced AWS latency from 200ms to 100ms.",
+        kind="behavioral",
+        source_text=source_text,
+    )
+    assert valid.checks.technical_accuracy == "pass"
+    assert valid.ready_for_review is True
+
+    for bad_back in (
+        "I reduced AWS latency from 100ms to 200ms.",
+        "I reduced AWS latency to 200ms.",
+    ):
+        res = evaluate_generated_card(
+            front="How did you improve AWS latency?",
+            back=bad_back,
+            kind="behavioral",
+            source_text=source_text,
+        )
+        assert res.checks.technical_accuracy == "fail"
+        assert res.ready_for_review is False
+        assert (
+            "Card makes a first-person achievement claim not supported by source_text."
+            in res.rejection_reasons
+        )
+
+        resp = client.post(
+            "/cards/generate/approve",
+            json={
+                "deck_id": did,
+                "front": "How did you improve AWS latency?",
+                "back": bad_back,
+                "kind": "behavioral",
+                "source_text": source_text,
+            },
+        )
+        assert resp.status_code == 422
+
+    with Session(db_engine) as session:
+        assert session.scalars(select(Card)).all() == []
+
+
+def test_reversed_technology_claim_rejected():
+    source_text = "I migrated our API from PostgreSQL to Docker."
+
+    valid = evaluate_generated_card(
+        front="Which API migration did you perform?",
+        back="I migrated our API from PostgreSQL to Docker.",
+        kind="behavioral",
+        source_text=source_text,
+    )
+    assert valid.checks.technical_accuracy == "pass"
+    assert valid.ready_for_review is True
+
+    reversed_claim = evaluate_generated_card(
+        front="Which API migration did you perform?",
+        back="I migrated our API from Docker to PostgreSQL.",
+        kind="behavioral",
+        source_text=source_text,
+    )
+    assert reversed_claim.checks.technical_accuracy == "fail"
+    assert reversed_claim.ready_for_review is False
+    assert (
+        "Card makes a first-person achievement claim not supported by source_text."
+        in reversed_claim.rejection_reasons
+    )
+
+
+def test_practice_exemption_abuse_rejected(client, db_engine):
+    did = create_deck(client)
+    source_text = "Cloud support role working with AWS infrastructure."
+
+    genuine = evaluate_generated_card(
+        front="How would you discuss your experience with AWS?",
+        back=(
+            "Practice: I have worked with AWS to [task]. "
+            "Use a truthful example and explain your contribution."
+        ),
+        kind="interview_phrase",
+        source_text=source_text,
+    )
+    assert genuine.checks.technical_accuracy == "pass"
+    assert genuine.ready_for_review is True
+
+    for abused_back in (
+        "Practice: I have worked with AWS to lead the production migration",
+        (
+            "Practice: I have worked with AWS to lead the production migration [task]. "
+            "Use a truthful example and explain your contribution."
+        ),
+    ):
+        res = evaluate_generated_card(
+            front="How would you discuss your experience with AWS?",
+            back=abused_back,
+            kind="interview_phrase",
+            source_text=source_text,
+        )
+        assert res.checks.technical_accuracy == "fail"
+        assert res.ready_for_review is False
+        assert (
+            "Card makes a first-person achievement claim not supported by source_text."
+            in res.rejection_reasons
+        )
+
+        resp = client.post(
+            "/cards/generate/approve",
+            json={
+                "deck_id": did,
+                "front": "How would you discuss your experience with AWS?",
+                "back": abused_back,
+                "kind": "interview_phrase",
+                "source_text": source_text,
+            },
+        )
+        assert resp.status_code == 422
+
+    with Session(db_engine) as session:
+        assert session.scalars(select(Card)).all() == []
