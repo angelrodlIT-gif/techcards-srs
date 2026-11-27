@@ -103,6 +103,7 @@ class InterviewSession(Base):
     __table_args__ = (
         CheckConstraint("role IN ('cloud_support', 'junior_aws', 'python_backend')"),
         CheckConstraint("status IN ('active', 'completed')"),
+        {"sqlite_autoincrement": True},
     )
     id: Mapped[int] = mapped_column(primary_key=True)
     role: Mapped[str] = mapped_column(String(30))

@@ -1,7 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event
 
 import pytest
 from alembic import command
@@ -823,3 +823,45 @@ def test_concurrent_duplicate_answer_preserves_winner(
     fetched = client.get(session_path)
     assert fetched.status_code == 200
     assert fetched.json()["turns"][0] == winner.json()
+
+
+def test_pending_answer_cannot_write_to_replacement_session(
+    concurrent_interview_client, db_engine, monkeypatch
+):
+    if db_engine.dialect.name != "sqlite":
+        pytest.skip("SQLite can reuse deleted integer primary keys")
+
+    client = concurrent_interview_client
+    created = client.post("/interviews", json={"role": "cloud_support"})
+    assert created.status_code == 201
+    original = created.json()
+    session_path = f"/interviews/{original['id']}"
+    answer_path = f"{session_path}/turns/{original['turns'][0]['id']}/answer"
+    evaluation_started = Event()
+    allow_answer_to_finish = Event()
+    evaluator = MockInterviewEvaluator()
+
+    class PausedEvaluator:
+        def evaluate(self, **kwargs):
+            evaluation_started.set()
+            assert allow_answer_to_finish.wait(timeout=10)
+            return evaluator.evaluate(**kwargs)
+
+    monkeypatch.setitem(app.dependency_overrides, get_interview_evaluator, PausedEvaluator)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(client.post, answer_path, json={"answer": "I checked target logs."})
+        try:
+            assert evaluation_started.wait(timeout=10)
+            assert client.delete(session_path).status_code == 204
+            created = client.post("/interviews", json={"role": "python_backend"})
+            assert created.status_code == 201
+            replacement = created.json()
+        finally:
+            allow_answer_to_finish.set()
+        answer = pending.result(timeout=10)
+
+    fetched = client.get(f"/interviews/{replacement['id']}")
+    assert fetched.status_code == 200
+    assert fetched.json() == replacement
+    assert answer.status_code == 404

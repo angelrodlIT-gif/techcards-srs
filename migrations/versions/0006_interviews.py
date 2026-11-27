@@ -25,6 +25,7 @@ def upgrade():
         sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
         sa.CheckConstraint("role IN ('cloud_support', 'junior_aws', 'python_backend')"),
         sa.CheckConstraint("status IN ('active', 'completed')"),
+        sqlite_autoincrement=True,
     )
     op.create_table(
         "interview_turns",
