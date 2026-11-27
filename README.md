@@ -27,6 +27,7 @@ docker compose logs migrate api
 Compose waits for PostgreSQL and runs `alembic upgrade head` in the one-shot `migrate`
 service before starting the API. `migrate` exiting with code 0 is expected.
 Open http://localhost:8000/docs for interactive requests; liveness: http://localhost:8000/health.
+Open the training cockpit UI at http://127.0.0.1:8000/ui/ (details in [UI Cabina](docs/UI_CABINA.md)).
 Data persists in the Compose volume. These explicit migration commands also work on PowerShell:
 
 ```console

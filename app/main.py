@@ -54,6 +54,7 @@ from app.schemas import (
 )
 from app.sm2 import Schedule, schedule_review
 from app.templates import STUDY_TEMPLATES, TEMPLATES_BY_ID
+from app.ui import router as ui_router
 
 
 def utc_now() -> datetime:
@@ -71,6 +72,7 @@ def normalize_utc(value: datetime) -> datetime:
 
 
 app = FastAPI(title="TechCards SRS", version="0.1.0")
+app.include_router(ui_router)
 DB = Annotated[Session, Depends(get_db)]
 Generator = Annotated[CardGenerator, Depends(get_generator)]
 Clock = Annotated[Callable[[], datetime], Depends(get_clock)]
