@@ -647,6 +647,37 @@ def _header_values(headers: Any, name: str) -> list[str]:
     return []
 
 
+_HTTP_HEADER_TOKEN_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+
+
+def _validate_response_headers(headers: Any) -> None:
+    if headers is None:
+        return
+    if getattr(headers, "defects", None):
+        raise GeneratorUpstreamError(
+            "AI generator provider returned malformed HTTP response headers."
+        )
+    get_payload = getattr(headers, "get_payload", None)
+    if callable(get_payload) and get_payload() not in ("", None):
+        raise GeneratorUpstreamError(
+            "AI generator provider returned malformed HTTP response headers."
+        )
+    items = getattr(headers, "items", None)
+    if callable(items):
+        for raw_name, raw_value in items():
+            name = str(raw_name)
+            value = "" if raw_value is None else str(raw_value)
+            if (
+                not _HTTP_HEADER_TOKEN_RE.fullmatch(name)
+                or "\r" in value
+                or "\n" in value
+                or "\x00" in value
+            ):
+                raise GeneratorUpstreamError(
+                    "AI generator provider returned malformed HTTP response headers."
+                )
+
+
 def _is_chunked_transfer_encoding(response: Any, headers: Any) -> bool:
     chunked_flag = getattr(response, "chunked", None)
     raw_values = _header_values(headers, "transfer-encoding")
@@ -664,6 +695,7 @@ def _expected_content_length(response: Any) -> int | None:
     headers = getattr(response, "headers", None)
     if headers is None:
         headers = getattr(response, "msg", None)
+    _validate_response_headers(headers)
     if headers is None or _is_chunked_transfer_encoding(response, headers):
         return None
     raw_values = _header_values(headers, "content-length")

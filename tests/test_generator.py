@@ -3130,3 +3130,55 @@ def test_chunked_response_with_bws_before_extension_semicolon_returns_201_and_pe
     assert len(cards) == 1
     assert cards[0]["front"] == "Does HTTP/1.1 allow BWS before a chunk extension semicolon?"
     assert len(client.get("/cards", params={"deck_id": did}).json()) == 1
+
+
+@pytest.mark.parametrize(
+    "malformed_header_prefix",
+    [
+        b"Malformed-Header-Line\r\n",
+        b"X-Bad-Colon-Space : 1\r\n",
+        b" Content-Type: application/json\r\n",
+        b"X-Folded: 1\r\n ",
+        b"X-Double-CR: 1\r\r\n",
+        b"X-Embedded-CR: a\rb\r\n",
+    ],
+)
+def test_malformed_header_block_hiding_content_length_returns_502_no_cards(
+    client, malformed_header_prefix
+):
+    secret = "sk-malformed-header-defect-secret"
+    valid_body = _chat_completion_bytes(
+        {
+            "cards": [
+                {
+                    "front": "Should a truncated response with a discarded Content-Length persist?",
+                    "back": "No, malformed HTTP header blocks must fail closed with 502.",
+                    "kind": "vocabulary",
+                }
+            ]
+        }
+    )
+    declared_length = len(valid_body) + 500
+    raw_http = (
+        b"HTTP/1.1 200 OK\r\n"
+        + malformed_header_prefix
+        + f"Content-Length: {declared_length}\r\n".encode()
+        + b"Connection: close\r\n\r\n"
+        + valid_body
+    )
+    strict_opener = _make_raw_http_socket_opener(raw_http)
+
+    did = _create_deck(client)
+    app.dependency_overrides[get_generator] = lambda: OpenAICompatibleGenerator(
+        api_key=secret,
+        model="gpt-4o-mini",
+        opener=strict_opener,
+    )
+    res = client.post(
+        "/cards/generate",
+        json={"deck_id": did, "text": "HTTP header parsing defect validation"},
+    )
+    assert res.status_code == 502
+    assert "header" in res.json()["detail"].lower()
+    assert secret not in res.text
+    assert client.get("/cards", params={"deck_id": did}).json() == []
