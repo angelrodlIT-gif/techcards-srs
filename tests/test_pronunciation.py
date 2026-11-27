@@ -1,5 +1,5 @@
 from io import BytesIO
-from time import monotonic, sleep
+from threading import Event
 from unittest.mock import Mock
 
 import pytest
@@ -629,23 +629,19 @@ def test_recording_invalidation_on_card_deck_error_mutations_and_bulk_clear(clie
     assert client.get(f"/study/{cid}/pronunciation/recording", headers=LOOPBACK).status_code == 404
 
     # Direct store verification for deck_id, kind, and reference_text mismatches
+    # Mismatched reads must return None without deleting the stored recording.
     main.pronunciation_recordings.put(
         cid, deck_b, "sentence", "Edited sentence.", "audio/webm", b"direct"
     )
     assert main.pronunciation_recordings.get(cid, deck_a, "sentence", "Edited sentence.") is None
-    assert main.pronunciation_recordings.get(cid, deck_b, "sentence", "Edited sentence.") is None
-    main.pronunciation_recordings.put(
-        cid, deck_b, "sentence", "Edited sentence.", "audio/webm", b"direct"
-    )
     assert (
         main.pronunciation_recordings.get(cid, deck_b, "pronunciation", "Edited sentence.") is None
     )
-    assert main.pronunciation_recordings.get(cid, deck_b, "sentence", "Edited sentence.") is None
-    main.pronunciation_recordings.put(
-        cid, deck_b, "sentence", "Edited sentence.", "audio/webm", b"direct"
-    )
     assert main.pronunciation_recordings.get(cid, deck_b, "sentence", "Different text.") is None
-    assert main.pronunciation_recordings.get(cid, deck_b, "sentence", "Edited sentence.") is None
+    assert main.pronunciation_recordings.get(cid, deck_b, "sentence", "Edited sentence.") == (
+        "audio/webm",
+        b"direct",
+    )
 
     # DELETE /cards/{card_id} purges recording
     assert (
@@ -882,39 +878,115 @@ def test_recording_upload_rejects_card_edits_during_stream_and_put_window(
     assert isolated_recordings.total_bytes == 0
 
 
+def test_stale_reader_mismatch_preserves_newer_recording(client, isolated_recordings):
+    deck_a = create_deck(client, "Stale Reader Deck A")
+    deck_b = create_deck(client, "Stale Reader Deck B")
+    card = create_card(
+        client,
+        deck_id=deck_a,
+        kind="pronunciation",
+        back="Snapshot A reference.",
+    ).json()
+    cid = card["id"]
+
+    # Recording uploaded for snapshot A
+    assert (
+        client.post(
+            f"/study/{cid}/pronunciation/recording", headers=RECORD_HEADERS, content=b"audio-a"
+        ).status_code
+        == 201
+    )
+
+    # Card edited to snapshot B (purges A) and new recording uploaded for B
+    assert (
+        client.put(
+            f"/cards/{cid}",
+            json={
+                "deck_id": deck_b,
+                "kind": "sentence",
+                "front": card["front"],
+                "back": "Snapshot B reference.",
+            },
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(
+            f"/study/{cid}/pronunciation/recording", headers=RECORD_HEADERS, content=b"audio-b"
+        ).status_code
+        == 201
+    )
+
+    # Paused reader resumes with stale snapshot A: gets None, must not delete recording B
+    assert isolated_recordings.get(cid, deck_a, "pronunciation", "Snapshot A reference.") is None
+
+    # Subsequent reader with current snapshot B still retrieves recording B
+    assert isolated_recordings.get(cid, deck_b, "sentence", "Snapshot B reference.") == (
+        "audio/webm",
+        b"audio-b",
+    )
+    replay = client.get(f"/study/{cid}/pronunciation/recording", headers=LOOPBACK)
+    assert replay.status_code == 200
+    assert replay.content == b"audio-b"
+    assert isolated_recordings.total_bytes == len(b"audio-b")
+
+
 def test_idle_recording_expiration_purges_ram_without_requests(
     client, isolated_recordings, monkeypatch
 ):
-    monkeypatch.setattr(pronunciation, "RECORDING_TTL_SECONDS", 0.05)
     deck_id = create_deck(client, "Idle TTL")
     c1 = create_card(client, deck_id=deck_id, back="First idle clip.").json()["id"]
     c2 = create_card(client, deck_id=deck_id, back="Second idle clip.").json()["id"]
 
     payload1 = b"first-idle-audio-bytes"
     payload2 = b"second-idle-audio-bytes"
+    purge_runs = 0
+    uploads_done = False
+    all_purged = Event()
+    real_run = isolated_recordings._run_scheduled_purge
+
+    def tracked_run(generation: int) -> None:
+        nonlocal purge_runs
+        purge_runs += 1
+        real_run(generation)
+        with isolated_recordings._lock:
+            if (
+                uploads_done
+                and len(isolated_recordings._recordings) == 0
+                and isolated_recordings._total_bytes == 0
+                and isolated_recordings._expiry_timer is None
+            ):
+                all_purged.set()
+
+    monkeypatch.setattr(isolated_recordings, "_run_scheduled_purge", tracked_run)
+
+    monkeypatch.setattr(pronunciation, "RECORDING_TTL_SECONDS", 0.05)
     assert (
         client.post(
             f"/study/{c1}/pronunciation/recording", headers=RECORD_HEADERS, content=payload1
         ).status_code
         == 201
     )
-    sleep(0.03)
+    monkeypatch.setattr(pronunciation, "RECORDING_TTL_SECONDS", 0.12)
     assert (
         client.post(
             f"/study/{c2}/pronunciation/recording", headers=RECORD_HEADERS, content=payload2
         ).status_code
         == 201
     )
-    assert len(isolated_recordings._recordings) == 2
-    assert isolated_recordings._total_bytes == len(payload1) + len(payload2)
+
+    with isolated_recordings._lock:
+        uploads_done = True
+        if (
+            len(isolated_recordings._recordings) == 0
+            and isolated_recordings._total_bytes == 0
+            and isolated_recordings._expiry_timer is None
+        ):
+            all_purged.set()
 
     # Wait passively without issuing any GET/POST/DELETE request; background timer purges RAM.
-    deadline = monotonic() + 2.0
-    while monotonic() < deadline:
-        if len(isolated_recordings._recordings) == 0 and isolated_recordings._total_bytes == 0:
-            break
-        sleep(0.01)
-
+    assert all_purged.wait(timeout=5.0)
+    assert purge_runs >= 1
     assert len(isolated_recordings._recordings) == 0
     assert isolated_recordings._total_bytes == 0
     assert isolated_recordings._expiry_timer is None

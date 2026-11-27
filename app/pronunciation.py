@@ -256,7 +256,6 @@ class PronunciationRecordingStore:
                 return None
             _, stored_deck_id, stored_kind, stored_digest, media_type, audio = entry
             if stored_deck_id != deck_id or stored_kind != kind or stored_digest != digest:
-                self._remove_locked(card_id)
                 self._schedule_expiry_locked(now)
                 return None
             self._recordings.move_to_end(card_id)
