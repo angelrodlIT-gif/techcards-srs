@@ -2454,6 +2454,12 @@ def test_truncated_chunked_response_over_real_loopback_http_returns_502(client):
                 conn.settimeout(2.0)
                 conn.recv(4096)
                 conn.sendall(raw_http)
+                conn.shutdown(socket.SHUT_WR)
+                try:
+                    while conn.recv(4096):
+                        pass
+                except OSError:
+                    pass
         finally:
             server_sock.close()
 
