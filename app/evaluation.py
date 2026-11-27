@@ -23,11 +23,6 @@ WORD_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z][A-Za-z0-9]*")
 CONTENT_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z][A-Za-z0-9]+")
 UNRESOLVED_RE = re.compile(r"\b(?:TODO|TBD)\b|\?\?\?", re.IGNORECASE)
 PLACEHOLDER_RE = re.compile(r"\[[A-Za-z][A-Za-z0-9 _/-]{0,60}\]")
-SCAFFOLD_HINT_RE = re.compile(
-    r"\b(?:use\s+star|star\s+scaffold|truthful\s+example|real\s+experience|"
-    r"do\s+not\s+invent|never\s+invent|practice\s+prompt)\b",
-    re.IGNORECASE,
-)
 
 _NUMBER_PATTERN = r"\d+(?:,\d+)*(?:\.\d+)?"
 METRIC_RE = re.compile(
@@ -40,26 +35,81 @@ METRIC_RE = re.compile(
 CLAUSE_NUMBER_RE = re.compile(rf"(?<![\d,.])\b{_NUMBER_PATTERN}(?!\d)(?![,.]\d)")
 CLAUSE_SPLIT_RE = re.compile(
     r"(?:\.(?!\d)|[!?;:\n])+"
-    r"|,\s+(?:while|whereas|but|although|though|and)\b"
+    r"|,\s+(?:while|whereas|but|although|though)\b"
     r"|\b(?:while|whereas|but|although|though)\b"
-    r"|\band\s+(?=(?:my|our|their|his|her|he|she|they|i|we)\b)",
+    r"|(?:,\s*)?\band\s+(?=(?:my|our|their|his|her|he|she|they|i|we)\b)",
     re.IGNORECASE,
 )
+COORD_SEPARATOR_RE = re.compile(r",|\b(?:and|or)\b", re.IGNORECASE)
 
-FIRST_PERSON_CLAIM_RE = re.compile(
-    r"\b(?:i|we)(?:\s+have|'ve)?\s+(?:"
+CLAIM_VERB_TOKENS: frozenset[str] = frozenset(
+    {
+        "led",
+        "built",
+        "designed",
+        "architected",
+        "migrated",
+        "reduced",
+        "improved",
+        "increased",
+        "cut",
+        "saved",
+        "managed",
+        "owned",
+        "maintained",
+        "deployed",
+        "automated",
+        "created",
+        "implemented",
+        "developed",
+        "resolved",
+        "fixed",
+        "troubleshot",
+        "configured",
+        "optimized",
+        "scaled",
+        "delivered",
+        "launched",
+        "supported",
+        "administered",
+        "operated",
+        "monitored",
+        "wrote",
+        "authored",
+        "spearheaded",
+        "drove",
+        "achieved",
+        "eliminated",
+        "prevented",
+        "handled",
+        "worked",
+    }
+)
+_CLAIM_VERB_ALTERNATION = (
     r"led|built|designed|architected|migrated|reduced|improved|increased|cut|saved|"
     r"managed|owned|maintained|deployed|automated|created|implemented|developed|"
     r"resolved|fixed|troubleshot|configured|optimized|scaled|delivered|launched|"
     r"supported|administered|operated|monitored|wrote|authored|spearheaded|drove|"
     r"achieved|eliminated|prevented|handled|worked\s+(?:with|on)"
-    r")\b",
+)
+FIRST_PERSON_CLAIM_RE = re.compile(
+    rf"\b(?:i|we)(?:\s+have|'ve)?\s+(?:{_CLAIM_VERB_ALTERNATION})\b",
     re.IGNORECASE,
 )
-PRACTICE_CLAIM_CLAUSE_RE = re.compile(
-    r"^(?:i|we)(?:\s+have)?\s+worked\s+with\s+"
+COORDINATED_CLAIM_VERB_RE = re.compile(
+    rf"(?:,\s*)?\band\s+(?:have\s+)?({_CLAIM_VERB_ALTERNATION})\b",
+    re.IGNORECASE,
+)
+EXEMPT_PRACTICE_BACK_RE = re.compile(
+    r"^practice:\s+(?:i|we)(?:\s+have)?\s+worked\s+with\s+"
     r"([a-z0-9_./+-]+(?:\s+[a-z0-9_./+-]+){0,2})\s+to\s+"
-    r"\[[a-z][a-z0-9 _/-]{0,60}\]$",
+    r"\[[a-z][a-z0-9 _/-]{0,60}\]\.\s+"
+    r"use\s+a\s+truthful\s+example(?:\s+and\s+explain\s+your\s+contribution)?\.?$",
+    re.IGNORECASE,
+)
+STAR_SCAFFOLD_BACK_RE = re.compile(
+    r"^use\s+star:\s+describe\s+the\s+situation,\s+task,\s+action(?:,)?\s+and\s+result\.\s+"
+    r"choose\s+a\s+real\s+experience;\s+do\s+not\s+invent\s+an\s+outcome\.?$",
     re.IGNORECASE,
 )
 DIRECTIONAL_BINDING_RE = re.compile(
@@ -68,28 +118,18 @@ DIRECTIONAL_BINDING_RE = re.compile(
     r"(\$?\d+(?:,\d+)*(?:\.\d+)?[a-z%]*|[a-z][a-z0-9_-]*)",
     re.IGNORECASE,
 )
-SCAFFOLD_TEMPLATE_TOKENS: frozenset[str] = frozenset(
-    {
-        "practice",
-        "worked",
-        "work",
-        "working",
-        "task",
-        "truthful",
-        "example",
-        "explain",
-        "contribution",
-        "star",
-        "describe",
-        "situation",
-        "action",
-        "result",
-        "choose",
-        "real",
-        "experience",
-        "invent",
-        "outcome",
-    }
+_METRIC_VALUE_PATTERN = (
+    rf"(?:(?<![a-z0-9,.])\$\s?{_NUMBER_PATTERN}(?!\d)(?![,.]\d)|"
+    rf"(?<![a-z0-9,.$])\b{_NUMBER_PATTERN}(?!\d)(?![,.]\d)(?:\s?%|[a-z]*))"
+)
+_METRIC_PREP_PATTERN = r"(?:from|to|into|by|under|below|over|above|at)"
+METRIC_CHAIN_RE = re.compile(
+    rf"(?:\bbetween\s+(?:(?:a|an|the)\s+)?{_METRIC_VALUE_PATTERN}"
+    rf"\s+and\s+(?:(?:a|an|the)\s+)?{_METRIC_VALUE_PATTERN}|"
+    rf"(?:\b{_METRIC_PREP_PATTERN}\s+)?(?:(?:a|an|the)\s+)?{_METRIC_VALUE_PATTERN}"
+    rf"(?:\s+(?:to|through|from|into|by|under|below|over|above|at)\s+"
+    rf"(?:(?:a|an|the)\s+)?{_METRIC_VALUE_PATTERN})*)",
+    re.IGNORECASE,
 )
 
 TECHNICAL_CONTRADICTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
@@ -386,36 +426,87 @@ def _clauses(text: str) -> list[str]:
     return [part.strip() for part in CLAUSE_SPLIT_RE.split(stripped) if part.strip()]
 
 
-def _is_practice_scaffold_back(back_text: str, kind: Kind, source_tokens: set[str]) -> bool:
+def _is_exempt_practice_back(back_text: str, kind: Kind, source_tokens: set[str]) -> bool:
     if kind not in ("behavioral", "interview_phrase"):
         return False
-    if not SCAFFOLD_HINT_RE.search(back_text):
+    match = EXEMPT_PRACTICE_BACK_RE.fullmatch(_norm_space(back_text))
+    if match is None:
         return False
-    non_scaffold_tokens = (
-        _content_tokens(PLACEHOLDER_RE.sub(" ", back_text)) - SCAFFOLD_TEMPLATE_TOKENS
+    topic = match.group(1)
+    if "to" in topic.lower().split():
+        return False
+    topic_tokens = _content_tokens(topic)
+    if not topic_tokens or (topic_tokens & CLAIM_VERB_TOKENS):
+        return False
+    return topic_tokens.issubset(source_tokens)
+
+
+def _is_practice_scaffold_back(back_text: str, kind: Kind, source_tokens: set[str]) -> bool:
+    if _is_exempt_practice_back(back_text, kind, source_tokens):
+        return True
+    return (
+        kind in ("behavioral", "interview_phrase")
+        and STAR_SCAFFOLD_BACK_RE.fullmatch(_norm_space(back_text)) is not None
     )
-    return non_scaffold_tokens.issubset(source_tokens)
 
 
-def _is_exempt_practice_back(back_text: str, kind: Kind, source_tokens: set[str]) -> bool:
-    if not _is_practice_scaffold_back(back_text, kind, source_tokens):
-        return False
-    if not PLACEHOLDER_RE.search(back_text):
-        return False
-    claim_clauses = [
-        clause for clause in _clauses(back_text) if FIRST_PERSON_CLAIM_RE.search(clause)
-    ]
-    if not claim_clauses:
-        return False
-    for clause in claim_clauses:
-        match = PRACTICE_CLAIM_CLAUSE_RE.fullmatch(_norm_space(clause))
-        if match is None:
+def _metric_context_tokens(segment: str) -> set[str]:
+    return _content_tokens(segment) - CLAIM_VERB_TOKENS - set(CLAUSE_NUMBER_RE.findall(segment))
+
+
+def _extract_metric_chains(
+    clause: str,
+) -> list[tuple[set[str], list[str], set[tuple[str, str]]]]:
+    norm_clause = _norm_space(clause)
+    matches = list(METRIC_CHAIN_RE.finditer(norm_clause))
+    chains: list[tuple[set[str], list[str], set[tuple[str, str]]]] = []
+
+    for idx, match in enumerate(matches):
+        chain_text = match.group(0)
+        chain_numbers = CLAUSE_NUMBER_RE.findall(chain_text)
+        chain_bindings = _directional_bindings(chain_text)
+
+        prev_end = matches[idx - 1].end() if idx > 0 else 0
+        next_start = matches[idx + 1].start() if idx + 1 < len(matches) else len(norm_clause)
+
+        raw_before = norm_clause[prev_end : match.start()]
+        before_parts = COORD_SEPARATOR_RE.split(raw_before)
+        had_before_sep = len(before_parts) > 1
+        before_tokens = _metric_context_tokens(before_parts[-1])
+
+        raw_after = norm_clause[match.end() : next_start]
+        after_segment = COORD_SEPARATOR_RE.split(raw_after, maxsplit=1)[0]
+        after_tokens = _metric_context_tokens(after_segment)
+
+        context_tokens = before_tokens | after_tokens
+        if not context_tokens and idx > 0 and not had_before_sep:
+            context_tokens = chains[-1][0]
+
+        chains.append((context_tokens, chain_numbers, chain_bindings))
+
+    return chains
+
+
+def _metric_chains_supported(
+    card_chains: list[tuple[set[str], list[str], set[tuple[str, str]]]],
+    source_chains: list[tuple[set[str], list[str], set[tuple[str, str]]]],
+) -> bool:
+    src_idx = 0
+    for card_ctx, card_nums, card_binds in card_chains:
+        if not card_ctx or not card_nums:
             return False
-        topic = match.group(1)
-        if "to" in topic.lower().split():
-            return False
-        topic_tokens = _content_tokens(topic)
-        if not topic_tokens or not topic_tokens.issubset(source_tokens):
+        matched = False
+        while src_idx < len(source_chains):
+            src_ctx, src_nums, src_binds = source_chains[src_idx]
+            if (
+                _is_subsequence(card_nums, src_nums)
+                and card_binds.issubset(src_binds)
+                and card_ctx.issubset(src_ctx)
+            ):
+                matched = True
+                break
+            src_idx += 1
+        if not matched:
             return False
     return True
 
@@ -424,14 +515,25 @@ def _claim_clause_supported(card_clause: str, source_clauses: list[str]) -> bool
     claim_phrases = [_norm_space(match) for match in FIRST_PERSON_CLAIM_RE.findall(card_clause)]
     if not claim_phrases:
         return True
+    coordinated_verbs = [
+        _norm_space(match.group(1))
+        for match in COORDINATED_CLAIM_VERB_RE.finditer(_norm_space(card_clause))
+    ]
     card_tokens = _content_tokens(card_clause)
     ordered_card_tokens = _ordered_content_tokens(card_clause)
     card_numbers = CLAUSE_NUMBER_RE.findall(card_clause)
     card_bindings = _directional_bindings(card_clause)
+    card_metric_chains = _extract_metric_chains(card_clause)
 
     for source_clause in source_clauses:
         norm_source = _norm_space(source_clause)
         if not all(re.search(rf"\b{re.escape(phrase)}\b", norm_source) for phrase in claim_phrases):
+            continue
+        if not all(
+            re.search(rf"\b(?:i|we)(?:\s+have|'ve)?\s+{re.escape(verb)}\b", norm_source)
+            or re.search(rf"(?:,\s*)?\band\s+(?:have\s+)?{re.escape(verb)}\b", norm_source)
+            for verb in coordinated_verbs
+        ):
             continue
         if not card_tokens.issubset(_content_tokens(source_clause)):
             continue
@@ -440,6 +542,10 @@ def _claim_clause_supported(card_clause: str, source_clauses: list[str]) -> bool
         if not _is_subsequence(card_numbers, CLAUSE_NUMBER_RE.findall(source_clause)):
             continue
         if not card_bindings.issubset(_directional_bindings(source_clause)):
+            continue
+        if card_metric_chains and not _metric_chains_supported(
+            card_metric_chains, _extract_metric_chains(source_clause)
+        ):
             continue
         return True
     return False

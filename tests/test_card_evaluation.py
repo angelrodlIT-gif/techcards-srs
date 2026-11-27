@@ -877,3 +877,139 @@ def test_practice_exemption_abuse_rejected(client, db_engine):
 
     with Session(db_engine) as session:
         assert session.scalars(select(Card)).all() == []
+
+
+# --- Sol Round 2 regressions: cross-metric binding & subject-less coordinated verbs ---
+
+
+def test_cross_metric_target_assignment_rejected(client, db_engine):
+    did = create_deck(client)
+    source_text = (
+        "I reduced AWS latency from 200ms to 100ms and database latency from 300ms to 200ms."
+    )
+
+    for valid_back in (
+        "I reduced AWS latency from 200ms to 100ms.",
+        "I reduced database latency from 300ms to 200ms.",
+    ):
+        res = evaluate_generated_card(
+            front="How did you improve latency?",
+            back=valid_back,
+            kind="behavioral",
+            source_text=source_text,
+        )
+        assert res.checks.technical_accuracy == "pass"
+        assert res.ready_for_review is True
+
+    for bad_back in (
+        "I reduced AWS latency to 200ms.",
+        "I reduced database latency to 100ms.",
+    ):
+        res = evaluate_generated_card(
+            front="How did you improve latency?",
+            back=bad_back,
+            kind="behavioral",
+            source_text=source_text,
+        )
+        assert res.checks.technical_accuracy == "fail"
+        assert res.ready_for_review is False
+        assert (
+            "Card makes a first-person achievement claim not supported by source_text."
+            in res.rejection_reasons
+        )
+
+        resp = client.post(
+            "/cards/generate/approve",
+            json={
+                "deck_id": did,
+                "front": "How did you improve latency?",
+                "back": bad_back,
+                "kind": "behavioral",
+                "source_text": source_text,
+            },
+        )
+        assert resp.status_code == 422
+
+    with Session(db_engine) as session:
+        assert session.scalars(select(Card)).all() == []
+
+
+def test_coordinated_count_swap_rejected():
+    source_text = "I migrated 10 AWS services and 5 GCP services."
+
+    for valid_back in (
+        "I migrated 10 AWS services.",
+        "I migrated 5 GCP services.",
+    ):
+        res = evaluate_generated_card(
+            front="How many cloud services did you migrate?",
+            back=valid_back,
+            kind="behavioral",
+            source_text=source_text,
+        )
+        assert res.checks.technical_accuracy == "pass"
+        assert res.ready_for_review is True
+
+    swapped = evaluate_generated_card(
+        front="How many AWS services did you migrate?",
+        back="I migrated 5 AWS services.",
+        kind="behavioral",
+        source_text=source_text,
+    )
+    assert swapped.checks.technical_accuracy == "fail"
+    assert swapped.ready_for_review is False
+    assert (
+        "Card makes a first-person achievement claim not supported by source_text."
+        in swapped.rejection_reasons
+    )
+
+
+def test_subjectless_coordinated_verb_in_practice_and_regular_back_rejected(client, db_engine):
+    did = create_deck(client)
+
+    cases = (
+        (
+            "Cloud support role using AWS. My colleague led production migrations.",
+            "How would you discuss your experience with AWS?",
+            (
+                "Practice: I have worked with AWS to [task], and led production migrations. "
+                "Use a truthful example."
+            ),
+            "interview_phrase",
+        ),
+        (
+            "I worked with AWS. My colleague led production migrations.",
+            "What production work did you handle with AWS?",
+            "I worked with AWS, and led production migrations.",
+            "behavioral",
+        ),
+    )
+
+    for source_text, front, bad_back, kind in cases:
+        res = evaluate_generated_card(
+            front=front,
+            back=bad_back,
+            kind=kind,
+            source_text=source_text,
+        )
+        assert res.checks.technical_accuracy == "fail"
+        assert res.ready_for_review is False
+        assert (
+            "Card makes a first-person achievement claim not supported by source_text."
+            in res.rejection_reasons
+        )
+
+        resp = client.post(
+            "/cards/generate/approve",
+            json={
+                "deck_id": did,
+                "front": front,
+                "back": bad_back,
+                "kind": kind,
+                "source_text": source_text,
+            },
+        )
+        assert resp.status_code == 422
+
+    with Session(db_engine) as session:
+        assert session.scalars(select(Card)).all() == []
