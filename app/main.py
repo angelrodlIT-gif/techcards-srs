@@ -1,13 +1,16 @@
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime
 from typing import Annotated, Literal
+from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, contains_eager, joinedload, selectinload
+from starlette.concurrency import run_in_threadpool
 
 from app.db import get_db
 from app.generator import (
@@ -19,6 +22,7 @@ from app.generator import (
 from app.learning import LearningSummary, summarize_learning
 from app.listening import AudioUnavailable, SynthesisLimitReached, listening_audio
 from app.models import Card, Deck, ErrorLog, Review, Source
+from app.pronunciation import MAX_BYTES, MEDIA_TYPES, TTL, comparison, recordings
 from app.remediation import STAR_PREFIX, build_remediation_draft
 from app.schemas import (
     MAX_LISTENING_CHARS,
@@ -38,6 +42,9 @@ from app.schemas import (
     ErrorSuggestionOut,
     GenerateInput,
     Kind,
+    PronunciationCompareInput,
+    PronunciationCompareOut,
+    PronunciationRecordingOut,
     ReviewInput,
     ReviewOut,
     SourceApproveInput,
@@ -70,7 +77,15 @@ def normalize_utc(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
-app = FastAPI(title="TechCards SRS", version="0.1.0")
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    try:
+        yield
+    finally:
+        recordings.clear()
+
+
+app = FastAPI(title="TechCards SRS", version="0.1.0", lifespan=lifespan)
 DB = Annotated[Session, Depends(get_db)]
 Generator = Annotated[CardGenerator, Depends(get_generator)]
 Clock = Annotated[Callable[[], datetime], Depends(get_clock)]
@@ -214,6 +229,8 @@ def get_card(card_id: int, db: DB):
 def update_card(card_id: int, payload: CardInput, db: DB):
     card = require(db, Card, card_id)
     require(db, Deck, payload.deck_id)
+    if (card.deck_id, card.kind, card.back) != (payload.deck_id, payload.kind, payload.back):
+        card.pronunciation_revision = uuid4().hex
     for key, value in payload.model_dump().items():
         setattr(card, key, value)
     return save(db, card)
@@ -325,6 +342,17 @@ def study_reveal(card_id: int, db: DB):
     )
 
 
+def require_loopback(request: Request, detail: str) -> None:
+    if (
+        request.client is None
+        or request.client.host not in {"127.0.0.1", "::1"}
+        or request.url.hostname not in {"127.0.0.1", "::1", "localhost"}
+        or "forwarded" in request.headers
+        or "x-forwarded-for" in request.headers
+    ):
+        raise HTTPException(403, detail)
+
+
 @app.post(
     "/study/{card_id}/audio",
     response_class=Response,
@@ -340,24 +368,126 @@ def study_reveal(card_id: int, db: DB):
 def study_audio(
     card_id: int, db: DB, request: Request, polly_opt_in: Annotated[Literal["true"], Header()]
 ):
-    if (
-        request.client is None
-        or request.client.host not in {"127.0.0.1", "::1"}
-        or request.url.hostname not in {"127.0.0.1", "::1", "localhost"}
-        or "forwarded" in request.headers
-        or "x-forwarded-for" in request.headers
-    ):
-        raise HTTPException(403, "Listening audio requires a direct loopback connection")
+    require_loopback(request, "Listening audio requires a direct loopback connection")
     card = require(db, Card, card_id)
     if card.kind != "listening" or not 1 <= len(card.back) <= MAX_LISTENING_CHARS:
         raise HTTPException(409, "Card is ineligible for listening audio")
+    return reference_audio(card.back)
+
+
+def reference_audio(text: str) -> Response:
     try:
-        audio = listening_audio.get(card.back)
+        audio = listening_audio.get(text)
     except SynthesisLimitReached as exc:
         raise HTTPException(429, "Synthesis budget exhausted. Reveal for the transcript.") from exc
     except AudioUnavailable as exc:
         raise HTTPException(503, "Audio unavailable. Reveal for the transcript.") from exc
     return Response(audio, media_type="audio/mpeg", headers={"Cache-Control": "no-store"})
+
+
+def pronunciation_card(db: Session, card_id: int, request: Request) -> Card:
+    require_loopback(request, "Pronunciation practice requires a direct loopback connection")
+    card = require(db, Card, card_id)
+    if (
+        card.kind
+        not in {"pronunciation", "vocabulary", "sentence", "interview_phrase", "listening"}
+        or not 1 <= len(card.back) <= MAX_LISTENING_CHARS
+    ):
+        raise HTTPException(409, "Card is ineligible for pronunciation practice")
+    return card
+
+
+def recording_key(card: Card) -> tuple[int, str | None]:
+    return card.id, card.pronunciation_revision
+
+
+@app.post("/study/{card_id}/pronunciation/audio", response_class=Response)
+def pronunciation_audio(
+    card_id: int, db: DB, request: Request, polly_opt_in: Annotated[Literal["true"], Header()]
+):
+    reference = pronunciation_card(db, card_id, request).back
+    db.rollback()
+    return reference_audio(reference)
+
+
+@app.post(
+    "/study/{card_id}/pronunciation/recording",
+    response_model=PronunciationRecordingOut,
+    status_code=201,
+)
+async def upload_pronunciation_recording(
+    card_id: int, db: DB, request: Request, recording_consent: Annotated[Literal["true"], Header()]
+):
+    def snapshot():
+        try:
+            return recording_key(pronunciation_card(db, card_id, request))
+        finally:
+            db.rollback()
+
+    initial = await run_in_threadpool(snapshot)
+    media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if media_type not in MEDIA_TYPES:
+        raise HTTPException(415, "Unsupported recording media type")
+    audio = bytearray()
+    async for chunk in request.stream():
+        if len(audio) + len(chunk) > MAX_BYTES:
+            raise HTTPException(413, "Recording exceeds 512 KiB limit")
+        audio.extend(chunk)
+    if not audio:
+        raise HTTPException(422, "Recording audio must not be empty")
+    if await run_in_threadpool(snapshot) != initial:
+        raise HTTPException(409, "Card changed during recording upload; retry recording")
+
+    def store_if_current() -> None:
+        try:
+            # Lock the matching revision through the cache write on both PostgreSQL and SQLite.
+            result = db.execute(
+                update(Card)
+                .where(Card.id == initial[0], Card.pronunciation_revision == initial[1])
+                .values(pronunciation_revision=Card.pronunciation_revision)
+            )
+            if result.rowcount != 1:
+                raise HTTPException(409, "Card changed during recording upload; retry recording")
+            recordings.put(initial, media_type, bytes(audio))
+        finally:
+            db.rollback()
+
+    await run_in_threadpool(store_if_current)
+    return PronunciationRecordingOut(
+        card_id=card_id, media_type=media_type, size_bytes=len(audio), expires_in_seconds=TTL
+    )
+
+
+@app.get("/study/{card_id}/pronunciation/recording", response_class=Response)
+def get_pronunciation_recording(card_id: int, db: DB, request: Request):
+    clip = recordings.get(recording_key(pronunciation_card(db, card_id, request)))
+    if clip is None:
+        raise HTTPException(404, "Recording not found")
+    media_type, audio = clip
+    return Response(audio, media_type=media_type, headers={"Cache-Control": "no-store"})
+
+
+@app.delete("/study/{card_id}/pronunciation/recording", status_code=204)
+def delete_pronunciation_recording(card_id: int, db: DB, request: Request):
+    key = recording_key(pronunciation_card(db, card_id, request))
+    result = db.execute(
+        update(Card)
+        .where(Card.id == key[0], Card.pronunciation_revision == key[1])
+        .values(pronunciation_revision=uuid4().hex)
+    )
+    db.commit()
+    if result.rowcount != 1:
+        raise HTTPException(409, "Card changed during recording deletion; retry deletion")
+    recordings.delete(key)
+    return Response(status_code=204)
+
+
+@app.post("/study/{card_id}/pronunciation/compare", response_model=PronunciationCompareOut)
+def compare_pronunciation(
+    card_id: int, db: DB, request: Request, payload: PronunciationCompareInput
+):
+    card = pronunciation_card(db, card_id, request)
+    return comparison(card, payload, recordings.get(recording_key(card)) is not None)
 
 
 @app.post("/study/{card_id}/grade", response_model=ReviewOut, status_code=201)

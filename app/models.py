@@ -1,4 +1,5 @@
 from datetime import UTC, date, datetime
+from uuid import uuid4
 
 from sqlalchemy import JSON, CheckConstraint, Date, DateTime, ForeignKey, Index, String, Text, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -26,6 +27,9 @@ class Card(Base):
     front: Mapped[str] = mapped_column(Text)
     back: Mapped[str] = mapped_column(Text)
     kind: Mapped[str] = mapped_column(String(30), default="vocabulary")
+    pronunciation_revision: Mapped[str | None] = mapped_column(
+        String(32), default=lambda: uuid4().hex
+    )
     source_label: Mapped[str | None] = mapped_column(String(255), nullable=True, default=None)
     accepted_answers: Mapped[list[str] | None] = mapped_column(JSON, nullable=True, default=list)
     explanation: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
