@@ -261,6 +261,25 @@ function updateChrome() {
   }
 }
 
+function renderIfView(...views) {
+  if (views.includes(state.view)) {
+    render();
+  } else {
+    updateChrome();
+  }
+}
+
+function hasUnsavedMainFormInput() {
+  const active = document.activeElement;
+  if (active && mainEl.contains(active) && /^(INPUT|TEXTAREA|SELECT)$/.test(active.tagName)) {
+    return true;
+  }
+  for (const el of mainEl.querySelectorAll("textarea, input[type='text'], input[type='url']")) {
+    if (el.value && el.value.trim().length > 0) return true;
+  }
+  return false;
+}
+
 function render() {
   updateChrome();
   const ctx = { state, actions };
@@ -414,7 +433,7 @@ async function refreshHeatmap() {
   const seq = ++heatmapSeq;
   state.heatmap.loading = true;
   state.heatmap.error = "";
-  render();
+  renderIfView("dashboard", "analytics");
 
   const res = await fetchRealHeatmap(state.heatmap.dateKeys);
   if (seq !== heatmapSeq || state.demoMode) return;
@@ -425,14 +444,15 @@ async function refreshHeatmap() {
   } else {
     state.heatmap.error = res.error;
   }
-  render();
+  renderIfView("dashboard", "analytics");
 }
 
 async function loadTemplates() {
   if (state.demoMode) return;
   state.templatesLoading = true;
   state.templatesError = "";
-  render();
+  if (state.view === "create" && state.createTab === "templates") render();
+  else updateChrome();
   const res = await api.listTemplates();
   if (state.demoMode) return;
   state.templatesLoading = false;
@@ -441,14 +461,16 @@ async function loadTemplates() {
   } else {
     state.templatesError = res.error;
   }
-  render();
+  if (state.view === "create" && state.createTab === "templates") render();
+  else updateChrome();
 }
 
 async function loadSources() {
   if (state.demoMode) return;
   state.sourcesLoading = true;
   state.sourcesError = "";
-  render();
+  if (state.view === "create" && state.createTab === "sources" && !hasUnsavedMainFormInput()) render();
+  else updateChrome();
   const res = await api.listSources();
   if (state.demoMode) return;
   state.sourcesLoading = false;
@@ -457,14 +479,15 @@ async function loadSources() {
   } else {
     state.sourcesError = res.error;
   }
-  render();
+  if (state.view === "create" && state.createTab === "sources" && !hasUnsavedMainFormInput()) render();
+  else updateChrome();
 }
 
 async function loadErrors() {
   if (state.demoMode) return;
   state.errorsLoading = true;
   state.errorsError = "";
-  render();
+  renderIfView("errors");
   const res = await api.listErrors();
   if (state.demoMode) return;
   state.errorsLoading = false;
@@ -473,17 +496,17 @@ async function loadErrors() {
   } else {
     state.errorsError = res.error;
   }
-  render();
+  renderIfView("errors");
 }
 
 async function loadAnalytics() {
   if (state.demoMode) {
-    render();
+    renderIfView("analytics");
     return;
   }
   state.analytics.loading = true;
   state.analytics.error = "";
-  render();
+  renderIfView("analytics");
   const res = await api.learningSummary({
     start: state.analytics.start,
     end: state.analytics.end,
@@ -495,7 +518,7 @@ async function loadAnalytics() {
   } else {
     state.analytics.error = res.error;
   }
-  render();
+  renderIfView("analytics");
 }
 
 async function refreshAll() {
@@ -504,6 +527,7 @@ async function refreshAll() {
     return;
   }
 
+  const refreshEpoch = dataModeEpoch;
   state.loadError = "";
   const [healthRes, decksRes, errorsRes, templatesRes, sourcesRes] = await Promise.all([
     api.health(),
@@ -513,14 +537,19 @@ async function refreshAll() {
     api.listSources(),
   ]);
 
-  if (state.demoMode) return;
+  if (state.demoMode || refreshEpoch !== dataModeEpoch) return;
   state.loadingInitial = false;
+  state.templatesLoading = false;
+  state.sourcesLoading = false;
+  state.errorsLoading = false;
 
   if (!healthRes.ok && !decksRes.ok) {
     state.apiStatus = "error";
     state.loadError = decksRes.error || healthRes.error;
     state.heatmap.loading = false;
-    render();
+    state.study.loading = false;
+    if (!(state.view === "create" && hasUnsavedMainFormInput())) render();
+    else updateChrome();
     return;
   }
 
@@ -531,7 +560,7 @@ async function refreshAll() {
       state.selectedDeckId = state.decks[0]?.id || "";
     }
     await refreshDeckStats(state.decks);
-    if (state.demoMode) return;
+    if (state.demoMode || refreshEpoch !== dataModeEpoch) return;
   } else {
     state.loadError = decksRes.error;
   }
@@ -540,7 +569,18 @@ async function refreshAll() {
   if (templatesRes.ok) state.templates = Array.isArray(templatesRes.data) ? templatesRes.data : [];
   if (sourcesRes.ok) state.sources = sourcesRes.data;
 
-  render();
+  if (state.view === "study") {
+    if (state.selectedDeckId) {
+      await actions.startStudy(state.selectedDeckId);
+    } else {
+      state.study.loading = false;
+      render();
+    }
+  } else if (state.view === "create" && hasUnsavedMainFormInput()) {
+    updateChrome();
+  } else {
+    render();
+  }
   refreshHeatmap();
   if (state.view === "analytics") loadAnalytics();
 }
@@ -854,6 +894,47 @@ const actions = {
       state.demoData = null;
       state.loadingInitial = true;
       state.apiStatus = "connecting";
+      state.decks = [];
+      state.deckStats = {};
+      state.selectedDeckId = "";
+      state.lastGeneratedCards = [];
+      state.templates = [];
+      state.templatesLoading = true;
+      state.templatesError = "";
+      state.sources = [];
+      state.sourcesLoading = true;
+      state.sourcesError = "";
+      state.errors = [];
+      state.errorsLoading = true;
+      state.errorsError = "";
+      state.heatmap = {
+        dateKeys: initialDateKeys,
+        counts: Object.fromEntries(initialDateKeys.map((k) => [k, 0])),
+        loading: true,
+        error: "",
+      };
+      state.analytics = {
+        ...state.analytics,
+        data: null,
+        loading: true,
+        error: "",
+      };
+      state.study = {
+        deckId: "",
+        filterKind: "",
+        remediationOnly: false,
+        initialDueCount: 0,
+        card: null,
+        reveal: null,
+        loading: state.view === "study",
+        revealing: false,
+        grading: false,
+        error: "",
+        sessionHistory: [],
+        audioLoading: false,
+        audioUrl: "",
+        audioError: "",
+      };
       syncUrlDemoParam("");
       render();
       refreshAll();

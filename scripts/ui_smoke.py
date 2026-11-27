@@ -158,6 +158,7 @@ def run_viewport_smoke(
         assert_no_horizontal_overflow(page, f"{name}:study-demo-initial")
 
     # Blur any focused button so Space triggers the keyboard shortcut handler cleanly
+    prompt_before = page.locator(".study-prompt").text_content() or ""
     page.evaluate("() => document.activeElement?.blur()")
     page.keyboard.press("Space")
     page.locator(".study-answer-panel").wait_for(state="visible", timeout=5000)
@@ -165,8 +166,24 @@ def run_viewport_smoke(
     assert_no_horizontal_overflow(page, f"{name}:study-revealed")
 
     page.keyboard.press("4")
-    page.wait_for_timeout(400)
+    page.locator(".study-answer-panel").wait_for(state="hidden", timeout=5000)
     assert_no_horizontal_overflow(page, f"{name}:study-after-grade")
+
+    if page.locator(".study-prompt").count() > 0:
+        prompt_after = page.locator(".study-prompt").text_content() or ""
+        if prompt_after == prompt_before:
+            raise AssertionError("Expected grade shortcut '4' to advance to the next card")
+
+    # Verify exiting Demo during revealed Focus Mode clears the Demo card cleanly
+    if not live_grade and not is_mobile and page.locator("#reveal-btn").count() > 0:
+        page.evaluate("() => document.activeElement?.blur()")
+        page.keyboard.press("Space")
+        page.locator(".study-answer-panel").wait_for(state="visible", timeout=5000)
+        page.keyboard.press("Control+k")
+        palette.wait_for(state="visible", timeout=5000)
+        cmd_input.fill("Volver a API real")
+        cmd_input.press("Enter")
+        page.locator(".study-answer-panel").wait_for(state="hidden", timeout=5000)
 
     page.keyboard.press("Escape")
     page.locator(".focus-shell").wait_for(state="hidden", timeout=5000)
