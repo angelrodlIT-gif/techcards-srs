@@ -148,6 +148,8 @@ def due_cards(
 @app.post("/cards/generate", response_model=list[CardOut], status_code=201)
 def generate_cards(payload: GenerateInput, db: DB, generator: Generator, clock: Clock):
     require(db, Deck, payload.deck_id)
+    # Release the read transaction and pooled connection before the outbound call.
+    db.rollback()
     generated = generator.generate(payload.text, payload.max_cards)
     if not generated:
         raise GeneratorUpstreamError("Generator returned no cards.")
@@ -165,8 +167,13 @@ def generate_cards(payload: GenerateInput, db: DB, generator: Generator, clock: 
         ]
     except ValidationError as exc:
         raise GeneratorUpstreamError("Generator returned invalid card output.") from exc
+    require(db, Deck, payload.deck_id)
     db.add_all(cards)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(404, "Deck not found") from exc
     for card in cards:
         db.refresh(card)
     return cards

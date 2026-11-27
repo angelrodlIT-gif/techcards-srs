@@ -10,9 +10,14 @@ import urllib.request
 from datetime import UTC, datetime
 
 import pytest
+from fastapi.testclient import TestClient
 from pydantic import ValidationError
+from sqlalchemy import create_engine, event, select, text
+from sqlalchemy.orm import Session
+from sqlalchemy.pool import QueuePool
 
 from app.config import Settings, get_settings
+from app.db import get_db
 from app.generator import (
     MAX_CONCURRENT_DNS_LOOKUPS,
     MAX_RESPONSE_BYTES,
@@ -35,6 +40,7 @@ from app.generator import (
     validate_generator_base_url,
 )
 from app.main import app
+from app.models import Base, Card, Deck
 
 
 def _chat_completion_bytes(content: object) -> bytes:
@@ -1852,3 +1858,140 @@ def test_huge_digit_content_length_returns_502_never_500(client):
     assert "Content-Length" in res.json()["detail"]
     assert "sk-huge-cl-secret" not in res.text
     assert client.get("/cards", params={"deck_id": did}).json() == []
+
+
+def test_generate_cards_releases_db_transaction_and_pool_connection_during_generation(tmp_path):
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'pool.db'}",
+        connect_args={"check_same_thread": False},
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=1,
+    )
+
+    @event.listens_for(engine, "connect")
+    def enable_foreign_keys(connection, _):
+        connection.execute("PRAGMA foreign_keys=ON")
+
+    Base.metadata.create_all(engine)
+    active_sessions: list[Session] = []
+    observed: dict[str, object] = {}
+
+    def override_db():
+        with Session(engine) as session:
+            active_sessions.append(session)
+            yield session
+
+    class InspectingGenerator:
+        def generate(self, text_input: str, max_cards: int) -> list[GeneratedCard]:
+            route_session = active_sessions[-1]
+            observed["in_transaction"] = route_session.in_transaction()
+            observed["checkedout"] = engine.pool.checkedout()
+            # With pool_size=1 and max_overflow=0, acquiring a connection here
+            # proves the route returned its pooled connection before calling generate().
+            with engine.connect() as conn:
+                observed["probe"] = conn.execute(text("SELECT 1")).scalar_one()
+            return [
+                GeneratedCard(
+                    front="What does releasing a DB transaction before I/O prevent?",
+                    back="It prevents holding pooled DB connections during slow outbound calls.",
+                    kind="vocabulary",
+                )
+            ]
+
+    app.dependency_overrides[get_db] = override_db
+    app.dependency_overrides[get_generator] = lambda: InspectingGenerator()
+    try:
+        with TestClient(app, client=("127.0.0.1", 50000)) as pooled_client:
+            did = _create_deck(pooled_client)
+            res = pooled_client.post(
+                "/cards/generate",
+                json={"deck_id": did, "text": "Connection pool hygiene in FastAPI", "max_cards": 1},
+            )
+            assert res.status_code == 201
+            assert len(res.json()) == 1
+            assert observed == {
+                "in_transaction": False,
+                "checkedout": 0,
+                "probe": 1,
+            }
+            assert engine.pool.checkedout() == 0
+    finally:
+        app.dependency_overrides.clear()
+        Base.metadata.drop_all(engine)
+        engine.dispose()
+
+
+def test_generate_cards_returns_404_when_deck_deleted_during_generation(client, db_engine):
+    did = _create_deck(client)
+
+    class DeletingDeckGenerator:
+        def generate(self, text_input: str, max_cards: int) -> list[GeneratedCard]:
+            with Session(db_engine) as other_session:
+                deck = other_session.get(Deck, did)
+                assert deck is not None
+                other_session.delete(deck)
+                other_session.commit()
+            return [
+                GeneratedCard(
+                    front="Explain foreign key integrity on concurrent delete.",
+                    back="Deleting the parent deck must prevent orphaned cards.",
+                    kind="vocabulary",
+                )
+            ]
+
+    app.dependency_overrides[get_generator] = lambda: DeletingDeckGenerator()
+    res = client.post(
+        "/cards/generate",
+        json={"deck_id": did, "text": "Concurrent deck deletion during generation", "max_cards": 1},
+    )
+    assert res.status_code == 404
+    assert res.json()["detail"] == "Deck not found"
+
+    with Session(db_engine) as check_session:
+        assert check_session.scalars(select(Card)).all() == []
+
+
+def test_generate_cards_returns_404_when_deck_deleted_just_before_commit(client, db_engine):
+    did = _create_deck(client)
+    deleted_once = False
+
+    def override_db_with_commit_race():
+        with Session(db_engine) as session:
+
+            @event.listens_for(session, "before_flush")
+            def delete_deck_before_flush(_sess, _flush_context, _instances):
+                nonlocal deleted_once
+                if deleted_once:
+                    return
+                deleted_once = True
+                with Session(db_engine) as other_session:
+                    deck = other_session.get(Deck, did)
+                    if deck is not None:
+                        other_session.delete(deck)
+                        other_session.commit()
+
+            yield session
+
+    class StaticGenerator:
+        def generate(self, text_input: str, max_cards: int) -> list[GeneratedCard]:
+            return [
+                GeneratedCard(
+                    front="Explain IntegrityError handling on commit.",
+                    back="Roll back and map missing parent deck FK errors to 404.",
+                    kind="vocabulary",
+                )
+            ]
+
+    app.dependency_overrides[get_db] = override_db_with_commit_race
+    app.dependency_overrides[get_generator] = lambda: StaticGenerator()
+    res = client.post(
+        "/cards/generate",
+        json={"deck_id": did, "text": "Concurrent deck deletion before commit", "max_cards": 1},
+    )
+    assert res.status_code == 404
+    assert res.json()["detail"] == "Deck not found"
+
+    with Session(db_engine) as check_session:
+        assert check_session.scalars(select(Card)).all() == []
