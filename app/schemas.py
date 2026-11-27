@@ -40,9 +40,17 @@ MAX_ACCEPTED_ANSWERS = 20
 MAX_ACCEPTED_ANSWER_CHARS = 5000
 CLOZE_BLANK_RE = re.compile(r"_{4,}")
 Kind = Literal[
-    "vocabulary", "interview_phrase", "behavioral", "sentence", "cloze", "es_en", "listening"
+    "vocabulary",
+    "interview_phrase",
+    "behavioral",
+    "sentence",
+    "cloze",
+    "es_en",
+    "listening",
+    "pronunciation",
 ]
 MAX_LISTENING_CHARS = 1000
+RecordingStatus = Literal["recorded", "transcript_only", "microphone_denied_fallback"]
 SourceStatus = Literal["draft", "approved", "discarded"]
 ErrorStatus = SourceStatus
 ErrorCategory = Literal["technical", "star"]
@@ -135,9 +143,9 @@ class CardPayloadBase(CardExtrasMixin):
     def validate_format(self) -> Self:
         if self.kind == "cloze" and CLOZE_BLANK_RE.findall(self.front) != ["____"]:
             raise ValueError("cloze card front must contain exactly one '____' blank")
-        if self.kind == "listening" and len(self.back) > MAX_LISTENING_CHARS:
+        if self.kind in {"listening", "pronunciation"} and len(self.back) > MAX_LISTENING_CHARS:
             raise ValueError(
-                f"listening transcript must be at most {MAX_LISTENING_CHARS} characters"
+                f"{self.kind} transcript must be at most {MAX_LISTENING_CHARS} characters"
             )
         return self
 
@@ -274,6 +282,43 @@ class StudyCardReveal(BaseModel):
 
 class StudyGradeInput(BaseModel):
     quality: int = Field(strict=True, ge=0, le=5)
+
+
+class PronunciationRecordingOut(BaseModel):
+    card_id: int
+    media_type: str
+    size_bytes: int
+    expires_in_seconds: int
+
+
+class PronunciationCompareInput(BaseModel):
+    microphone_available: StrictBool = True
+    spoken_transcript: Text | None = None
+    learner_notes: Text | None = None
+
+    @field_validator("spoken_transcript", "learner_notes", mode="before")
+    @classmethod
+    def normalize_optional_text(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
+
+
+class PronunciationCompareOut(BaseModel):
+    card_id: int
+    deck_id: int
+    kind: Kind
+    reference_text: str
+    card_explanation: str | None = None
+    has_recording: bool
+    recording_status: RecordingStatus
+    matched_terms: list[str]
+    missing_terms: list[str]
+    extra_terms: list[str]
+    intelligibility_focus: str
+    pronunciation_notes: list[str]
+    workflow_steps: list[str]
+    evaluation_disclaimer: str
 
 
 class StudyTemplateOut(BaseModel):

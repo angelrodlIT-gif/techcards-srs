@@ -1,6 +1,6 @@
 # Card Practice Formats
 
-Cards support seven `kind` values across `POST /cards`, `PUT /cards/{id}`, and
+Cards support eight `kind` values across `POST /cards`, `PUT /cards/{id}`, and
 `POST /sources/{id}/approve` (default remains `vocabulary`):
 
 - Existing kinds: `vocabulary`, `interview_phrase`, `behavioral`.
@@ -14,6 +14,10 @@ Cards support seven `kind` values across `POST /cards`, `PUT /cards/{id}`, and
 - `listening`: technical English comprehension. Use `front` for a prompt that
   keeps the transcript hidden and `back` for the English transcript (1–1,000
   characters after trimming). See [Listening cards](STUDY_LOOP.md#listening-cards).
+- `pronunciation`: technical English pronunciation and shadowing practice. Use
+  `front` for the word/phrase cue and `back` for the reference word or mined
+  English sentence (1–1,000 characters after trimming). See
+  [Pronunciation and shadowing practice](STUDY_LOOP.md#pronunciation-and-shadowing-practice).
 
 ## Alternatives and explanations
 

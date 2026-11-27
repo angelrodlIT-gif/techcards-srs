@@ -44,6 +44,54 @@ worker clears both the cache and budget. Use one worker for a single shared
 limit. Deleted or edited cards stop serving the old clip for that card, but
 the bytes may remain in memory until expiry, eviction, or restart.
 
+## Pronunciation and shadowing practice
+
+Practice pronunciation and shadowing on `pronunciation` cards as well as
+`vocabulary`, `sentence`, `interview_phrase`, and `listening` cards whose `back`
+is 1–1,000 characters (`409` for `behavioral`, `cloze`, `es_en`, or longer
+backs). All `/study/.../pronunciation/...` endpoints require a direct loopback
+connection (`127.0.0.1`, `::1`, or `localhost` without `Forwarded` or
+`X-Forwarded-For` proxy headers; `403` otherwise).
+
+1. **Listen:** Call `POST /study/{card_id}/pronunciation/audio` with
+   `Polly-Opt-In: true` to fetch the reference `audio/mpeg` (`Cache-Control: no-store`).
+   It shares the Polly cache and hourly budget with listening cards and returns
+   `429` or `503` with a fallback message to use `/pronunciation/compare` or
+   `/reveal` for text-only practice.
+2. **Shadow:** Repeat the target word or mined sentence aloud in real time,
+   matching content-word stress and clause pauses.
+3. **Record & replay (or microphone-denied fallback):**
+   - With explicit consent, upload a short local clip via
+     `POST /study/{card_id}/pronunciation/recording` (`201`) with header
+     `Recording-Consent: true` (`422` if missing or not `"true"`), a supported
+     `Content-Type` (`audio/webm`, `audio/ogg`, `audio/wav`, `audio/x-wav`,
+     `audio/mpeg`, `audio/mp4`; `415` otherwise), and 1–524,288 bytes (`422` if
+     empty, `413` if over 512 KiB). Replay via
+     `GET /study/{card_id}/pronunciation/recording` (`Cache-Control: no-store`).
+   - If microphone permission is denied or unavailable, skip recording and call
+     `POST /study/{card_id}/pronunciation/compare` with
+     `{"microphone_available": false}` (optionally including
+     `spoken_transcript` and/or `learner_notes`).
+4. **Compare & self-grade:** Call `POST /study/{card_id}/pronunciation/compare`
+   to receive deterministic intelligibility feedback (`matched_terms`,
+   `missing_terms`, `extra_terms`, `intelligibility_focus`, actionable
+   `pronunciation_notes` covering technical acronyms, initial s-clusters,
+   regular `-ed` endings, voiced `/v/` and `/z/`, card notes, and self-check
+   notes, plus a 4-step workflow summary). When `microphone_available` is `true`,
+   either an active recording or a non-empty `spoken_transcript` is required
+   (`409` otherwise). Feedback intentionally avoids unsupported numeric scores,
+   percentages, phoneme grades, or CEFR levels. Finish by self-grading with
+   `POST /study/{card_id}/grade`.
+
+**Privacy, retention, and delete controls:** Learner recordings are held
+exclusively in worker RAM (never written to disk or PostgreSQL), bounded to 32
+clips of up to 512 KiB each with a 1-hour TTL and LRU eviction. Recordings are
+automatically invalidated when a card's `deck_id`, `kind`, or `back` changes, or
+when the card, deck, or linked error (`delete_card=true`) is deleted. Delete a
+single recording at any time with `DELETE /study/{card_id}/pronunciation/recording`
+(`204`) or clear all in-memory recordings with
+`DELETE /study/pronunciation/recordings` (`204`).
+
 ## Read-only template catalog (`/templates`)
 
 - Built-in generic catalog served from `app/templates.py` (never auto-creates cards on list, get, startup, or migration):
