@@ -6,3 +6,13 @@ __pycache__/
 .ruff_cache/
 *.db
 .coverage
+
+# Terraform working data and environment configuration
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+*.tfplan
+*.tfbackend
+.terraform.tfstate.lock.info
