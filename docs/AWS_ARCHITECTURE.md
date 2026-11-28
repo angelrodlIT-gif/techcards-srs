@@ -2,7 +2,8 @@
 
 **Status:** Proposed. Design for a single invited learner in one AWS region.
 The account, region, domain, and spending ceiling require owner approval before
-provisioning. Use synthetic data through the deployment and recovery drills.
+provisioning. Use synthetic study data throughout the pilot, including
+deployment and recovery drills.
 
 ## Runtime decision
 
@@ -35,12 +36,15 @@ Lambda after measuring traffic, DB connections and recovery times.
   API Gateway's rules), expiry and a dedicated API scope. Verify that only the
   invited learner can obtain that scope. Disable the default execute-api URL.
   See the [JWT authorizer contract](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-jwt-authorizer.html).
-- **Edge to service.** Explicitly list approved text routes. Omit catch-all
-  routes, docs, OpenAPI, health, audio and pronunciation. Account for path
-  rewriting and test the effective route map before enabling the custom
-  domain. [FastAPI](../app/main.py) has no caller authentication or per-user
-  data isolation. The invited learner has access to all data in this deployment.
-  Adding users requires per-user authorization and data ownership first.
+- **Edge to service.** Publish only `GET /decks`, `GET /study/next`,
+  `POST /study/{card_id}/reveal` and `POST /study/{card_id}/grade`. Use
+  explicit method and path rules with the JWT authorizer and no catch-all.
+  Keep docs, OpenAPI, health, audio and pronunciation off the public route
+  map. Account for path rewriting and test the effective route map before
+  enabling the custom domain. The [application](../app/main.py) has no caller
+  authentication or per-user data isolation. The invited learner can access
+  the synthetic study data through the published routes. Adding users requires
+  per-user authorization and data ownership first.
 - **Inside the VPC.** The gateway connects through a dedicated VPC link to an
   internal ALB over HTTPS with server name verification. The ALB forwards to
   Uvicorn over HTTP on port 8000 inside private subnets. This hop is cleartext
@@ -59,28 +63,49 @@ Lambda after measuring traffic, DB connections and recovery times.
 - **Release gate.** Before allowing external traffic, demonstrate rejection of
   missing, expired and wrong-issuer, wrong-client or wrong-scope tokens and
   rejection of direct access to the ALB, tasks and RDS from outside their
-  allowed sources. Verify that docs and audio stay unreachable and that a
-  valid token can complete a text study loop against disposable data. Keep
-  the edge disabled if any check fails.
+  allowed sources. With a valid token, verify that excluded routes stay
+  unreachable, including encoded or rewritten paths, and that the learner
+  can list decks, fetch, reveal and grade a synthetic card. Keep the edge
+  disabled if any check fails.
 
 ## Data and audio
 
-[Study behavior](STUDY_LOOP.md) includes stored interview text and study
-history. Keep the default offline generator. The optional
-[OpenAI-compatible adapter](../app/generator.py) crosses a separate provider
-boundary and needs separate approval for outbound traffic and submitted data.
+Preserve the local-only interview-text contract in [Study Loop](STUDY_LOOP.md).
+Seed a fresh RDS database with reviewed synthetic decks and cards through a
+private, authorized setup step. Exclude real interview answers, personal
+details from study content, and imports from local databases or exports.
+The [grade handler](../app/main.py) updates scheduling and stores
+a review using a numeric grade from [StudyGradeInput](../app/schemas.py).
 
-[Audio handlers](../app/main.py) require a direct loopback peer and host and
-reject forwarding headers. Polly synthesis requires `Polly-Opt-In: true`.
-[Listening audio](../app/listening.py) is disabled by default. When enabled
-locally, it sends reference text to Polly on cache misses and caches clips
-in worker RAM. Recording upload requires `Recording-Consent: true`.
-[Recordings](../app/pronunciation.py) are held in worker RAM, with a one-hour
-TTL and bounded capacity, and are lost on restart. PostgreSQL can hold
-pronunciation revision metadata. The recording bytes do not belong in RDS,
-S3 or backups.
+Keep every method on `/errors` and `/errors/*` private to local use. The
+[error handlers](../app/main.py) can save attempted and corrected answers,
+and approval can copy that text into a card. The `consent: true` field on
+`/errors/suggest` does not authorize cloud storage. Also exclude deck and
+card create/update, card generation, source create/update/approval, and
+template-to-card creation. The [API handlers](../app/main.py) accept
+free-form fields through several of those routes and can persist them
+directly or in generated cards. Keep the default offline generator from
+[settings](../app/config.py). The optional
+[OpenAI-compatible adapter](../app/generator.py) needs separate approval
+for outbound traffic and submitted data.
 
-Ship text only with Polly disabled and no Polly or audio bucket permissions.
+The [audio and pronunciation guard](../app/main.py) requires an ASGI
+client host of `127.0.0.1` or `::1`, a request URL hostname of
+`127.0.0.1`, `::1` or `localhost`, and absence of both `Forwarded` and
+`X-Forwarded-For`. The [local setup](STUDY_LOOP.md) assumes a direct
+loopback connection with no reverse proxy and Uvicorn proxy header
+processing disabled. The ALB deployment is proxied, so omit listening
+audio and all pronunciation routes from its public surface.
+
+Both synthesis endpoints require `Polly-Opt-In: true`. Polly is disabled
+by default in [settings](../app/config.py). When enabled, the
+[listening service](../app/listening.py) sends reference text to Polly on
+cache misses and caches clips in worker RAM. The [upload handler](../app/main.py)
+requires `Recording-Consent: true` and can use a PostgreSQL card revision
+for cache identity. [Recording bytes](../app/pronunciation.py) stay in
+worker RAM with a one-hour TTL and bounded capacity and are lost on restart.
+
+Keep Polly disabled and grant no Polly or audio bucket permissions.
 The private S3 audio requirement in [#26](https://github.com/angelrodlIT-gif/techcards-srs/issues/26)
 needs reconciliation before provisioning an audio bucket. Any later proposal
 for hosted audio must define permitted content, consent, authorization and
