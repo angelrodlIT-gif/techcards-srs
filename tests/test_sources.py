@@ -26,7 +26,9 @@ def test_source_intake_normalization_and_duplicates(client):
     # URL-less sources (omitted or blank) are allowed as duplicates, even with the same label.
     no_url = client.post("/sources", json={"label": "  AWS Notes  ", "excerpt": "  IAM basics  "})
     assert no_url.status_code == 201
+    assert len(no_url.json()["identity"]) == 32
     assert no_url.json() == {
+        "identity": no_url.json()["identity"],
         "id": no_url.json()["id"],
         "label": "AWS Notes",
         "url": None,
@@ -107,7 +109,9 @@ def test_source_validation_and_missing_resources(client):
     assert client.post("/sources/999/discard").status_code == 404
     assert (
         client.post(
-            "/sources/999/approve", json={"deck_id": 1, "front": "Q", "back": "A"}
+            "/sources/999/approve",
+            params={"identity": "0" * 32},
+            json={"deck_id": 1, "front": "Q", "back": "A"},
         ).status_code
         == 404
     )
@@ -160,16 +164,25 @@ def test_source_edit_discard_approve_and_delete_lifecycle(client, set_clock):
     assert client.post(f"/sources/{s2['id']}/discard").status_code == 409
     assert (
         client.post(
-            f"/sources/{s2['id']}/approve", json={"deck_id": did, "front": "Q", "back": "A"}
+            f"/sources/{s2['id']}/approve",
+            params={"identity": s2["identity"]},
+            json={"deck_id": did, "front": "Q", "back": "A"},
         ).status_code
         == 409
     )
 
     # Approve errors: missing fields -> 422; nonexistent deck -> 404 (source stays draft).
-    assert client.post(f"/sources/{s1['id']}/approve", json={"front": "Q"}).status_code == 422
     assert (
         client.post(
-            f"/sources/{s1['id']}/approve", json={"deck_id": 999, "front": "Q", "back": "A"}
+            f"/sources/{s1['id']}/approve", params={"identity": s1["identity"]}, json={"front": "Q"}
+        ).status_code
+        == 422
+    )
+    assert (
+        client.post(
+            f"/sources/{s1['id']}/approve",
+            params={"identity": s1["identity"]},
+            json={"deck_id": 999, "front": "Q", "back": "A"},
         ).status_code
         == 404
     )
@@ -178,6 +191,7 @@ def test_source_edit_discard_approve_and_delete_lifecycle(client, set_clock):
     # Approve draft -> creates card with source_label and default SM-2 schedule.
     approved = client.post(
         f"/sources/{s1['id']}/approve",
+        params={"identity": s1["identity"]},
         json={"deck_id": did, "front": "IAM access denied?", "back": "Check IAM/SCP policies."},
     )
     assert approved.status_code == 201
@@ -198,7 +212,9 @@ def test_source_edit_discard_approve_and_delete_lifecycle(client, set_clock):
     assert client.post(f"/sources/{s1['id']}/discard").status_code == 409
     assert (
         client.post(
-            f"/sources/{s1['id']}/approve", json={"deck_id": did, "front": "Q", "back": "A"}
+            f"/sources/{s1['id']}/approve",
+            params={"identity": s1["identity"]},
+            json={"deck_id": did, "front": "Q", "back": "A"},
         ).status_code
         == 409
     )
@@ -328,7 +344,12 @@ def test_source_embedded_nul_rejected(client):
         {"deck_id": did, "front": "What\x00is IAM?", "back": "Access control"},
         {"deck_id": did, "front": "What is IAM?", "back": "Access\x00control"},
     ):
-        assert client.post(f"/sources/{sid}/approve", json=bad_approve).status_code == 422
+        assert (
+            client.post(
+                f"/sources/{sid}/approve", params={"identity": draft["identity"]}, json=bad_approve
+            ).status_code
+            == 422
+        )
 
     assert client.get(f"/sources/{sid}").json()["status"] == "draft"
     assert client.get("/cards").json() == []

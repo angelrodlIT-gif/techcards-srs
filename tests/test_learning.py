@@ -29,13 +29,21 @@ def test_learning_summary_reads_real_review_and_error_routes(client, set_clock):
     set_clock(datetime(2026, 11, 24, 4, 45, tzinfo=UTC))
     deck_id = client.post("/decks", json={"name": "Practice"}).json()["id"]
     draft = {"attempted": "a subnet", "corrected": "an isolated subnet", "rationale": "Precision"}
-    error_ids = [client.post("/errors", json=draft).json()["id"] for _ in range(4)]
+    errors = [client.post("/errors", json=draft).json() for _ in range(4)]
 
-    approved = client.post(f"/errors/{error_ids[0]}/approve", json={"deck_id": deck_id})
+    approved = client.post(
+        f"/errors/{errors[0]['id']}/approve",
+        params={"identity": errors[0]["identity"]},
+        json={"deck_id": deck_id},
+    )
     card_id = approved.json()["card"]["id"]
-    deleted = client.post(f"/errors/{error_ids[1]}/approve", json={"deck_id": deck_id})
+    deleted = client.post(
+        f"/errors/{errors[1]['id']}/approve",
+        params={"identity": errors[1]["identity"]},
+        json={"deck_id": deck_id},
+    )
     assert client.delete(f"/cards/{deleted.json()['card']['id']}").status_code == 204
-    assert client.post(f"/errors/{error_ids[2]}/discard").status_code == 200
+    assert client.post(f"/errors/{errors[2]['id']}/discard").status_code == 200
 
     assert client.get("/study/next", params={"deck_id": deck_id}).status_code == 200
     assert client.post(f"/study/{card_id}/reveal").status_code == 200

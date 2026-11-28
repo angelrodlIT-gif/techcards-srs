@@ -43,10 +43,20 @@ curl --fail -X DELETE \
 - Older source labels carry no verified provenance. Migration 0007 also clears
   pre-upgrade SQLite error-to-card links because earlier SQLite connections
   allowed a deleted card ID to be reused without clearing the original link.
-  Review and delete any remaining legacy cards individually. The migration
-  removes SQLite cards with missing decks and reviews with missing cards.
-  An older orphan that already inherited a real parent ID is indistinguishable
-  from valid data, so review old SQLite data before bulk deletion.
+  It moves all legacy SQLite cards to a new **Recovered SQLite cards** deck
+  because an existing deck ID cannot prove the original deck survived. Card
+  content and review history are preserved. Reviews with missing cards receive
+  placeholder cards in the recovery deck. Move recovered cards to their intended
+  decks after inspecting them. Downgrading drops the new schema fields but leaves
+  recovered cards in their recovery deck.
+
+## Approve a draft
+
+For `POST /sources/{id}/approve` and `POST /errors/{id}/approve`, pass
+`?identity=<identity>` from the draft you viewed. Source and error responses
+include this field, including the draft returned by `POST /errors/suggest`.
+Keep the ID and identity together. Missing identity returns HTTP 422, and a
+stale identity returns HTTP 404 even if the numeric ID belongs to a new draft.
 
 ## Retention
 

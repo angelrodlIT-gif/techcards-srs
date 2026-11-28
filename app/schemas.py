@@ -238,6 +238,7 @@ class SourceInput(BaseModel):
 class SourceOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: int
+    identity: str | None
     label: str
     url: str | None
     normalized_url: str | None
@@ -346,6 +347,7 @@ class ErrorLogInput(BaseModel):
 class ErrorLogOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: int
+    identity: str | None
     attempted: str
     corrected: str
     rationale: str

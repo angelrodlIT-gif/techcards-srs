@@ -180,7 +180,12 @@ def test_errors_crud_lifecycle_validation_and_links(client, set_clock):
         == 404
     )
     assert client.post("/errors/999/discard").status_code == 404
-    assert client.post("/errors/999/approve", json={"deck_id": did}).status_code == 404
+    assert (
+        client.post(
+            "/errors/999/approve", params={"identity": "0" * 32}, json={"deck_id": did}
+        ).status_code
+        == 404
+    )
 
     e1 = client.post(
         "/errors",
@@ -190,7 +195,9 @@ def test_errors_crud_lifecycle_validation_and_links(client, set_clock):
             "rationale": "  Use base verb after 'did not'.  ",
         },
     ).json()
+    assert len(e1["identity"]) == 32
     assert e1 == {
+        "identity": e1["identity"],
         "id": e1["id"],
         "attempted": "The service did not responded",
         "corrected": "The service did not respond",
@@ -225,18 +232,39 @@ def test_errors_crud_lifecycle_validation_and_links(client, set_clock):
         == 409
     )
     assert client.post(f"/errors/{e2['id']}/discard").status_code == 409
-    assert client.post(f"/errors/{e2['id']}/approve", json={"deck_id": did}).status_code == 409
+    assert (
+        client.post(
+            f"/errors/{e2['id']}/approve",
+            params={"identity": e2["identity"]},
+            json={"deck_id": did},
+        ).status_code
+        == 409
+    )
 
     # Approve errors leave row in draft.
-    assert client.post(f"/errors/{e1['id']}/approve", json={"deck_id": 999}).status_code == 404
+    assert (
+        client.post(
+            f"/errors/{e1['id']}/approve",
+            params={"identity": e1["identity"]},
+            json={"deck_id": 999},
+        ).status_code
+        == 404
+    )
     for bad_approve in (
         {"deck_id": did, "kind": "cloze"},
         {"deck_id": did, "front": "Bad\x00front"},
     ):
-        assert client.post(f"/errors/{e1['id']}/approve", json=bad_approve).status_code == 422
+        assert (
+            client.post(
+                f"/errors/{e1['id']}/approve", params={"identity": e1["identity"]}, json=bad_approve
+            ).status_code
+            == 422
+        )
     assert client.get(f"/errors/{e1['id']}").json()["status"] == "draft"
 
-    approved = client.post(f"/errors/{e1['id']}/approve", json={"deck_id": did})
+    approved = client.post(
+        f"/errors/{e1['id']}/approve", params={"identity": e1["identity"]}, json={"deck_id": did}
+    )
     assert approved.status_code == 201
     err_out, card_out = approved.json()["error"], approved.json()["card"]
     assert (err_out["status"], err_out["card_id"], card_out["error_id"]) == (
@@ -255,7 +283,14 @@ def test_errors_crud_lifecycle_validation_and_links(client, set_clock):
         f"/cards/{card_out['id']}", json={"deck_id": did, "front": "Edited", "back": "Fixed"}
     )
     assert upd.status_code == 200 and upd.json()["error_id"] == err_out["id"]
-    assert client.post(f"/errors/{e1['id']}/approve", json={"deck_id": did}).status_code == 409
+    assert (
+        client.post(
+            f"/errors/{e1['id']}/approve",
+            params={"identity": e1["identity"]},
+            json={"deck_id": did},
+        ).status_code
+        == 409
+    )
 
     # Filter and pagination.
     assert [e["id"] for e in client.get("/errors", params={"status": "approved"}).json()] == [
@@ -275,6 +310,7 @@ def test_errors_crud_lifecycle_validation_and_links(client, set_clock):
     ).json()
     c3 = client.post(
         f"/errors/{e3['id']}/approve",
+        params={"identity": e3["identity"]},
         json={"deck_id": did, "front": "Results depend ____ load.", "back": "on", "kind": "cloze"},
     ).json()["card"]
     assert client.delete(f"/cards/{c3['id']}").status_code == 204
@@ -283,7 +319,14 @@ def test_errors_crud_lifecycle_validation_and_links(client, set_clock):
     e4 = client.post(
         "/errors", json={"attempted": "in Monday", "corrected": "on Monday", "rationale": "Days."}
     ).json()
-    assert client.post(f"/errors/{e4['id']}/approve", json={"deck_id": did}).status_code == 201
+    assert (
+        client.post(
+            f"/errors/{e4['id']}/approve",
+            params={"identity": e4["identity"]},
+            json={"deck_id": did},
+        ).status_code
+        == 201
+    )
     assert client.delete(f"/decks/{did}").status_code == 204
     assert client.get(f"/errors/{e4['id']}").json()["card_id"] is None
 
@@ -297,13 +340,21 @@ def test_error_approve_derived_front_length_boundaries(client):
             "/errors",
             json={"attempted": "a" * length, "corrected": "Fixed", "rationale": "Why"},
         ).json()
-        assert client.post(f"/errors/{err['id']}/approve", json={"deck_id": did}).status_code == 422
+        assert (
+            client.post(
+                f"/errors/{err['id']}/approve",
+                params={"identity": err["identity"]},
+                json={"deck_id": did},
+            ).status_code
+            == 422
+        )
         assert client.get(f"/errors/{err['id']}").json()["status"] == "draft"
     assert client.get("/cards").json() == []
 
     # Valid short override on a 5,000-char error still succeeds and remains PUT-editable.
     overridden = client.post(
         f"/errors/{err['id']}/approve",
+        params={"identity": err["identity"]},
         json={"deck_id": did, "front": "Short override prompt"},
     )
     assert overridden.status_code == 201
@@ -322,7 +373,11 @@ def test_error_approve_derived_front_length_boundaries(client):
         "/errors",
         json={"attempted": "b" * 4991, "corrected": "Fixed", "rationale": "Why"},
     ).json()
-    fitted = client.post(f"/errors/{fit_err['id']}/approve", json={"deck_id": did})
+    fitted = client.post(
+        f"/errors/{fit_err['id']}/approve",
+        params={"identity": fit_err["identity"]},
+        json={"deck_id": did},
+    )
     assert fitted.status_code == 201
     c_fit = fitted.json()["card"]
     assert len(c_fit["front"]) == 5000 and c_fit["error_id"] == fit_err["id"]
@@ -409,7 +464,11 @@ def test_error_suggest_validation_and_boundaries(client):
     )
     assert ok.status_code == 201 and len(ok.json()["suggested_card"]["front"]) == 5000
     assert client.get("/cards").json() == []
-    approved = client.post(f"/errors/{ok.json()['error']['id']}/approve", json={"deck_id": did})
+    approved = client.post(
+        f"/errors/{ok.json()['error']['id']}/approve",
+        params={"identity": ok.json()["error"]["identity"]},
+        json={"deck_id": did},
+    )
     assert approved.status_code == 201 and len(approved.json()["card"]["front"]) == 5000
 
 
@@ -472,10 +531,19 @@ def test_remediation_loop_suggest_approve_study_export_and_delete(client, set_cl
     assert len(client.get("/cards").json()) == 1  # suggest never creates cards
 
     # 3. Approve STAR (defaults to behavioral), technical (interview_phrase), and explicit override.
-    s_app = client.post(f"/errors/{s_err['id']}/approve", json={"deck_id": did}).json()
-    t_app = client.post(f"/errors/{t_err['id']}/approve", json={"deck_id": did}).json()
+    s_app = client.post(
+        f"/errors/{s_err['id']}/approve",
+        params={"identity": s_err["identity"]},
+        json={"deck_id": did},
+    ).json()
+    t_app = client.post(
+        f"/errors/{t_err['id']}/approve",
+        params={"identity": t_err["identity"]},
+        json={"deck_id": did},
+    ).json()
     ov = client.post(
         f"/errors/{star_custom['error']['id']}/approve",
+        params={"identity": star_custom["error"]["identity"]},
         json={"deck_id": did, "kind": "interview_phrase"},
     ).json()
     assert (s_app["card"]["kind"], t_app["card"]["kind"], ov["card"]["kind"]) == (
@@ -540,7 +608,9 @@ def test_remediation_loop_suggest_approve_study_export_and_delete(client, set_cl
         "[Technical remediation] [STAR remediation]"
     )
     tech_star_app = client.post(
-        f"/errors/{tech_star_note['error']['id']}/approve", json={"deck_id": did}
+        f"/errors/{tech_star_note['error']['id']}/approve",
+        params={"identity": tech_star_note["error"]["identity"]},
+        json={"deck_id": did},
     )
     assert tech_star_app.status_code == 201
     assert tech_star_app.json()["card"]["kind"] == "interview_phrase"

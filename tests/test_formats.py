@@ -227,11 +227,17 @@ def test_source_approve_and_generate_behavior(client, set_clock):
         {"deck_id": did, "front": "Q", "back": "A", "accepted_answers": ["a\x00b"]},
         {"deck_id": did, "front": "Q", "back": "A", "explanation": "a\x00b"},
     ):
-        assert client.post(f"/sources/{src['id']}/approve", json=bad).status_code == 422
+        assert (
+            client.post(
+                f"/sources/{src['id']}/approve", params={"identity": src["identity"]}, json=bad
+            ).status_code
+            == 422
+        )
     assert client.get(f"/sources/{src['id']}").json()["status"] == "draft"
 
     approved = client.post(
         f"/sources/{src['id']}/approve",
+        params={"identity": src["identity"]},
         json={
             "deck_id": did,
             "front": "Idempotent requests can be ____ safely.",

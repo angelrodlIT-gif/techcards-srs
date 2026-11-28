@@ -566,10 +566,12 @@ def save_source(db: Session, source: Source) -> Source:
         raise
 
 
-def lock_draft(db: Session, model, identifier: int, action: str, label: str):
+def lock_draft(
+    db: Session, model, identifier: int, action: str, label: str, identity: str | None = None
+):
     lock_personal_write(db)
     row = db.scalar(select(model).where(model.id == identifier).with_for_update())
-    if row is None:
+    if row is None or (identity is not None and row.identity != identity):
         raise HTTPException(404, f"{model.__name__} not found")
     if row.status != "draft":
         raise HTTPException(409, f"Cannot {action} {label} in '{row.status}' status")
@@ -648,9 +650,15 @@ def discard_source(source_id: int, db: DB):
 
 
 @app.post("/sources/{source_id}/approve", response_model=SourceApproveOut, status_code=201)
-def approve_source(source_id: int, payload: SourceApproveInput, db: DB, clock: Clock):
+def approve_source(
+    source_id: int,
+    payload: SourceApproveInput,
+    db: DB,
+    clock: Clock,
+    identity: Annotated[str, Query(pattern=r"^[0-9a-f]{32}$")],
+):
     try:
-        source = lock_draft_source(db, source_id, "approve")
+        source = lock_draft(db, Source, source_id, "approve", "source", identity)
         require(db, Deck, payload.deck_id)
         today = normalize_utc(clock()).date()
         card = Card(
@@ -743,6 +751,7 @@ def export_errors(
     rows = db.scalars(query.offset(offset).limit(limit)).all()
     items = [
         ErrorExportItemOut(
+            identity=row.identity,
             id=row.id,
             attempted=row.attempted,
             corrected=row.corrected,
@@ -807,9 +816,15 @@ def discard_error(error_id: int, db: DB):
 
 
 @app.post("/errors/{error_id}/approve", response_model=ErrorApproveOut, status_code=201)
-def approve_error(error_id: int, payload: ErrorApproveInput, db: DB, clock: Clock):
+def approve_error(
+    error_id: int,
+    payload: ErrorApproveInput,
+    db: DB,
+    clock: Clock,
+    identity: Annotated[str, Query(pattern=r"^[0-9a-f]{32}$")],
+):
     try:
-        err = lock_draft(db, ErrorLog, error_id, "approve", "error")
+        err = lock_draft(db, ErrorLog, error_id, "approve", "error", identity)
         require(db, Deck, payload.deck_id)
         front = payload.front if payload.front is not None else f"Correct: {err.attempted}"
         back = payload.back if payload.back is not None else err.corrected

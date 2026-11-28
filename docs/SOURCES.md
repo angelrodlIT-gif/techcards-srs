@@ -18,7 +18,7 @@ them, and approve only reviewed material into scheduled study cards.
 | --- | --- | --- |
 | `POST` / `GET` | `/sources` | Create `draft` (`201`) / list (optional `status`, `offset`, `limit`) |
 | `GET` / `PUT` / `DELETE` | `/sources/{id}` | Read / edit `draft` (`409` otherwise) / delete in any status (`204`) |
-| `POST` | `/sources/{id}/approve` | `draft` -> `approved`; creates one `Card` (`201`) with `source_label = source.label` and default SM-2 schedule (`due_date = today(UTC)`) |
+| `POST` | `/sources/{id}/approve?identity=<identity>` | `draft` -> `approved`; creates one `Card` (`201`) with `source_label = source.label` and default SM-2 schedule (`due_date = today(UTC)`) |
 | `POST` | `/sources/{id}/discard` | `draft` -> `discarded` (`200`); terminal, creates no card |
 
 ## URL normalization, duplicates, and no auto-merge
