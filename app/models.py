@@ -9,14 +9,18 @@ class Base(DeclarativeBase):
     pass
 
 
-class Deck(Base):
+class PersonalRow:
+    identity: Mapped[str | None] = mapped_column(String(32), default=lambda: uuid4().hex)
+
+
+class Deck(PersonalRow, Base):
     __tablename__ = "decks"
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(120))
     description: Mapped[str] = mapped_column(Text, default="")
 
 
-class Card(Base):
+class Card(PersonalRow, Base):
     __tablename__ = "cards"
     __table_args__ = (
         CheckConstraint("repetitions >= 0 AND interval_days >= 0 AND ease_factor >= 1.3"),
@@ -31,6 +35,9 @@ class Card(Base):
         String(32), default=lambda: uuid4().hex
     )
     source_label: Mapped[str | None] = mapped_column(String(255), nullable=True, default=None)
+    source_id: Mapped[int | None] = mapped_column(
+        ForeignKey("sources.id", ondelete="SET NULL"), index=True
+    )
     accepted_answers: Mapped[list[str] | None] = mapped_column(JSON, nullable=True, default=list)
     explanation: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
     repetitions: Mapped[int] = mapped_column(default=0)
@@ -46,7 +53,7 @@ class Card(Base):
         return self.error_log.id if self.error_log is not None else None
 
 
-class Review(Base):
+class Review(PersonalRow, Base):
     __tablename__ = "reviews"
     __table_args__ = (CheckConstraint("quality >= 0 AND quality <= 5"),)
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -59,7 +66,7 @@ class Review(Base):
     due_date: Mapped[date]
 
 
-class Source(Base):
+class Source(PersonalRow, Base):
     __tablename__ = "sources"
     __table_args__ = (
         CheckConstraint("status IN ('draft', 'approved', 'discarded')"),
@@ -79,7 +86,7 @@ class Source(Base):
     status: Mapped[str] = mapped_column(String(20), default="draft")
 
 
-class ErrorLog(Base):
+class ErrorLog(PersonalRow, Base):
     __tablename__ = "error_logs"
     __table_args__ = (
         CheckConstraint("status IN ('draft', 'approved', 'discarded')"),
@@ -92,6 +99,9 @@ class ErrorLog(Base):
         ),
     )
     id: Mapped[int] = mapped_column(primary_key=True)
+    created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+    )
     attempted: Mapped[str] = mapped_column(Text)
     corrected: Mapped[str] = mapped_column(Text)
     rationale: Mapped[str] = mapped_column(Text)

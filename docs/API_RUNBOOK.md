@@ -1,5 +1,7 @@
 # Core API Study and Troubleshooting Runbook
 
+See [Personal data controls](PERSONAL_DATA.md) for export, deletion, and retention.
+
 This runbook walks through a complete local study session against the implemented
 `techcards-srs` FastAPI backend, documents the exact SM-2, UTC, deletion, and
 loopback rules enforced by the code, and provides a repeatable clean-install

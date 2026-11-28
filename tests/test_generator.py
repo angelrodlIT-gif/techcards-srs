@@ -1964,8 +1964,7 @@ def test_generate_cards_returns_404_when_deck_deleted_just_before_commit(client,
     def override_db_with_commit_race():
         with Session(db_engine) as session:
 
-            @event.listens_for(session, "before_flush")
-            def delete_deck_before_flush(_sess, _flush_context, _instances):
+            def delete_deck():
                 nonlocal deleted_once
                 if deleted_once:
                     return
@@ -1975,6 +1974,16 @@ def test_generate_cards_returns_404_when_deck_deleted_just_before_commit(client,
                     if deck is not None:
                         other_session.delete(deck)
                         other_session.commit()
+
+            @event.listens_for(session, "do_orm_execute")
+            def delete_before_sqlite_write_lock(state):
+                if db_engine.dialect.name == "sqlite" and str(state.statement) == "BEGIN IMMEDIATE":
+                    delete_deck()
+
+            @event.listens_for(session, "before_flush")
+            def delete_before_postgres_flush(*_):
+                if db_engine.dialect.name == "postgresql":
+                    delete_deck()
 
             yield session
 

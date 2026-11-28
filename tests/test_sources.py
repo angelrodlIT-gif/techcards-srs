@@ -229,8 +229,12 @@ def test_source_concurrent_duplicate_url_integrity_error_returns_409(
 
     original_check = main_module.ensure_unique_source_url
 
-    def claim_url_after_precheck(db, normalized_url, exclude_id=None):
-        original_check(db, normalized_url, exclude_id=exclude_id)
+    # SQLite PUT holds a write lock before prechecking. Inject the competing
+    # commit before acquisition there, and after the precheck for other cases.
+    sqlite = db_engine.dialect.name == "sqlite"
+    original_lock = main_module.lock_personal_write
+
+    def claim_url(normalized_url):
         if normalized_url is not None:
             with Session(db_engine) as peer:
                 peer.add(
@@ -243,6 +247,17 @@ def test_source_concurrent_duplicate_url_integrity_error_returns_409(
                 )
                 peer.commit()
 
+    def claim_url_after_precheck(db, normalized_url, exclude_id=None):
+        original_check(db, normalized_url, exclude_id=exclude_id)
+        if not (sqlite and exclude_id is not None):
+            claim_url(normalized_url)
+
+    def lock_after_competing_claim(db):
+        claim_url("https://example.com/raced-put")
+        original_lock(db)
+
+    if sqlite:
+        monkeypatch.setattr(main_module, "lock_personal_write", lock_after_competing_claim)
     monkeypatch.setattr(main_module, "ensure_unique_source_url", claim_url_after_precheck)
 
     # PUT from NULL -> raced URL hits unique index; rollback expires draft, still returns 409.

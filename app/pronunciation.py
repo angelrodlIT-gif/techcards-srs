@@ -11,7 +11,7 @@ MAX_BYTES = 512 * 1024
 MAX_CLIPS = 32
 TTL = 3600
 MEDIA_TYPES = {"audio/webm", "audio/ogg", "audio/wav", "audio/x-wav", "audio/mpeg", "audio/mp4"}
-RecordingKey = tuple[int, str | None]
+RecordingKey = tuple[int, str | None, str | None]
 
 
 class RecordingStore:
@@ -52,6 +52,12 @@ class RecordingStore:
     def delete(self, key: RecordingKey):
         with self._lock:
             self._delete(key)
+
+    def delete_card(self, card_id: int, identity: str | None):
+        with self._lock:
+            for key in list(self._clips):
+                if key[0] == card_id and key[2] == identity:
+                    self._delete(key)
 
     def clear(self):
         with self._lock:

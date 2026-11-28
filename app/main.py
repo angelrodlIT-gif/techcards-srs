@@ -12,7 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, contains_eager, joinedload, selectinload
 from starlette.concurrency import run_in_threadpool
 
-from app.db import get_db
+from app.db import get_db, lock_personal_write, lock_sqlite_write
 from app.generator import (
     CardGenerator,
     GeneratorError,
@@ -22,6 +22,7 @@ from app.generator import (
 from app.learning import LearningSummary, summarize_learning
 from app.listening import AudioUnavailable, SynthesisLimitReached, listening_audio
 from app.models import Card, Deck, ErrorLog, Review, Source
+from app.personal_data import router as personal_data_router
 from app.pronunciation import MAX_BYTES, MEDIA_TYPES, TTL, comparison, recordings
 from app.remediation import STAR_PREFIX, build_remediation_draft
 from app.schemas import (
@@ -86,6 +87,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="TechCards SRS", version="0.1.0", lifespan=lifespan)
+app.include_router(personal_data_router)
 DB = Annotated[Session, Depends(get_db)]
 Generator = Annotated[CardGenerator, Depends(get_generator)]
 Clock = Annotated[Callable[[], datetime], Depends(get_clock)]
@@ -132,6 +134,7 @@ def get_deck(deck_id: int, db: DB):
 
 @app.put("/decks/{deck_id}", response_model=DeckOut)
 def update_deck(deck_id: int, payload: DeckInput, db: DB):
+    lock_personal_write(db)
     deck = require(db, Deck, deck_id)
     deck.name, deck.description = payload.name, payload.description
     return save(db, deck)
@@ -139,6 +142,7 @@ def update_deck(deck_id: int, payload: DeckInput, db: DB):
 
 @app.delete("/decks/{deck_id}", status_code=204)
 def delete_deck(deck_id: int, db: DB):
+    lock_personal_write(db)
     db.delete(require(db, Deck, deck_id))
     db.commit()
     return Response(status_code=204)
@@ -167,7 +171,7 @@ def due_cards(
 # Register this static path before /cards/{card_id}.
 @app.post("/cards/generate", response_model=list[CardOut], status_code=201)
 def generate_cards(payload: GenerateInput, db: DB, generator: Generator, clock: Clock):
-    require(db, Deck, payload.deck_id)
+    deck_identity = require(db, Deck, payload.deck_id).identity
     # Release the read transaction and pooled connection before the outbound call.
     db.rollback()
     generated = generator.generate(payload.text, payload.max_cards)
@@ -187,7 +191,9 @@ def generate_cards(payload: GenerateInput, db: DB, generator: Generator, clock: 
         ]
     except ValidationError as exc:
         raise GeneratorUpstreamError("Generator returned invalid card output.") from exc
-    require(db, Deck, payload.deck_id)
+    lock_personal_write(db)
+    if require(db, Deck, payload.deck_id).identity != deck_identity:
+        raise HTTPException(404, "Deck not found")
     db.add_all(cards)
     try:
         db.commit()
@@ -201,6 +207,7 @@ def generate_cards(payload: GenerateInput, db: DB, generator: Generator, clock: 
 
 @app.post("/cards", response_model=CardOut, status_code=201)
 def create_card(payload: CardInput, db: DB, clock: Clock):
+    lock_personal_write(db)
     require(db, Deck, payload.deck_id)
     today = normalize_utc(clock()).date()
     return save(db, Card(**payload.model_dump(), due_date=today))
@@ -227,6 +234,7 @@ def get_card(card_id: int, db: DB):
 
 @app.put("/cards/{card_id}", response_model=CardOut)
 def update_card(card_id: int, payload: CardInput, db: DB):
+    lock_personal_write(db)
     card = require(db, Card, card_id)
     require(db, Deck, payload.deck_id)
     if (card.deck_id, card.kind, card.back) != (payload.deck_id, payload.kind, payload.back):
@@ -238,6 +246,7 @@ def update_card(card_id: int, payload: CardInput, db: DB):
 
 @app.delete("/cards/{card_id}", status_code=204)
 def delete_card(card_id: int, db: DB):
+    lock_personal_write(db)
     db.delete(require(db, Card, card_id))
     db.commit()
     return Response(status_code=204)
@@ -246,7 +255,7 @@ def delete_card(card_id: int, db: DB):
 def record_review(
     db: Session, card_id: int, quality: int, clock: Callable[[], datetime]
 ) -> ReviewOut:
-    # PostgreSQL serializes reviews for the same card; SQLite is for sequential unit tests.
+    lock_sqlite_write(db)
     try:
         card = db.scalar(select(Card).where(Card.id == card_id).with_for_update())
         if card is None:
@@ -397,8 +406,8 @@ def pronunciation_card(db: Session, card_id: int, request: Request) -> Card:
     return card
 
 
-def recording_key(card: Card) -> tuple[int, str | None]:
-    return card.id, card.pronunciation_revision
+def recording_key(card: Card) -> tuple[int, str | None, str | None]:
+    return card.id, card.pronunciation_revision, card.identity
 
 
 @app.post("/study/{card_id}/pronunciation/audio", response_class=Response)
@@ -443,7 +452,11 @@ async def upload_pronunciation_recording(
             # Lock the matching revision through the cache write on both PostgreSQL and SQLite.
             result = db.execute(
                 update(Card)
-                .where(Card.id == initial[0], Card.pronunciation_revision == initial[1])
+                .where(
+                    Card.id == initial[0],
+                    Card.pronunciation_revision == initial[1],
+                    Card.identity == initial[2],
+                )
                 .values(pronunciation_revision=Card.pronunciation_revision)
             )
             if result.rowcount != 1:
@@ -472,7 +485,7 @@ def delete_pronunciation_recording(card_id: int, db: DB, request: Request):
     key = recording_key(pronunciation_card(db, card_id, request))
     result = db.execute(
         update(Card)
-        .where(Card.id == key[0], Card.pronunciation_revision == key[1])
+        .where(Card.id == key[0], Card.pronunciation_revision == key[1], Card.identity == key[2])
         .values(pronunciation_revision=uuid4().hex)
     )
     db.commit()
@@ -515,6 +528,7 @@ def get_template(template_id: str):
 @app.post("/templates/{template_id}/cards", response_model=CardOut, status_code=201)
 def create_card_from_template(template_id: str, payload: TemplateCardInput, db: DB, clock: Clock):
     template = require_template(template_id)
+    lock_personal_write(db)
     require(db, Deck, payload.deck_id)
     today = normalize_utc(clock()).date()
     card = Card(
@@ -553,6 +567,7 @@ def save_source(db: Session, source: Source) -> Source:
 
 
 def lock_draft(db: Session, model, identifier: int, action: str, label: str):
+    lock_personal_write(db)
     row = db.scalar(select(model).where(model.id == identifier).with_for_update())
     if row is None:
         raise HTTPException(404, f"{model.__name__} not found")
@@ -615,6 +630,7 @@ def update_source(source_id: int, payload: SourceInput, db: DB):
 
 @app.delete("/sources/{source_id}", status_code=204)
 def delete_source(source_id: int, db: DB):
+    lock_personal_write(db)
     db.delete(require(db, Source, source_id))
     db.commit()
     return Response(status_code=204)
@@ -643,6 +659,7 @@ def approve_source(source_id: int, payload: SourceApproveInput, db: DB, clock: C
             back=payload.back,
             kind=payload.kind,
             source_label=source.label,
+            source_id=source.id,
             accepted_answers=payload.accepted_answers,
             explanation=payload.explanation,
             due_date=today,
@@ -759,6 +776,7 @@ def update_error(error_id: int, payload: ErrorLogInput, db: DB):
 
 @app.delete("/errors/{error_id}", status_code=204)
 def delete_error(error_id: int, db: DB, delete_card: bool = Query(False)):
+    lock_personal_write(db)
     try:
         err = db.scalar(select(ErrorLog).where(ErrorLog.id == error_id).with_for_update())
         if err is None:

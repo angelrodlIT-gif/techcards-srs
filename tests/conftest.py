@@ -14,8 +14,12 @@ from app.models import Base
 @pytest.fixture
 def db_engine():
     url = os.getenv("TEST_DATABASE_URL", "sqlite://")
-    options = {"connect_args": {"check_same_thread": False}, "poolclass": StaticPool}
-    engine = create_engine(url, **(options if url.startswith("sqlite") else {}))
+    options = (
+        {"connect_args": {"check_same_thread": False}, "poolclass": StaticPool}
+        if url == "sqlite://"
+        else {}
+    )
+    engine = create_engine(url, **options)
     if url.startswith("sqlite"):
 
         @event.listens_for(engine, "connect")
